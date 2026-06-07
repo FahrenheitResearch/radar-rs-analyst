@@ -1,5 +1,6 @@
 import math
 import struct
+import unicodedata
 import zipfile
 from pathlib import Path
 
@@ -8,6 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = ROOT / "work" / "basemap_sources"
 OUT = ROOT / "crates" / "app_ui" / "src" / "basemap_data.rs"
 
+REGIONS = {
+    "US": {"codes": {"USA"}, "bbox": (-170.0, 18.0, -50.0, 72.0)},
+    "CANADA": {"codes": {"CAN"}, "bbox": (-142.0, 41.0, -52.0, 84.0)},
+    "MEXICO": {"codes": {"MEX"}, "bbox": (-119.0, 14.0, -86.0, 34.0)},
+    "JAPAN": {"codes": {"JPN"}, "bbox": (122.0, 24.0, 153.0, 46.5)},
+}
+
 
 def read_zip_member(zip_name, suffix):
     with zipfile.ZipFile(SOURCE_DIR / zip_name) as archive:
@@ -15,8 +23,24 @@ def read_zip_member(zip_name, suffix):
         return archive.read(name)
 
 
+def read_zip_text(zip_name, suffix, default=None):
+    with zipfile.ZipFile(SOURCE_DIR / zip_name) as archive:
+        matches = [name for name in archive.namelist() if name.endswith(suffix)]
+        if not matches:
+            return default
+        return archive.read(matches[0]).decode("ascii", "ignore").strip()
+
+
+def dbf_encoding(zip_name):
+    cpg = (read_zip_text(zip_name, ".cpg", "latin1") or "latin1").lower()
+    if cpg in {"65001", "utf-8", "utf8"}:
+        return "utf-8"
+    return cpg
+
+
 def read_dbf(zip_name):
     data = read_zip_member(zip_name, ".dbf")
+    encoding = dbf_encoding(zip_name)
     record_count = struct.unpack_from("<I", data, 4)[0]
     header_len = struct.unpack_from("<H", data, 8)[0]
     record_len = struct.unpack_from("<H", data, 10)[0]
@@ -41,7 +65,7 @@ def read_dbf(zip_name):
         row = {}
         for name, field_type, field_offset, length in fields:
             raw = data[start + field_offset : start + field_offset + length]
-            text = raw.decode("latin1", "ignore").strip()
+            text = raw.decode(encoding, "ignore").replace("\x00", "").strip()
             if field_type in ("N", "F"):
                 if text == "":
                     value = 0.0
@@ -153,6 +177,21 @@ def bbox_for(points):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def bbox_union(left, right):
+    if left is None:
+        return right
+    return (
+        min(left[0], right[0]),
+        min(left[1], right[1]),
+        max(left[2], right[2]),
+        max(left[3], right[3]),
+    )
+
+
+def bbox_intersects(left, right):
+    return left[2] >= right[0] and left[0] <= right[2] and left[3] >= right[1] and left[1] <= right[3]
+
+
 def ring_area(points):
     if len(points) < 3:
         return 0.0
@@ -162,18 +201,25 @@ def ring_area(points):
     return abs(area) * 0.5
 
 
-def ascii_text(value):
-    value = str(value).replace("\\", "").replace('"', "").strip()
-    return value.encode("ascii", "ignore").decode("ascii")
+def clean_text(value):
+    value = str(value).replace("\\", "").replace('"', "").replace("\x00", "").strip()
+    normalized = unicodedata.normalize("NFKD", value)
+    return normalized.encode("ascii", "ignore").decode("ascii").strip()
 
 
-def make_lines(zip_name, tolerance, min_area, name_field=None, state_field=None):
+def country_code(record):
+    return clean_text(record.get("ADM0_A3") or record.get("adm0_a3") or record.get("SOV_A3"))
+
+
+def make_lines(zip_name, tolerance, min_area, record_filter=None, name_field=None, state_field=None):
     shapes = read_shapes(zip_name)
     records = read_dbf(zip_name)
     lines = []
     labels = []
     for shape, record in zip(shapes, records):
         if not shape or shape["type"] != "line":
+            continue
+        if record_filter and not record_filter(record, shape):
             continue
         largest_ring = None
         largest_area = 0.0
@@ -192,8 +238,8 @@ def make_lines(zip_name, tolerance, min_area, name_field=None, state_field=None)
             lines.append((bbox_for(simplified), simplified))
         if name_field and largest_ring:
             bbox = bbox_for(largest_ring)
-            name = ascii_text(record.get(name_field, ""))
-            state = ascii_text(record.get(state_field, "")) if state_field else ""
+            name = clean_text(record.get(name_field, ""))
+            state = clean_text(record.get(state_field, "")) if state_field else ""
             if name:
                 labels.append(
                     {
@@ -207,51 +253,69 @@ def make_lines(zip_name, tolerance, min_area, name_field=None, state_field=None)
     return lines, labels
 
 
+def make_region_admin_lines(region_name):
+    codes = REGIONS[region_name]["codes"]
+    region_bbox = REGIONS[region_name]["bbox"]
+    return make_lines(
+        "ne_10m_admin_1_states_provinces.zip",
+        tolerance=0.01,
+        min_area=0.00002,
+        name_field="name_en",
+        record_filter=lambda record, shape: country_code(record) in codes
+        and bbox_intersects(shape["bbox"], region_bbox),
+    )
+
+
 def read_places():
     shapes = read_shapes("ne_10m_populated_places.zip")
     records = read_dbf("ne_10m_populated_places.zip")
-    places = []
-    wanted = {"USA", "CAN", "MEX"}
+    regional = {region: [] for region in REGIONS}
+    world = []
     for shape, record in zip(shapes, records):
         if not shape or shape["type"] != "point":
             continue
-        adm0 = record.get("ADM0_A3", "")
-        sov = record.get("SOV_A3", "")
-        if adm0 not in wanted and sov not in wanted:
-            continue
         lon, lat = shape["point"]
+        code = country_code(record)
         population = int(record.get("POP_MAX", 0.0))
         scalerank = int(record.get("SCALERANK", 10.0))
-        if population < 1_000 and scalerank > 8:
-            continue
-        if population >= 1_000_000:
+        if population >= 5_000_000:
             rank = 0
-        elif population >= 250_000:
+        elif population >= 1_000_000:
             rank = 1
-        elif population >= 100_000:
+        elif population >= 250_000:
             rank = 2
-        elif population >= 50_000:
+        elif population >= 100_000:
             rank = 3
-        elif population >= 20_000:
+        elif population >= 50_000:
             rank = 4
-        elif population >= 10_000:
+        elif population >= 20_000:
             rank = 5
-        else:
+        elif population >= 10_000:
             rank = 6
-        name = ascii_text(record.get("NAMEASCII") or record.get("NAME") or "")
+        else:
+            rank = 7
+        rank = min(rank, scalerank)
+        name = clean_text(record.get("NAMEASCII") or record.get("NAME_EN") or record.get("NAME") or "")
         if not name:
             continue
-        places.append(
-            {
-                "name": name,
-                "lon": lon,
-                "lat": lat,
-                "population": population,
-                "rank": min(rank, scalerank),
-            }
-        )
-    places.sort(key=lambda place: (place["rank"], -place["population"], place["name"]))
-    return places
+        place = {
+            "name": name,
+            "lon": lon,
+            "lat": lat,
+            "population": population,
+            "rank": rank,
+        }
+        if rank <= 1:
+            world.append(place)
+        for region, spec in REGIONS.items():
+            if code in spec["codes"] and bbox_intersects((lon, lat, lon, lat), spec["bbox"]):
+                if region == "US" and population >= 1_000:
+                    regional[region].append(place)
+                elif region != "US" and population >= 5_000:
+                    regional[region].append(place)
+    for places in [world, *regional.values()]:
+        places.sort(key=lambda place: (place["rank"], -place["population"], place["name"]))
+    return world, regional
 
 
 def rust_float(value):
@@ -273,24 +337,55 @@ def write_lines(handle, const_name, lines):
     handle.write("];\n\n")
 
 
+def write_labels(handle, const_name, labels, default_rank=None):
+    handle.write("#[rustfmt::skip]\n")
+    handle.write(f"pub const {const_name}: &[BasemapLabel] = &[\n")
+    for label in labels:
+        rank = default_rank if default_rank is not None else int(label["rank"])
+        handle.write(
+            f"    BasemapLabel {{ name: \"{label['name']}\", "
+            f"lon: {rust_float(label['lon'])}, lat: {rust_float(label['lat'])}, "
+            f"rank: {rank} }},\n"
+        )
+    handle.write("];\n\n")
+
+
+def write_bbox(handle, const_name, bbox):
+    handle.write(
+        f"pub const {const_name}: [f32; 4] = ["
+        + ", ".join(rust_float(value) for value in bbox)
+        + "];\n"
+    )
+
+
 def main():
-    state_lines, _ = make_lines(
+    world_country_lines, _ = make_lines(
+        "ne_50m_admin_0_countries.zip", tolerance=0.03, min_area=0.002
+    )
+    us_state_lines, _ = make_lines(
         "cb_2024_us_state_500k.zip", tolerance=0.004, min_area=0.00002
     )
-    county_lines, county_labels = make_lines(
+    us_county_lines, us_county_labels = make_lines(
         "cb_2024_us_county_500k.zip",
         tolerance=0.006,
         min_area=0.00001,
         name_field="NAME",
         state_field="STATEFP",
     )
-    places = read_places()
+    regional_admin = {
+        "CANADA": make_region_admin_lines("CANADA"),
+        "MEXICO": make_region_admin_lines("MEXICO"),
+        "JAPAN": make_region_admin_lines("JAPAN"),
+    }
+    world_places, regional_places = read_places()
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     with OUT.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("// Generated by work/generate_basemap_data.py.\n")
-        handle.write("// Source data: US Census 2024 cartographic boundaries and Natural Earth populated places.\n\n")
-        handle.write("#![allow(clippy::excessive_precision)]\n\n")
+        handle.write("// Generated by tools/generate_basemap_data.py.\n")
+        handle.write(
+            "// Source data: US Census 2024 cartographic boundaries and Natural Earth boundaries/places.\n\n"
+        )
+        handle.write("#![allow(clippy::approx_constant, clippy::excessive_precision)]\n\n")
         handle.write("#[derive(Clone, Copy, Debug)]\n")
         handle.write("pub struct BasemapLine {\n")
         handle.write("    pub bbox: [f32; 4],\n")
@@ -303,27 +398,35 @@ def main():
         handle.write("    pub lat: f32,\n")
         handle.write("    pub rank: u8,\n")
         handle.write("}\n\n")
-        write_lines(handle, "BASEMAP_STATE_LINES", state_lines)
-        write_lines(handle, "BASEMAP_COUNTY_LINES", county_lines)
-        handle.write("#[rustfmt::skip]\n")
-        handle.write("pub const BASEMAP_COUNTY_LABELS: &[BasemapLabel] = &[\n")
-        for label in county_labels:
-            handle.write(
-                f"    BasemapLabel {{ name: \"{label['name']}\", "
-                f"lon: {rust_float(label['lon'])}, lat: {rust_float(label['lat'])}, rank: 4 }},\n"
-            )
-        handle.write("];\n\n")
-        handle.write("#[rustfmt::skip]\n")
-        handle.write("pub const BASEMAP_PLACE_LABELS: &[BasemapLabel] = &[\n")
-        for place in places:
-            handle.write(
-                f"    BasemapLabel {{ name: \"{place['name']}\", "
-                f"lon: {rust_float(place['lon'])}, lat: {rust_float(place['lat'])}, "
-                f"rank: {int(place['rank'])} }},\n"
-            )
-        handle.write("];\n")
+        for region, spec in REGIONS.items():
+            write_bbox(handle, f"BASEMAP_{region}_BOUNDS", spec["bbox"])
+        handle.write("\n")
+        write_lines(handle, "BASEMAP_WORLD_COUNTRY_LINES", world_country_lines)
+        write_lines(handle, "BASEMAP_US_STATE_LINES", us_state_lines)
+        write_lines(handle, "BASEMAP_US_COUNTY_LINES", us_county_lines)
+        for region, (lines, labels) in regional_admin.items():
+            write_lines(handle, f"BASEMAP_{region}_ADMIN_LINES", lines)
+            write_labels(handle, f"BASEMAP_{region}_ADMIN_LABELS", labels, default_rank=4)
+        write_labels(handle, "BASEMAP_US_COUNTY_LABELS", us_county_labels, default_rank=4)
+        write_labels(handle, "BASEMAP_WORLD_PLACE_LABELS", world_places)
+        for region, places in regional_places.items():
+            write_labels(handle, f"BASEMAP_{region}_PLACE_LABELS", places)
 
-    print(f"state_lines={len(state_lines)} county_lines={len(county_lines)} county_labels={len(county_labels)} places={len(places)}")
+    content = OUT.read_text(encoding="utf-8")
+    OUT.write_text(content.rstrip() + "\n", encoding="utf-8", newline="\n")
+
+    print(
+        " ".join(
+            [
+                f"world_country_lines={len(world_country_lines)}",
+                f"us_state_lines={len(us_state_lines)}",
+                f"us_county_lines={len(us_county_lines)}",
+                f"us_county_labels={len(us_county_labels)}",
+                f"world_places={len(world_places)}",
+                *(f"{region.lower()}_admin_lines={len(lines)} {region.lower()}_places={len(regional_places[region])}" for region, (lines, _) in regional_admin.items()),
+            ]
+        )
+    )
     print(f"wrote={OUT} bytes={OUT.stat().st_size}")
 
 

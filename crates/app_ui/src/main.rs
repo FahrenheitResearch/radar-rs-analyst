@@ -36,6 +36,12 @@ const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 8;
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const LATEST_OBJECT_CACHE_TTL: Duration = Duration::from_secs(20);
+const BASEMAP_US_DETAIL_BOUNDS: &[[f32; 4]] = &[
+    [-125.5, 24.0, -66.0, 50.3],
+    [-171.0, 51.0, -129.0, 72.0],
+    [-161.5, 18.5, -154.5, 23.0],
+    [-68.5, 17.0, -64.0, 19.0],
+];
 const FORCE_PREVIEW_ENV: &str = "RADAR_RS_FORCE_PREVIEW";
 const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 
@@ -2252,52 +2258,111 @@ impl ViewerApp {
 
     fn draw_basemap(&self, painter: &egui::Painter, rect: egui::Rect) {
         let bounds = self.visible_geo_bounds(rect).expand(0.25);
-        if self.map_scale >= 38.0 {
-            self.draw_basemap_lines(
-                painter,
-                rect,
-                bounds,
-                basemap_data::BASEMAP_COUNTY_LINES,
-                egui::Stroke::new(0.65, egui::Color32::from_rgb(24, 35, 46)),
-            );
-        }
+        let us_detail_visible = us_detail_visible(bounds);
         self.draw_basemap_lines(
             painter,
             rect,
             bounds,
-            basemap_data::BASEMAP_STATE_LINES,
-            egui::Stroke::new(1.05, egui::Color32::from_rgb(41, 58, 73)),
+            basemap_data::BASEMAP_WORLD_COUNTRY_LINES,
+            egui::Stroke::new(0.75, egui::Color32::from_rgb(31, 45, 57)),
         );
-    }
 
-    fn draw_basemap_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let bounds = self.visible_geo_bounds(rect).expand(0.15);
-        if self.map_scale >= 76.0 {
+        if us_detail_visible && self.map_scale >= 38.0 {
             self.draw_basemap_lines(
                 painter,
                 rect,
                 bounds,
-                basemap_data::BASEMAP_COUNTY_LINES,
+                basemap_data::BASEMAP_US_COUNTY_LINES,
+                egui::Stroke::new(0.65, egui::Color32::from_rgb(24, 35, 46)),
+            );
+        }
+        if us_detail_visible {
+            self.draw_basemap_lines(
+                painter,
+                rect,
+                bounds,
+                basemap_data::BASEMAP_US_STATE_LINES,
+                egui::Stroke::new(1.05, egui::Color32::from_rgb(41, 58, 73)),
+            );
+        }
+
+        if self.map_scale >= 36.0 {
+            for layer in REGIONAL_BASEMAP_LAYERS {
+                if bounds.intersects_bbox(layer.bounds) {
+                    self.draw_basemap_lines(
+                        painter,
+                        rect,
+                        bounds,
+                        layer.admin_lines,
+                        egui::Stroke::new(0.85, egui::Color32::from_rgb(36, 52, 65)),
+                    );
+                }
+            }
+        }
+    }
+
+    fn draw_basemap_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let bounds = self.visible_geo_bounds(rect).expand(0.15);
+        let us_detail_visible = us_detail_visible(bounds);
+        if self.map_scale >= 18.0 {
+            self.draw_basemap_lines(
+                painter,
+                rect,
+                bounds,
+                basemap_data::BASEMAP_WORLD_COUNTRY_LINES,
+                egui::Stroke::new(
+                    0.85,
+                    egui::Color32::from_rgba_unmultiplied(102, 126, 145, 84),
+                ),
+            );
+        }
+
+        if us_detail_visible && self.map_scale >= 76.0 {
+            self.draw_basemap_lines(
+                painter,
+                rect,
+                bounds,
+                basemap_data::BASEMAP_US_COUNTY_LINES,
                 egui::Stroke::new(
                     0.55,
                     egui::Color32::from_rgba_unmultiplied(92, 112, 128, 92),
                 ),
             );
         }
-        self.draw_basemap_lines(
-            painter,
-            rect,
-            bounds,
-            basemap_data::BASEMAP_STATE_LINES,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(126, 150, 170, 116),
-            ),
-        );
+        if us_detail_visible {
+            self.draw_basemap_lines(
+                painter,
+                rect,
+                bounds,
+                basemap_data::BASEMAP_US_STATE_LINES,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(126, 150, 170, 116),
+                ),
+            );
+        }
+
+        if self.map_scale >= 74.0 {
+            for layer in REGIONAL_BASEMAP_LAYERS {
+                if bounds.intersects_bbox(layer.bounds) {
+                    self.draw_basemap_lines(
+                        painter,
+                        rect,
+                        bounds,
+                        layer.admin_lines,
+                        egui::Stroke::new(
+                            0.75,
+                            egui::Color32::from_rgba_unmultiplied(112, 136, 154, 96),
+                        ),
+                    );
+                }
+            }
+        }
 
         let mut occupied = Vec::with_capacity(128);
-        self.draw_place_labels(painter, rect, bounds, &mut occupied);
-        self.draw_county_labels(painter, rect, bounds, &mut occupied);
+        self.draw_world_place_labels(painter, rect, bounds, &mut occupied);
+        self.draw_regional_place_labels(painter, rect, bounds, &mut occupied);
+        self.draw_admin_labels(painter, rect, bounds, &mut occupied);
     }
 
     fn draw_basemap_lines(
@@ -2334,7 +2399,30 @@ impl ViewerApp {
         painter.add(egui::Shape::line(points, stroke));
     }
 
-    fn draw_place_labels(
+    fn draw_world_place_labels(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        bounds: GeoBounds,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
+        let Some(max_rank) = world_place_label_rank(self.map_scale) else {
+            return;
+        };
+        self.draw_place_label_set(
+            painter,
+            rect,
+            bounds,
+            PlaceLabelSet {
+                labels: basemap_data::BASEMAP_WORLD_PLACE_LABELS,
+                max_rank,
+                max_labels: world_label_budget(self.map_scale),
+            },
+            occupied,
+        );
+    }
+
+    fn draw_regional_place_labels(
         &self,
         painter: &egui::Painter,
         rect: egui::Rect,
@@ -2345,14 +2433,52 @@ impl ViewerApp {
             return;
         };
         let max_labels = label_budget(self.map_scale);
+        if us_detail_visible(bounds) {
+            self.draw_place_label_set(
+                painter,
+                rect,
+                bounds,
+                PlaceLabelSet {
+                    labels: basemap_data::BASEMAP_US_PLACE_LABELS,
+                    max_rank,
+                    max_labels,
+                },
+                occupied,
+            );
+        }
+        for layer in REGIONAL_BASEMAP_LAYERS {
+            if bounds.intersects_bbox(layer.bounds) {
+                self.draw_place_label_set(
+                    painter,
+                    rect,
+                    bounds,
+                    PlaceLabelSet {
+                        labels: layer.place_labels,
+                        max_rank,
+                        max_labels,
+                    },
+                    occupied,
+                );
+            }
+        }
+    }
+
+    fn draw_place_label_set(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        bounds: GeoBounds,
+        place_labels: PlaceLabelSet,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
         let font = egui::FontId::proportional(if self.map_scale >= 190.0 { 12.0 } else { 11.0 });
         let text_color = egui::Color32::from_rgb(198, 207, 214);
         let halo_color = egui::Color32::from_rgba_unmultiplied(3, 5, 8, 210);
         let dot_color = egui::Color32::from_rgb(118, 143, 158);
         let mut drawn = 0usize;
 
-        for label in basemap_data::BASEMAP_PLACE_LABELS {
-            if label.rank > max_rank || !bounds.contains(label.lon, label.lat) {
+        for label in place_labels.labels {
+            if label.rank > place_labels.max_rank || !bounds.contains(label.lon, label.lat) {
                 continue;
             }
             let position = self.lon_lat_to_screen(rect, label.lon, label.lat);
@@ -2376,13 +2502,13 @@ impl ViewerApp {
             );
             occupied.push(label_rect);
             drawn += 1;
-            if drawn >= max_labels {
+            if drawn >= place_labels.max_labels {
                 break;
             }
         }
     }
 
-    fn draw_county_labels(
+    fn draw_admin_labels(
         &self,
         painter: &egui::Painter,
         rect: egui::Rect,
@@ -2393,12 +2519,45 @@ impl ViewerApp {
             return;
         }
         let max_labels = if self.map_scale >= 220.0 { 72 } else { 36 };
+        if us_detail_visible(bounds) {
+            self.draw_admin_label_set(
+                painter,
+                rect,
+                bounds,
+                basemap_data::BASEMAP_US_COUNTY_LABELS,
+                max_labels,
+                occupied,
+            );
+        }
+        for layer in REGIONAL_BASEMAP_LAYERS {
+            if bounds.intersects_bbox(layer.bounds) {
+                self.draw_admin_label_set(
+                    painter,
+                    rect,
+                    bounds,
+                    layer.admin_labels,
+                    max_labels,
+                    occupied,
+                );
+            }
+        }
+    }
+
+    fn draw_admin_label_set(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        bounds: GeoBounds,
+        labels: &[basemap_data::BasemapLabel],
+        max_labels: usize,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
         let font = egui::FontId::proportional(10.0);
         let text_color = egui::Color32::from_rgba_unmultiplied(150, 164, 176, 184);
         let halo_color = egui::Color32::from_rgba_unmultiplied(2, 4, 7, 180);
         let mut drawn = 0usize;
 
-        for label in basemap_data::BASEMAP_COUNTY_LABELS {
+        for label in labels {
             if !bounds.contains(label.lon, label.lat) {
                 continue;
             }
@@ -2645,6 +2804,51 @@ struct GeoBounds {
     south: f32,
     east: f32,
     north: f32,
+}
+
+#[derive(Clone, Copy)]
+struct RegionalBasemapLayer {
+    bounds: [f32; 4],
+    admin_lines: &'static [basemap_data::BasemapLine],
+    admin_labels: &'static [basemap_data::BasemapLabel],
+    place_labels: &'static [basemap_data::BasemapLabel],
+}
+
+#[derive(Clone, Copy)]
+struct PlaceLabelSet {
+    labels: &'static [basemap_data::BasemapLabel],
+    max_rank: u8,
+    max_labels: usize,
+}
+
+const REGIONAL_BASEMAP_LAYERS: &[RegionalBasemapLayer] = &[
+    RegionalBasemapLayer {
+        bounds: basemap_data::BASEMAP_CANADA_BOUNDS,
+        admin_lines: basemap_data::BASEMAP_CANADA_ADMIN_LINES,
+        admin_labels: basemap_data::BASEMAP_CANADA_ADMIN_LABELS,
+        place_labels: basemap_data::BASEMAP_CANADA_PLACE_LABELS,
+    },
+    RegionalBasemapLayer {
+        bounds: basemap_data::BASEMAP_MEXICO_BOUNDS,
+        admin_lines: basemap_data::BASEMAP_MEXICO_ADMIN_LINES,
+        admin_labels: basemap_data::BASEMAP_MEXICO_ADMIN_LABELS,
+        place_labels: basemap_data::BASEMAP_MEXICO_PLACE_LABELS,
+    },
+    RegionalBasemapLayer {
+        bounds: basemap_data::BASEMAP_JAPAN_BOUNDS,
+        admin_lines: basemap_data::BASEMAP_JAPAN_ADMIN_LINES,
+        admin_labels: basemap_data::BASEMAP_JAPAN_ADMIN_LABELS,
+        place_labels: basemap_data::BASEMAP_JAPAN_PLACE_LABELS,
+    },
+];
+
+fn us_detail_visible(bounds: GeoBounds) -> bool {
+    if !bounds.intersects_bbox(basemap_data::BASEMAP_US_BOUNDS) {
+        return false;
+    }
+    BASEMAP_US_DETAIL_BOUNDS
+        .iter()
+        .any(|us_bounds| bounds.intersects_bbox(*us_bounds))
 }
 
 impl GeoBounds {
@@ -2977,6 +3181,22 @@ fn graticule_step(visible_degrees: f32) -> f32 {
     } else {
         0.25
     }
+}
+
+fn world_place_label_rank(map_scale: f32) -> Option<u8> {
+    if map_scale < 10.0 {
+        None
+    } else if map_scale < 28.0 {
+        Some(0)
+    } else if map_scale < 58.0 {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn world_label_budget(map_scale: f32) -> usize {
+    if map_scale < 28.0 { 18 } else { 36 }
 }
 
 fn place_label_rank(map_scale: f32) -> Option<u8> {
@@ -3682,6 +3902,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn basemap_regional_packs_have_real_content() {
+        assert_eq!(REGIONAL_BASEMAP_LAYERS.len(), 3);
+        assert!(basemap_data::BASEMAP_WORLD_COUNTRY_LINES.len() > 1_000);
+        assert!(basemap_data::BASEMAP_WORLD_COUNTRY_LINES.len() < 2_000);
+        assert!(basemap_data::BASEMAP_US_COUNTY_LINES.len() > 4_000);
+        assert!(basemap_data::BASEMAP_US_PLACE_LABELS.len() > 500);
+
+        for layer in REGIONAL_BASEMAP_LAYERS {
+            assert!(layer.admin_lines.len() > 50);
+            assert!(layer.admin_labels.len() > 10);
+            assert!(layer.place_labels.len() > 50);
+        }
+    }
+
+    #[test]
+    fn basemap_detail_layers_are_gated_by_viewport() {
+        let central_us = GeoBounds {
+            west: -101.0,
+            south: 35.0,
+            east: -90.0,
+            north: 40.0,
+        };
+        let canada_interior = GeoBounds {
+            west: -111.0,
+            south: 51.0,
+            east: -100.0,
+            north: 55.0,
+        };
+        let mexico_city = GeoBounds {
+            west: -101.0,
+            south: 18.0,
+            east: -97.0,
+            north: 21.0,
+        };
+        let japan_kanto = GeoBounds {
+            west: 138.0,
+            south: 34.0,
+            east: 141.0,
+            north: 37.0,
+        };
+        let alaska = GeoBounds {
+            west: -154.0,
+            south: 58.0,
+            east: -149.0,
+            north: 62.0,
+        };
+
+        assert!(us_detail_visible(central_us));
+        assert!(us_detail_visible(alaska));
+        assert!(!us_detail_visible(canada_interior));
+        assert!(!us_detail_visible(mexico_city));
+        assert!(!us_detail_visible(japan_kanto));
+
+        assert_eq!(active_regional_layer_count(central_us), 0);
+        assert_eq!(active_regional_layer_count(canada_interior), 1);
+        assert_eq!(active_regional_layer_count(mexico_city), 1);
+        assert_eq!(active_regional_layer_count(japan_kanto), 1);
+        assert_eq!(active_regional_layer_count(alaska), 0);
+    }
+
+    #[test]
+    fn basemap_culling_keeps_representative_views_bounded() {
+        let central_us = GeoBounds {
+            west: -101.0,
+            south: 35.0,
+            east: -90.0,
+            north: 40.0,
+        };
+        let canada_interior = GeoBounds {
+            west: -111.0,
+            south: 51.0,
+            east: -100.0,
+            north: 55.0,
+        };
+        let japan_kanto = GeoBounds {
+            west: 138.0,
+            south: 34.0,
+            east: 141.0,
+            north: 37.0,
+        };
+
+        let us_counties =
+            basemap_line_candidates(central_us, basemap_data::BASEMAP_US_COUNTY_LINES);
+        assert!(us_counties.lines < 400);
+        assert!(us_counties.points < 8_000);
+
+        let canada_admin =
+            basemap_line_candidates(canada_interior, basemap_data::BASEMAP_CANADA_ADMIN_LINES);
+        assert!(canada_admin.lines > 0);
+        assert!(canada_admin.lines < 60);
+        assert!(canada_admin.points < 5_000);
+        assert!(!us_detail_visible(canada_interior));
+
+        let japan_admin =
+            basemap_line_candidates(japan_kanto, basemap_data::BASEMAP_JAPAN_ADMIN_LINES);
+        assert!(japan_admin.lines > 0);
+        assert!(japan_admin.lines < 40);
+        assert!(japan_admin.points < 2_000);
+        assert!(!us_detail_visible(japan_kanto));
+    }
+
     fn test_ref_then_velocity_volume() -> RadarVolume {
         let gate_range = radar_core::GateRange {
             first_gate_m: 500,
@@ -3793,5 +4115,35 @@ mod tests {
             used_sample_cache,
             radar_range_km: 460.0,
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct BasemapLineCandidates {
+        lines: usize,
+        points: usize,
+    }
+
+    fn basemap_line_candidates(
+        bounds: GeoBounds,
+        lines: &[basemap_data::BasemapLine],
+    ) -> BasemapLineCandidates {
+        let mut candidates = BasemapLineCandidates {
+            lines: 0,
+            points: 0,
+        };
+        for line in lines {
+            if bounds.intersects_bbox(line.bbox) {
+                candidates.lines += 1;
+                candidates.points += line.points.len();
+            }
+        }
+        candidates
+    }
+
+    fn active_regional_layer_count(bounds: GeoBounds) -> usize {
+        REGIONAL_BASEMAP_LAYERS
+            .iter()
+            .filter(|layer| bounds.intersects_bbox(layer.bounds))
+            .count()
     }
 }
