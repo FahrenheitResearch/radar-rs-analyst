@@ -13,7 +13,8 @@ Windows users can download the latest `radar-rs-analyst-windows-x64.zip` from th
 - Native Level II Archive II decode for public NEXRAD data.
 - Full-resolution CPU viewport rendering, with no quality downgrade at zoom.
 - Reflectivity, velocity, storm-relative velocity, spectrum width, ZDR, RHO, PHI, and CFP product selection when present in the scan.
-- Lightweight basemap with radar-site selection and right-click nearest-site loading.
+- Lightweight vector basemap with state/county boundaries and zoom-aware town/county labels.
+- Radar-site selection and right-click nearest-site loading.
 - VROT/source-gate readout for velocity interrogation.
 - Honest timing readout split into lookup, fetch, read, decode, render, worker, texture, and cache stages.
 - Cache-aware latest-scan loading so repeated loads are fast while still allowing new scans to download.
@@ -51,6 +52,11 @@ target\release\radar-rs-analyst.exe C:\path\to\KTLX20260607_162229_V06
 - `crates/nexrad_io` - Level II decode path.
 - `crates/render2d` - high-fidelity CPU viewport renderer and perf probes.
 - `crates/radar_core` - shared radar volume, cut, radial, and moment data structures.
+- `tools/generate_basemap_data.py` - regenerates the baked vector basemap data.
+
+## Basemap Data
+
+The baked basemap uses public US Census 2024 cartographic state/county boundaries and Natural Earth populated places. The source archives are not committed; the generated Rust module is committed so the app builds without runtime map downloads.
 
 ## License
 

@@ -12,6 +12,8 @@ use render2d::{
     viewport_sample_cache_storage_upper_bound,
 };
 
+mod basemap_data;
+
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
 const MIN_MAP_SCALE: f32 = 2.0;
@@ -206,6 +208,7 @@ struct ViewerApp {
     worker_ms: Option<f32>,
     texture_ms: Option<f32>,
     sample_cache_build_ms: Option<f32>,
+    basemap_ms: Option<f32>,
     perf: PerfTelemetry,
     status: String,
     sites: Vec<RadarSite>,
@@ -796,6 +799,7 @@ impl ViewerApp {
             worker_ms: None,
             texture_ms: None,
             sample_cache_build_ms: None,
+            basemap_ms: None,
             perf: PerfTelemetry::new(),
             status: String::new(),
             sites,
@@ -2090,6 +2094,9 @@ impl ViewerApp {
         if let Some(sample_cache_build_ms) = self.sample_cache_build_ms {
             ui.label(format!("Cache {:.1} ms", sample_cache_build_ms));
         }
+        if let Some(basemap_ms) = self.basemap_ms {
+            ui.label(format!("Map {:.1} ms", basemap_ms));
+        }
 
         ui.add_space(6.0);
         self.perf_metric_readout(ui, "Decode", &self.perf.decode);
@@ -2165,10 +2172,15 @@ impl ViewerApp {
             .flatten()
             .and_then(|position| self.cursor_readout_at(rect, position));
 
+        let basemap_start = Instant::now();
         self.draw_basemap(&painter, rect);
         self.draw_graticule(&painter, rect);
+        let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_texture_render(ui.ctx(), rect);
         self.draw_radar_layer(&painter, rect);
+        let overlay_start = Instant::now();
+        self.draw_basemap_overlay(&painter, rect);
+        self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
 
         let site_points = self
             .sites
@@ -2239,18 +2251,67 @@ impl ViewerApp {
     }
 
     fn draw_basemap(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let country_stroke = egui::Stroke::new(1.35, egui::Color32::from_rgb(48, 66, 82));
-        let state_stroke = egui::Stroke::new(0.75, egui::Color32::from_rgb(32, 45, 58));
-        let water_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(36, 58, 74));
+        let bounds = self.visible_geo_bounds(rect).expand(0.25);
+        if self.map_scale >= 38.0 {
+            self.draw_basemap_lines(
+                painter,
+                rect,
+                bounds,
+                basemap_data::BASEMAP_COUNTY_LINES,
+                egui::Stroke::new(0.65, egui::Color32::from_rgb(24, 35, 46)),
+            );
+        }
+        self.draw_basemap_lines(
+            painter,
+            rect,
+            bounds,
+            basemap_data::BASEMAP_STATE_LINES,
+            egui::Stroke::new(1.05, egui::Color32::from_rgb(41, 58, 73)),
+        );
+    }
 
-        for line in BASEMAP_COUNTRY_LINES {
-            self.draw_geo_line(painter, rect, line, country_stroke);
+    fn draw_basemap_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let bounds = self.visible_geo_bounds(rect).expand(0.15);
+        if self.map_scale >= 76.0 {
+            self.draw_basemap_lines(
+                painter,
+                rect,
+                bounds,
+                basemap_data::BASEMAP_COUNTY_LINES,
+                egui::Stroke::new(
+                    0.55,
+                    egui::Color32::from_rgba_unmultiplied(92, 112, 128, 92),
+                ),
+            );
         }
-        for line in BASEMAP_STATE_LINES {
-            self.draw_geo_line(painter, rect, line, state_stroke);
-        }
-        for line in BASEMAP_WATER_LINES {
-            self.draw_geo_line(painter, rect, line, water_stroke);
+        self.draw_basemap_lines(
+            painter,
+            rect,
+            bounds,
+            basemap_data::BASEMAP_STATE_LINES,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(126, 150, 170, 116),
+            ),
+        );
+
+        let mut occupied = Vec::with_capacity(128);
+        self.draw_place_labels(painter, rect, bounds, &mut occupied);
+        self.draw_county_labels(painter, rect, bounds, &mut occupied);
+    }
+
+    fn draw_basemap_lines(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        bounds: GeoBounds,
+        lines: &[basemap_data::BasemapLine],
+        stroke: egui::Stroke,
+    ) {
+        for line in lines {
+            if bounds.intersects_bbox(line.bbox) {
+                self.draw_geo_line(painter, rect, line.points, stroke);
+            }
         }
     }
 
@@ -2271,6 +2332,99 @@ impl ViewerApp {
             })
             .collect::<Vec<_>>();
         painter.add(egui::Shape::line(points, stroke));
+    }
+
+    fn draw_place_labels(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        bounds: GeoBounds,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
+        let Some(max_rank) = place_label_rank(self.map_scale) else {
+            return;
+        };
+        let max_labels = label_budget(self.map_scale);
+        let font = egui::FontId::proportional(if self.map_scale >= 190.0 { 12.0 } else { 11.0 });
+        let text_color = egui::Color32::from_rgb(198, 207, 214);
+        let halo_color = egui::Color32::from_rgba_unmultiplied(3, 5, 8, 210);
+        let dot_color = egui::Color32::from_rgb(118, 143, 158);
+        let mut drawn = 0usize;
+
+        for label in basemap_data::BASEMAP_PLACE_LABELS {
+            if label.rank > max_rank || !bounds.contains(label.lon, label.lat) {
+                continue;
+            }
+            let position = self.lon_lat_to_screen(rect, label.lon, label.lat);
+            if !rect.expand(32.0).contains(position) {
+                continue;
+            }
+            let text_position = egui::pos2(position.x + 4.0, position.y - 1.0);
+            let label_rect = left_label_rect(text_position, label.name, font.size).expand(2.0);
+            if !rect.expand(80.0).intersects(label_rect) || overlaps_any(occupied, label_rect) {
+                continue;
+            }
+            painter.circle_filled(position, 1.5, dot_color);
+            draw_halo_text(
+                painter,
+                text_position,
+                egui::Align2::LEFT_CENTER,
+                label.name,
+                font.clone(),
+                text_color,
+                halo_color,
+            );
+            occupied.push(label_rect);
+            drawn += 1;
+            if drawn >= max_labels {
+                break;
+            }
+        }
+    }
+
+    fn draw_county_labels(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        bounds: GeoBounds,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
+        if self.map_scale < 118.0 {
+            return;
+        }
+        let max_labels = if self.map_scale >= 220.0 { 72 } else { 36 };
+        let font = egui::FontId::proportional(10.0);
+        let text_color = egui::Color32::from_rgba_unmultiplied(150, 164, 176, 184);
+        let halo_color = egui::Color32::from_rgba_unmultiplied(2, 4, 7, 180);
+        let mut drawn = 0usize;
+
+        for label in basemap_data::BASEMAP_COUNTY_LABELS {
+            if !bounds.contains(label.lon, label.lat) {
+                continue;
+            }
+            let position = self.lon_lat_to_screen(rect, label.lon, label.lat);
+            if !rect.expand(24.0).contains(position) {
+                continue;
+            }
+            let label_rect = centered_label_rect(position, label.name, font.size).expand(5.0);
+            if !rect.expand(80.0).intersects(label_rect) || overlaps_any(occupied, label_rect) {
+                continue;
+            }
+            draw_halo_text(
+                painter,
+                position,
+                egui::Align2::CENTER_CENTER,
+                label.name,
+                font.clone(),
+                text_color,
+                halo_color,
+            );
+            occupied.push(label_rect);
+            drawn += 1;
+            if drawn >= max_labels {
+                break;
+            }
+        }
     }
 
     fn draw_graticule(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -2468,9 +2622,53 @@ impl ViewerApp {
         )
     }
 
+    fn visible_geo_bounds(&self, rect: egui::Rect) -> GeoBounds {
+        let (west, north) = self.screen_to_lon_lat(rect, rect.left_top());
+        let (east, south) = self.screen_to_lon_lat(rect, rect.right_bottom());
+        GeoBounds {
+            west: west.min(east),
+            east: west.max(east),
+            south: south.min(north).clamp(-85.0, 85.0),
+            north: south.max(north).clamp(-85.0, 85.0),
+        }
+    }
+
     fn clamp_map_center(&mut self) {
         self.map_center_lon = normalize_lon(self.map_center_lon);
         self.map_center_lat = self.map_center_lat.clamp(-85.0, 85.0);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GeoBounds {
+    west: f32,
+    south: f32,
+    east: f32,
+    north: f32,
+}
+
+impl GeoBounds {
+    fn expand(self, degrees: f32) -> Self {
+        Self {
+            west: self.west - degrees,
+            south: self.south - degrees,
+            east: self.east + degrees,
+            north: self.north + degrees,
+        }
+    }
+
+    fn contains(self, longitude_deg: f32, latitude_deg: f32) -> bool {
+        longitude_deg >= self.west
+            && longitude_deg <= self.east
+            && latitude_deg >= self.south
+            && latitude_deg <= self.north
+    }
+
+    fn intersects_bbox(self, bbox: [f32; 4]) -> bool {
+        bbox[2] >= self.west
+            && bbox[0] <= self.east
+            && bbox[3] >= self.south
+            && bbox[1] <= self.north
     }
 }
 
@@ -2781,6 +2979,77 @@ fn graticule_step(visible_degrees: f32) -> f32 {
     }
 }
 
+fn place_label_rank(map_scale: f32) -> Option<u8> {
+    if map_scale < 24.0 {
+        None
+    } else if map_scale < 42.0 {
+        Some(0)
+    } else if map_scale < 72.0 {
+        Some(2)
+    } else if map_scale < 130.0 {
+        Some(4)
+    } else if map_scale < 230.0 {
+        Some(5)
+    } else {
+        Some(6)
+    }
+}
+
+fn label_budget(map_scale: f32) -> usize {
+    if map_scale < 72.0 {
+        28
+    } else if map_scale < 130.0 {
+        54
+    } else if map_scale < 230.0 {
+        92
+    } else {
+        140
+    }
+}
+
+fn left_label_rect(position: egui::Pos2, text: &str, font_size: f32) -> egui::Rect {
+    let width = estimated_label_width(text, font_size);
+    let height = font_size + 5.0;
+    egui::Rect::from_min_size(
+        egui::pos2(position.x, position.y - height * 0.5),
+        egui::vec2(width, height),
+    )
+}
+
+fn centered_label_rect(position: egui::Pos2, text: &str, font_size: f32) -> egui::Rect {
+    let width = estimated_label_width(text, font_size);
+    let height = font_size + 5.0;
+    egui::Rect::from_center_size(position, egui::vec2(width, height))
+}
+
+fn estimated_label_width(text: &str, font_size: f32) -> f32 {
+    text.chars().count() as f32 * font_size * 0.58 + 8.0
+}
+
+fn overlaps_any(existing: &[egui::Rect], candidate: egui::Rect) -> bool {
+    existing.iter().any(|rect| rect.intersects(candidate))
+}
+
+fn draw_halo_text(
+    painter: &egui::Painter,
+    position: egui::Pos2,
+    align: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+    text_color: egui::Color32,
+    halo_color: egui::Color32,
+) {
+    for offset in [
+        egui::vec2(-1.0, 0.0),
+        egui::vec2(1.0, 0.0),
+        egui::vec2(0.0, -1.0),
+        egui::vec2(0.0, 1.0),
+    ] {
+        painter.text(position + offset, align, text, font.clone(), halo_color);
+    }
+    painter.text(position, align, text, font, text_color);
+}
+
 fn normalize_lon(longitude_deg: f32) -> f32 {
     let mut longitude_deg = longitude_deg;
     while longitude_deg > 180.0 {
@@ -2814,174 +3083,6 @@ fn nearest_site_index(sites: &[RadarSite], target_lat: f32, target_lon: f32) -> 
         .min_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(index, _)| index)
 }
-
-type GeoLine = &'static [(f32, f32)];
-
-const BASEMAP_COUNTRY_LINES: &[GeoLine] = &[
-    &[
-        (-124.7, 48.5),
-        (-123.1, 45.6),
-        (-124.2, 42.0),
-        (-122.6, 38.5),
-        (-121.0, 36.2),
-        (-117.1, 32.5),
-        (-114.8, 32.7),
-        (-111.0, 31.3),
-        (-106.5, 31.8),
-        (-103.0, 29.8),
-        (-97.2, 25.9),
-        (-91.5, 29.0),
-        (-86.8, 30.3),
-        (-82.8, 29.8),
-        (-80.2, 25.2),
-        (-80.0, 31.0),
-        (-76.0, 35.1),
-        (-75.0, 39.0),
-        (-71.0, 41.6),
-        (-67.0, 45.0),
-        (-69.0, 47.4),
-        (-74.5, 45.0),
-        (-79.2, 43.2),
-        (-83.1, 42.0),
-        (-87.0, 45.7),
-        (-92.2, 48.7),
-        (-104.0, 49.0),
-        (-114.0, 49.0),
-        (-124.7, 48.5),
-    ],
-    &[
-        (-124.7, 48.9),
-        (-114.0, 49.0),
-        (-104.0, 49.0),
-        (-95.2, 49.0),
-        (-89.0, 48.2),
-        (-83.0, 46.1),
-        (-79.0, 43.2),
-        (-74.5, 45.0),
-        (-67.0, 45.0),
-    ],
-    &[
-        (-117.1, 32.5),
-        (-111.0, 31.3),
-        (-106.5, 31.8),
-        (-103.0, 29.8),
-        (-97.2, 25.9),
-        (-91.5, 29.0),
-        (-86.8, 30.3),
-        (-82.8, 29.8),
-        (-80.2, 25.2),
-    ],
-];
-
-const BASEMAP_STATE_LINES: &[GeoLine] = &[
-    &[
-        (-124.2, 42.0),
-        (-120.0, 42.0),
-        (-117.0, 42.0),
-        (-111.0, 42.0),
-    ],
-    &[(-124.0, 46.0), (-117.0, 46.0)],
-    &[
-        (-117.0, 49.0),
-        (-117.0, 46.0),
-        (-116.0, 45.0),
-        (-117.0, 42.0),
-    ],
-    &[
-        (-120.0, 42.0),
-        (-119.8, 39.0),
-        (-114.6, 35.0),
-        (-114.6, 32.7),
-    ],
-    &[(-114.0, 49.0), (-114.0, 44.5), (-111.0, 42.0)],
-    &[
-        (-111.0, 42.0),
-        (-111.0, 37.0),
-        (-109.0, 37.0),
-        (-109.0, 31.3),
-    ],
-    &[(-109.0, 41.0), (-102.0, 41.0)],
-    &[(-109.0, 37.0), (-102.0, 37.0)],
-    &[
-        (-104.0, 49.0),
-        (-104.0, 45.9),
-        (-104.0, 41.0),
-        (-104.0, 37.0),
-        (-103.0, 29.8),
-    ],
-    &[(-111.0, 45.0), (-104.0, 45.0)],
-    &[(-111.0, 44.0), (-104.0, 44.0)],
-    &[
-        (-102.0, 49.0),
-        (-102.0, 45.9),
-        (-102.0, 43.0),
-        (-102.0, 40.0),
-        (-102.0, 37.0),
-    ],
-    &[(-104.0, 43.0), (-96.5, 43.0)],
-    &[(-104.0, 40.0), (-95.3, 40.0)],
-    &[(-102.0, 37.0), (-94.6, 37.0)],
-    &[(-103.0, 36.5), (-94.6, 36.5)],
-    &[(-103.0, 34.0), (-94.4, 34.0)],
-    &[(-100.0, 36.5), (-100.0, 34.0)],
-    &[(-94.6, 37.0), (-94.6, 33.6), (-94.0, 29.7)],
-    &[
-        (-97.0, 49.0),
-        (-97.0, 45.9),
-        (-96.5, 43.0),
-        (-95.3, 40.0),
-        (-94.6, 37.0),
-    ],
-    &[(-95.0, 49.0), (-95.0, 45.9), (-91.2, 43.5), (-91.0, 40.5)],
-    &[(-91.0, 40.5), (-89.0, 37.0), (-89.2, 34.9), (-90.2, 30.2)],
-    &[(-88.1, 42.5), (-88.1, 37.8)],
-    &[(-84.8, 41.8), (-84.8, 39.1), (-84.8, 35.0)],
-    &[(-87.5, 37.8), (-84.8, 37.8), (-81.7, 37.3)],
-    &[(-90.0, 35.0), (-84.8, 35.0), (-81.0, 35.0)],
-    &[(-85.0, 31.0), (-85.0, 35.0)],
-    &[(-88.5, 30.3), (-88.5, 35.0)],
-    &[(-91.6, 33.0), (-88.5, 33.0), (-85.0, 32.9), (-81.0, 32.0)],
-    &[(-83.0, 30.7), (-82.0, 35.0)],
-    &[(-81.0, 35.0), (-76.0, 35.1)],
-    &[(-83.7, 36.6), (-75.8, 36.6)],
-    &[(-82.6, 39.0), (-75.0, 39.0)],
-    &[(-80.5, 40.6), (-74.7, 40.6)],
-    &[(-79.8, 42.0), (-74.0, 42.0)],
-    &[(-73.4, 45.0), (-73.4, 42.0)],
-    &[(-72.5, 42.0), (-72.5, 45.0)],
-    &[(-71.8, 42.0), (-71.8, 45.0)],
-    &[(-71.1, 43.0), (-69.0, 43.8)],
-];
-
-const BASEMAP_WATER_LINES: &[GeoLine] = &[
-    &[
-        (-92.2, 48.0),
-        (-89.5, 47.0),
-        (-87.0, 47.3),
-        (-84.7, 46.6),
-        (-86.4, 48.0),
-        (-89.5, 48.4),
-        (-92.2, 48.0),
-    ],
-    &[
-        (-87.0, 45.8),
-        (-86.0, 43.4),
-        (-86.2, 41.8),
-        (-87.6, 41.8),
-        (-87.8, 44.2),
-        (-87.0, 45.8),
-    ],
-    &[
-        (-84.8, 45.8),
-        (-82.4, 45.3),
-        (-81.2, 44.3),
-        (-82.2, 43.2),
-        (-84.0, 43.8),
-        (-84.8, 45.8),
-    ],
-    &[(-83.5, 42.2), (-80.0, 42.2), (-78.8, 42.8), (-79.2, 43.2)],
-    &[(-79.8, 43.3), (-77.5, 43.6), (-76.0, 44.0), (-76.5, 44.3)],
-];
 
 fn product_order(available: &std::collections::BTreeSet<MomentType>) -> Vec<DisplayProduct> {
     let mut ordered = Vec::new();
