@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release -p app_ui --bin radar-rs-analyst
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/radar-rs-analyst-windows-x64 | Out-Null
+          Copy-Item target/release/radar-rs-analyst.exe dist/radar-rs-analyst-windows-x64/
+          Copy-Item README.md dist/radar-rs-analyst-windows-x64/
+          Copy-Item LICENSE-MIT dist/radar-rs-analyst-windows-x64/
+          Copy-Item LICENSE-APACHE dist/radar-rs-analyst-windows-x64/
+          Compress-Archive -Path dist/radar-rs-analyst-windows-x64 -DestinationPath radar-rs-analyst-windows-x64.zip
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: radar-rs-analyst-windows-x64.zip
