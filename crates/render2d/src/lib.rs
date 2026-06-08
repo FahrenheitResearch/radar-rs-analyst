@@ -2025,17 +2025,18 @@ fn render_storm_relative_storage<T: RawMomentValue, G: LookupGeometry>(
                     if grid.nodata == Some(raw as u16) {
                         continue;
                     }
-                    if grid.range_folded == Some(raw as u16) {
-                        continue;
-                    }
-                    let velocity = (raw as f32 - grid.offset) / grid.scale;
-                    let relative = velocity
-                        - value_lookup
-                            .row_motion
-                            .get(candidate.row)
-                            .copied()
-                            .unwrap_or(0.0);
-                    let color = value_lookup.color_table.color_for_value(relative);
+                    let color = if grid.range_folded == Some(raw as u16) {
+                        value_lookup.color_table.range_folded_color()
+                    } else {
+                        let velocity = (raw as f32 - grid.offset) / grid.scale;
+                        let relative = velocity
+                            - value_lookup
+                                .row_motion
+                                .get(candidate.row)
+                                .copied()
+                                .unwrap_or(0.0);
+                        value_lookup.color_table.color_for_value(relative)
+                    };
                     if color[3] == 0 {
                         continue;
                     }
@@ -2082,17 +2083,18 @@ fn render_storm_relative_viewport_storage<T: RawMomentValue>(
                     if grid.nodata == Some(raw as u16) {
                         continue;
                     }
-                    if grid.range_folded == Some(raw as u16) {
-                        continue;
-                    }
-                    let velocity = (raw as f32 - grid.offset) / grid.scale;
-                    let relative = velocity
-                        - value_lookup
-                            .row_motion
-                            .get(candidate.row)
-                            .copied()
-                            .unwrap_or(0.0);
-                    let color = value_lookup.color_table.color_for_value(relative);
+                    let color = if grid.range_folded == Some(raw as u16) {
+                        value_lookup.color_table.range_folded_color()
+                    } else {
+                        let velocity = (raw as f32 - grid.offset) / grid.scale;
+                        let relative = velocity
+                            - value_lookup
+                                .row_motion
+                                .get(candidate.row)
+                                .copied()
+                                .unwrap_or(0.0);
+                        value_lookup.color_table.color_for_value(relative)
+                    };
                     if color[3] == 0 {
                         continue;
                     }
@@ -2133,7 +2135,7 @@ fn storm_relative_u8_color_for_raw(
         return [0, 0, 0, 0];
     }
     if grid.range_folded == Some(raw) {
-        return [0, 0, 0, 0];
+        return color_table.range_folded_color();
     }
     let velocity = (raw as f32 - grid.offset) / grid.scale;
     color_table.color_for_value(velocity - row_motion)
@@ -2308,13 +2310,19 @@ fn render_storm_relative_sample_cache_storage<T: RawMomentValue>(
                 debug_assert!(index < values.len());
                 debug_assert!(row < row_motion.len());
                 let raw = values[index].to_usize();
-                if grid.nodata != Some(raw as u16) && grid.range_folded != Some(raw as u16) {
+                if grid.nodata == Some(raw as u16) {
+                    pixel += 4;
+                    continue;
+                }
+                let color = if grid.range_folded == Some(raw as u16) {
+                    color_table.range_folded_color()
+                } else {
                     let velocity = (raw as f32 - grid.offset) / grid.scale;
                     let relative = velocity - row_motion[row];
-                    let color = color_table.color_for_value(relative);
-                    if color[3] != 0 {
-                        row_pixels[pixel..pixel + 4].copy_from_slice(&color);
-                    }
+                    color_table.color_for_value(relative)
+                };
+                if color[3] != 0 {
+                    row_pixels[pixel..pixel + 4].copy_from_slice(&color);
                 }
                 pixel += 4;
             }
@@ -2699,7 +2707,7 @@ fn resolve_compact_sample<T: RawMomentValue>(
             continue;
         }
         let raw = values[index].to_usize() as u16;
-        if grid.nodata == Some(raw) || grid.range_folded == Some(raw) {
+        if grid.nodata == Some(raw) {
             continue;
         }
         return Some(ResolvedSample {
@@ -2815,7 +2823,7 @@ fn color_for_raw(grid: &MomentGrid, color_table: &ColorTable, raw: u16) -> [u8; 
         return [0, 0, 0, 0];
     }
     if grid.range_folded == Some(raw) {
-        return [0, 0, 0, 0];
+        return color_table.range_folded_color();
     }
     color_table.color_for_value((raw as f32 - grid.offset) / grid.scale)
 }
@@ -3256,17 +3264,14 @@ fn row_valid_extent(grid: &MomentGrid, row: usize) -> usize {
             .and_then(|row| {
                 row.iter().rposition(|raw| {
                     let raw = u16::from(*raw);
-                    grid.nodata != Some(raw) && grid.range_folded != Some(raw)
+                    grid.nodata != Some(raw)
                 })
             })
             .map(|gate| gate + 1)
             .unwrap_or(0),
         MomentStorage::U16(values) => values
             .get(start..end)
-            .and_then(|row| {
-                row.iter()
-                    .rposition(|raw| grid.nodata != Some(*raw) && grid.range_folded != Some(*raw))
-            })
+            .and_then(|row| row.iter().rposition(|raw| grid.nodata != Some(*raw)))
             .map(|gate| gate + 1)
             .unwrap_or(0),
         MomentStorage::F32(values) => values
@@ -3370,7 +3375,7 @@ mod tests {
     }
 
     #[test]
-    fn velocity_range_folded_bins_render_transparent() {
+    fn velocity_range_folded_bins_render_table_rf_color() {
         let volume = test_volume();
         let grid = volume.cuts[0]
             .moments
@@ -3379,11 +3384,11 @@ mod tests {
         let tables = ColorTableSet::default();
         let table = tables.for_family(ColorTableFamily::Velocity);
 
-        assert_eq!(color_for_raw(grid, table, 1), [0, 0, 0, 0]);
+        assert_eq!(color_for_raw(grid, table, 1), table.range_folded_color());
     }
 
     #[test]
-    fn reflectivity_range_folded_bins_render_transparent() {
+    fn reflectivity_range_folded_bins_render_table_rf_color() {
         let volume = test_volume();
         let grid = volume.cuts[0]
             .moments
@@ -3392,7 +3397,7 @@ mod tests {
         let tables = ColorTableSet::default();
         let table = tables.for_family(ColorTableFamily::Reflectivity);
 
-        assert_eq!(color_for_raw(grid, table, 1), [0, 0, 0, 0]);
+        assert_eq!(color_for_raw(grid, table, 1), table.range_folded_color());
     }
 
     #[test]
@@ -3766,7 +3771,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_sample_resolution_skips_range_folded_candidates() {
+    fn compact_sample_resolution_keeps_visible_range_folded_candidates() {
         let gate_range = GateRange {
             first_gate_m: 0,
             gate_spacing_m: 1_000,
@@ -3781,24 +3786,19 @@ mod tests {
             Some(0),
             Some(1),
         );
-        for azimuth_deg in [0.0, 0.0] {
-            cut.radials.push(Radial {
-                azimuth_deg,
-                elevation_deg: 0.5,
-                time_offset_ms: 0,
-                gate_range: gate_range.clone(),
-                nyquist_velocity_mps: None,
-                radial_status: None,
-            });
-        }
+        cut.radials.push(Radial {
+            azimuth_deg: 0.0,
+            elevation_deg: 0.5,
+            time_offset_ms: 0,
+            gate_range: gate_range.clone(),
+            nyquist_velocity_mps: None,
+            radial_status: None,
+        });
         grid.push_u8_row_slice(0, &[1, 1, 1, 1])
             .expect("range-folded row");
-        grid.push_u8_row_slice(1, &[20, 30, 40, 50])
-            .expect("drawable row");
 
         let lookup = AzimuthLookup::new(&cut, &grid);
-        assert_eq!(row_valid_extent(&grid, 0), 0);
-        assert_eq!(row_valid_extent(&grid, 1), 4);
+        assert_eq!(row_valid_extent(&grid, 0), 4);
 
         let MomentStorage::U8(values) = &grid.storage else {
             panic!("test grid should use u8 storage");
@@ -3812,9 +3812,9 @@ mod tests {
                 gate: 3,
             },
         )
-        .expect("drawable duplicate should resolve");
+        .expect("range-folded sample should resolve");
 
-        assert_eq!(resolved.row, 1);
+        assert_eq!(resolved.row, 0);
         assert_eq!(resolved.gate, 3);
     }
 

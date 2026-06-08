@@ -530,7 +530,16 @@ impl FrameStatus {
 }
 
 fn history_archive_load_parallelism() -> usize {
-    effective_worker_threads().clamp(1, HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM)
+    history_archive_load_parallelism_for_threads(effective_worker_threads())
+}
+
+fn history_archive_load_parallelism_for_threads(threads: usize) -> usize {
+    match threads {
+        0..=2 => 1,
+        3..=4 => 2,
+        5..=7 => 3,
+        _ => HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM.min(threads),
+    }
 }
 
 fn decode_archive_history_object(
@@ -585,10 +594,19 @@ fn load_archive_history_objects_parallel(
     sender: &mpsc::Sender<AsyncLoadResult>,
 ) -> (Vec<DecodedLoad>, Option<String>) {
     let parallelism = history_archive_load_parallelism();
+    let priority_count = objects.len().min(parallelism.min(3));
     let mut decoded_frames = Vec::new();
     let mut first_error = None;
+    let mut offset = 0;
 
-    for chunk in objects.chunks(parallelism) {
+    while offset < objects.len() {
+        let chunk_size = if offset == 0 && priority_count > 0 {
+            priority_count
+        } else {
+            parallelism
+        };
+        let end = offset.saturating_add(chunk_size).min(objects.len());
+        let chunk = &objects[offset..end];
         let batch_results = thread::scope(|scope| {
             let mut workers = Vec::with_capacity(chunk.len());
             for (index, object) in chunk.iter().cloned() {
@@ -622,13 +640,26 @@ fn load_archive_history_objects_parallel(
 
         for result in batch_results {
             match result {
-                Ok(Ok(Some(decoded))) => decoded_frames.push(decoded),
+                Ok(Ok(Some(decoded))) => {
+                    let _ = sender.send(AsyncLoadResult {
+                        label: format!("L2 {site_id} loop frame"),
+                        update: AsyncLoadUpdate::History(
+                            DecodedLoadBatch {
+                                frames: vec![decoded.clone()],
+                                selected_index: 0,
+                            },
+                            false,
+                        ),
+                    });
+                    decoded_frames.push(decoded);
+                }
                 Ok(Ok(None)) => {}
                 Ok(Err(err)) | Err(err) => {
                     first_error.get_or_insert(err);
                 }
             }
         }
+        offset = end;
     }
 
     (decoded_frames, first_error)
@@ -796,16 +827,6 @@ fn spawn_latest_level2_load_worker(
                     );
                     fallback_error = fallback_error.or(history_error);
                     for decoded in history_frames {
-                        let _ = sender.send(AsyncLoadResult {
-                            label: format!("L2 {site_id} loop frame"),
-                            update: AsyncLoadUpdate::History(
-                                DecodedLoadBatch {
-                                    frames: vec![decoded.clone()],
-                                    selected_index: 0,
-                                },
-                                false,
-                            ),
-                        });
                         decoded_frames.push(decoded);
                     }
                 }
@@ -1972,7 +1993,9 @@ impl ViewerApp {
             .iter_mut()
             .find(|candidate| candidate.identity == identity)
         {
-            if frame.path == existing.path && frame.status == existing.status {
+            if live_partial_frame_has_new_data(&frame, existing) {
+                *existing = frame;
+            } else if frame.path == existing.path && frame.status == existing.status {
                 existing.timings = frame.timings;
                 existing.source_label = frame.source_label;
             } else if frame_status_priority(frame.status) > frame_status_priority(existing.status)
@@ -4015,7 +4038,9 @@ impl ViewerApp {
 
     fn active_product_color_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let family = self.selected_product.color_family();
-        let current_name = self.color_tables.for_family(family).name().to_owned();
+        let current_table = self.color_tables.for_family(family);
+        let current_name = current_table.name().to_owned();
+        let current_summary = color_table_summary(current_table);
         ui.add_space(6.0);
         ui.label("Color");
         egui::ComboBox::from_id_salt("active_product_color_preset")
@@ -4028,15 +4053,17 @@ impl ViewerApp {
                         .selectable_label(table_name == current_name, &table_name)
                         .clicked()
                     {
+                        let summary = color_table_summary(&table);
                         self.color_table_target = family;
                         self.color_tables.set_family(family, table);
                         self.clear_texture();
                         self.color_table_status =
-                            format!("Loaded {table_name} into {}", family.label());
+                            format!("Loaded {table_name} into {} ({summary})", family.label());
                         ctx.request_repaint();
                     }
                 }
             });
+        ui.label(current_summary);
     }
 
     fn radar_layers_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -4178,8 +4205,13 @@ impl ViewerApp {
             }
         });
 
-        let table_name = self.color_tables.for_family(self.color_table_target).name();
-        ui.label(format!("{}: {table_name}", self.color_table_target.label()));
+        let table = self.color_tables.for_family(self.color_table_target);
+        ui.label(format!(
+            "{}: {}",
+            self.color_table_target.label(),
+            table.name()
+        ));
+        ui.label(color_table_summary(table));
         egui::ComboBox::from_id_salt("color_table_builtin_preset")
             .selected_text("Built-ins")
             .width(220.0)
@@ -4187,10 +4219,11 @@ impl ViewerApp {
                 for table in builtin_tables_for_family(self.color_table_target) {
                     if ui.selectable_label(false, table.name()).clicked() {
                         let table_name = table.name().to_owned();
+                        let summary = color_table_summary(&table);
                         self.color_tables.set_family(self.color_table_target, table);
                         self.clear_texture();
                         self.color_table_status = format!(
-                            "Loaded {table_name} into {}",
+                            "Loaded {table_name} into {} ({summary})",
                             self.color_table_target.label()
                         );
                         ctx.request_repaint();
@@ -4235,7 +4268,7 @@ impl ViewerApp {
             .and_then(|stem| stem.to_str())
             .filter(|stem| !stem.is_empty())
             .unwrap_or("Custom color table");
-        let table = match ColorTable::parse(name, &text) {
+        let table = match parse_color_table_for_family(self.color_table_target, name, &text) {
             Ok(table) => table,
             Err(err) => {
                 self.color_table_status = format!("Color table parse failed: {err}");
@@ -4243,11 +4276,11 @@ impl ViewerApp {
             }
         };
         let table_name = table.name().to_owned();
-        let stop_count = table.stops().len();
+        let summary = color_table_summary(&table);
         self.color_tables.set_family(self.color_table_target, table);
         self.clear_texture();
         self.color_table_status = format!(
-            "Loaded {table_name} into {} ({stop_count} stops)",
+            "Loaded {table_name} into {} ({summary})",
             self.color_table_target.label()
         );
         ctx.request_repaint();
@@ -4257,10 +4290,13 @@ impl ViewerApp {
         let defaults = ColorTableSet::default();
         let table = defaults.for_family(self.color_table_target).clone();
         let table_name = table.name().to_owned();
+        let summary = color_table_summary(&table);
         self.color_tables.set_family(self.color_table_target, table);
         self.clear_texture();
-        self.color_table_status =
-            format!("Reset {} to {table_name}", self.color_table_target.label());
+        self.color_table_status = format!(
+            "Reset {} to {table_name} ({summary})",
+            self.color_table_target.label()
+        );
         ctx.request_repaint();
     }
 
@@ -5900,6 +5936,50 @@ fn default_hidden_hazard_families() -> BTreeSet<String> {
         .iter()
         .map(|family| (*family).to_owned())
         .collect()
+}
+
+fn parse_color_table_for_family(
+    family: ColorTableFamily,
+    name: &str,
+    text: &str,
+) -> Result<ColorTable, color_tables::ColorTableError> {
+    match family {
+        ColorTableFamily::Reflectivity
+        | ColorTableFamily::Velocity
+        | ColorTableFamily::SpectrumWidth => ColorTable::parse_stepped(name, text),
+        ColorTableFamily::Generic => ColorTable::parse(name, text),
+    }
+}
+
+fn color_table_summary(table: &ColorTable) -> String {
+    let range = table
+        .stops()
+        .first()
+        .zip(table.stops().last())
+        .map(|(first, last)| format!("range {:.1}..{:.1}", first.value, last.value))
+        .unwrap_or_else(|| "range unavailable".to_owned());
+    format!(
+        "{} stops, {}, {}, {range}",
+        table.stops().len(),
+        table.sample_mode_label(),
+        color_table_units_summary(table)
+    )
+}
+
+fn color_table_units_summary(table: &ColorTable) -> String {
+    let Some(units) = table
+        .units()
+        .map(str::trim)
+        .filter(|units| !units.is_empty())
+    else {
+        return "units unknown, assuming native".to_owned();
+    };
+    match units.to_ascii_lowercase().as_str() {
+        "kt" | "kts" | "knot" | "knots" | "mph" | "mi/h" => {
+            format!("units {units} -> m/s")
+        }
+        _ => format!("units {units}"),
+    }
 }
 
 fn hazard_record_is_active_or_pending(record: &HazardRecord) -> bool {
@@ -8189,6 +8269,23 @@ fn frame_status_priority(status: FrameStatus) -> u8 {
     }
 }
 
+fn live_partial_frame_has_new_data(
+    incoming: &FrameHistoryEntry,
+    existing: &FrameHistoryEntry,
+) -> bool {
+    incoming.status == FrameStatus::LivePartial
+        && existing.status == FrameStatus::LivePartial
+        && incoming.path == existing.path
+        && (incoming.volume.metadata.decoded_radial_count
+            > existing.volume.metadata.decoded_radial_count
+            || volume_total_radials(incoming.volume.as_ref())
+                > volume_total_radials(existing.volume.as_ref()))
+}
+
+fn volume_total_radials(volume: &RadarVolume) -> usize {
+    volume.cuts.iter().map(|cut| cut.radials.len()).sum()
+}
+
 fn frame_status_text(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> String {
     format!(
         "{} {} {} age {} ({})",
@@ -8609,6 +8706,17 @@ mod tests {
     }
 
     #[test]
+    fn history_archive_parallelism_scales_with_cpu_budget() {
+        assert_eq!(history_archive_load_parallelism_for_threads(1), 1);
+        assert_eq!(history_archive_load_parallelism_for_threads(4), 2);
+        assert_eq!(history_archive_load_parallelism_for_threads(6), 3);
+        assert_eq!(
+            history_archive_load_parallelism_for_threads(16),
+            HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM
+        );
+    }
+
+    #[test]
     fn block_bzip_preview_policy_only_uses_low_core_path() {
         assert!(should_preview_block_bzip_loads_for_threads(1));
         assert!(should_preview_block_bzip_loads_for_threads(
@@ -8935,6 +9043,30 @@ mod tests {
         ));
         assert!(!is_unchanged_realtime_refresh(true, other, Some(current)));
         assert!(!is_unchanged_realtime_refresh(true, current, None));
+    }
+
+    #[test]
+    fn live_partial_history_upsert_replaces_same_path_when_radials_increase() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let path = PathBuf::from("KTLX20260608_195512_RT035_V06");
+        let scan_time = Utc
+            .with_ymd_and_hms(2026, 6, 8, 19, 55, 12)
+            .single()
+            .expect("valid scan time");
+
+        app.upsert_history_frame(test_decoded_live_partial(
+            path.clone(),
+            "KTLX",
+            scan_time,
+            120,
+        ));
+        app.upsert_history_frame(test_decoded_live_partial(path, "KTLX", scan_time, 240));
+
+        assert_eq!(app.frame_history.len(), 1);
+        assert_eq!(
+            app.frame_history[0].volume.metadata.decoded_radial_count,
+            240
+        );
     }
 
     #[test]
@@ -9627,6 +9759,23 @@ mod tests {
         assert_eq!(records[0].event_family, "watch");
         assert_eq!(records[0].label, "WATCH 44");
         assert_eq!(records[0].points[0].lon, -97.50);
+    }
+
+    fn test_decoded_live_partial(
+        path: PathBuf,
+        site: &str,
+        scan_time: DateTime<Utc>,
+        decoded_radials: usize,
+    ) -> DecodedLoad {
+        let mut volume = RadarVolume::new(radar_core::RadarSite::new(site), scan_time);
+        volume.metadata.decoded_radial_count = decoded_radials;
+        DecodedLoad {
+            path,
+            volume,
+            timings: LoadTimings::default(),
+            status: FrameStatus::LivePartial,
+            source_label: format!("realtime L2 {site}"),
+        }
     }
 
     fn test_viewer_app_with_hazards(records: Vec<HazardRecord>) -> ViewerApp {

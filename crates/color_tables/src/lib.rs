@@ -108,12 +108,20 @@ impl ColorTable {
     }
 
     pub fn parse(name: impl Into<String>, text: &str) -> Result<Self, ColorTableError> {
+        Self::parse_with_default_mode(name, text, SampleMode::Interpolated)
+    }
+
+    pub fn parse_with_default_mode(
+        name: impl Into<String>,
+        text: &str,
+        default_sample_mode: SampleMode,
+    ) -> Result<Self, ColorTableError> {
         let name = name.into();
         let mut product = None;
         let mut units = None;
         let mut scale = None;
         let mut range_folded = default_range_folded_color();
-        let mut sample_mode = SampleMode::Interpolated;
+        let mut sample_mode = default_sample_mode;
         let mut stops = Vec::new();
 
         for (line_index, original_line) in text.lines().enumerate() {
@@ -138,6 +146,7 @@ impl ColorTable {
                 "product" => product = non_empty(value),
                 "units" => units = non_empty(value),
                 "scale" => scale = parse_positive_f32(value),
+                "step" => sample_mode = SampleMode::Stepped,
                 "mode" | "samplemode" | "interpolate" | "interpolation" | "smooth" => {
                     if let Some(parsed_mode) = parse_sample_mode(value) {
                         sample_mode = parsed_mode;
@@ -166,6 +175,10 @@ impl ColorTable {
         Self::from_parts(name, product, units, range_folded, sample_mode, stops)
     }
 
+    pub fn parse_stepped(name: impl Into<String>, text: &str) -> Result<Self, ColorTableError> {
+        Self::parse_with_default_mode(name, text, SampleMode::Stepped)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -184,6 +197,10 @@ impl ColorTable {
 
     pub fn interpolates(&self) -> bool {
         self.sample_mode == SampleMode::Interpolated
+    }
+
+    pub fn sample_mode_label(&self) -> &'static str {
+        self.sample_mode.label()
     }
 
     pub fn sample(&self, value: f32) -> Rgba8 {
@@ -280,9 +297,18 @@ impl ColorTable {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum SampleMode {
+pub enum SampleMode {
     Interpolated,
     Stepped,
+}
+
+impl SampleMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Interpolated => "interpolated",
+            Self::Stepped => "stepped",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -348,7 +374,7 @@ impl fmt::Display for ColorTableError {
 impl std::error::Error for ColorTableError {}
 
 pub fn builtin_reflectivity_table() -> ColorTable {
-    ColorTable::parse("WxTools RadarScope BR", RADARSCOPE_REFLECTIVITY_TABLE)
+    ColorTable::parse_stepped("WxTools RadarScope BR", RADARSCOPE_REFLECTIVITY_TABLE)
         .expect("built-in reflectivity color table is valid")
 }
 
@@ -357,7 +383,7 @@ pub fn builtin_velocity_table() -> ColorTable {
 }
 
 pub fn vortex_velocity_table() -> ColorTable {
-    ColorTable::parse("WxTools Vortex Velo", VORTEX_VELO_TABLE)
+    ColorTable::parse_stepped("WxTools Vortex Velo", VORTEX_VELO_TABLE)
         .expect("built-in velocity color table is valid")
 }
 
@@ -379,7 +405,7 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
 }
 
 pub fn analyst_reflectivity_table() -> ColorTable {
-    ColorTable::new(
+    ColorTable::new_stepped(
         "Analyst High Contrast REF",
         vec![
             stop(-10.0, 5, 8, 18),
@@ -400,7 +426,7 @@ pub fn analyst_reflectivity_table() -> ColorTable {
 }
 
 pub fn nws_reflectivity_table() -> ColorTable {
-    ColorTable::new(
+    ColorTable::new_stepped(
         "NWS Classic REF",
         vec![
             stop(5.0, 4, 233, 231),
@@ -424,12 +450,12 @@ pub fn nws_reflectivity_table() -> ColorTable {
 }
 
 pub fn analyst_velocity_table() -> ColorTable {
-    ColorTable::parse("Analyst Pro VEL", ANALYST_PRO_VELOCITY_TABLE)
+    ColorTable::parse_stepped("Analyst Pro VEL", ANALYST_PRO_VELOCITY_TABLE)
         .expect("built-in analyst velocity color table is valid")
 }
 
 pub fn nws_velocity_table() -> ColorTable {
-    ColorTable::parse("NWS Classic VEL", NWS_VELOCITY_TABLE)
+    ColorTable::parse_stepped("NWS Classic VEL", NWS_VELOCITY_TABLE)
         .expect("built-in nws velocity color table is valid")
 }
 
@@ -775,6 +801,88 @@ mod tests {
         assert!(!table.interpolates());
         assert_eq!(table.sample(5.0), Rgba8::opaque(0, 0, 0));
         assert_eq!(table.sample(10.0), Rgba8::opaque(255, 255, 255));
+    }
+
+    #[test]
+    fn step_rows_make_pal_style_tables_stepped() {
+        let table = ColorTable::parse(
+            "RadarScope sample",
+            r#"
+            product: BR
+            units: dBZ
+            step: 5
+            color4: -15 0 0 0 0
+            color: 5 29 37 60
+            "#,
+        )
+        .expect("table parses");
+
+        assert!(!table.interpolates());
+        assert_eq!(table.sample_mode_label(), "stepped");
+        assert_eq!(table.sample(-10.0), Rgba8::TRANSPARENT);
+        assert_eq!(table.sample(0.0), Rgba8::TRANSPARENT);
+        assert_eq!(table.sample(5.0), Rgba8::opaque(29, 37, 60));
+    }
+
+    #[test]
+    fn parse_stepped_defaults_to_bins_without_mode_line() {
+        let table = ColorTable::parse_stepped(
+            "NWS sample",
+            r#"
+            units: dBZ
+            color: 0 0 0 0
+            color: 10 255 255 255
+            "#,
+        )
+        .expect("table parses");
+
+        assert!(!table.interpolates());
+        assert_eq!(table.sample(5.0), Rgba8::opaque(0, 0, 0));
+    }
+
+    #[test]
+    fn explicit_interpolated_mode_overrides_stepped_default() {
+        let table = ColorTable::parse_stepped(
+            "Smooth sample",
+            r#"
+            mode: interpolated
+            color: 0 0 0 0
+            color: 10 100 100 100
+            "#,
+        )
+        .expect("table parses");
+
+        assert!(table.interpolates());
+        assert_eq!(table.sample(5.0), Rgba8::opaque(50, 50, 50));
+    }
+
+    #[test]
+    fn radarscope_reflectivity_preset_is_stepped() {
+        let table = builtin_reflectivity_table();
+
+        assert_eq!(table.name(), "WxTools RadarScope BR");
+        assert!(!table.interpolates());
+        assert_eq!(table.sample_mode_label(), "stepped");
+        assert_eq!(table.sample(0.0), Rgba8::TRANSPARENT);
+        assert_eq!(table.sample(5.0), Rgba8::opaque(29, 37, 60));
+    }
+
+    #[test]
+    fn builtin_radar_presets_default_to_stepped_sampling() {
+        for table in [
+            builtin_reflectivity_table(),
+            analyst_reflectivity_table(),
+            nws_reflectivity_table(),
+            builtin_velocity_table(),
+            vortex_velocity_table(),
+            nws_velocity_table(),
+        ] {
+            assert!(
+                !table.interpolates(),
+                "{} should use stepped radar bins",
+                table.name()
+            );
+        }
     }
 
     #[test]
