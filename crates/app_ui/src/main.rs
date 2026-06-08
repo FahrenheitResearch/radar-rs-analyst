@@ -48,8 +48,10 @@ const FRESH_RING_GREEN_SECONDS: i64 = 6 * 60;
 const FRESH_RING_YELLOW_SECONDS: i64 = 10 * 60;
 const FRESH_RING_RED_SECONDS: i64 = 15 * 60;
 const PERF_SAMPLE_CAPACITY: usize = 96;
-const LATEST_OBJECT_CACHE_TTL: Duration = Duration::from_secs(10);
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
+const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30];
+const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
+const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
 const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
@@ -92,10 +94,7 @@ const BASEMAP_US_DETAIL_BOUNDS: &[[f32; 4]] = &[
 const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 
 fn main() -> eframe::Result {
-    let input_path = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_sample_path);
+    let input_path = std::env::args_os().nth(1).map(PathBuf::from);
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -111,24 +110,57 @@ fn main() -> eframe::Result {
     )
 }
 
-fn default_sample_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("work")
-        .join("radar-rs-analyst-samples")
-        .join("KTLX20130520_201643_V06.gz")
+fn cache_dir(name: &str) -> PathBuf {
+    app_cache_root()
+        .join("level2")
+        .join(sanitized_cache_segment(name))
 }
 
-fn cache_dir(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("work")
+fn app_cache_root() -> PathBuf {
+    if let Ok(path) = std::env::var("RADAR_RS_ANALYST_CACHE_DIR")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+
+    #[cfg(windows)]
+    if let Ok(path) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(path).join("Radar RS Analyst").join("cache");
+    }
+
+    #[cfg(not(windows))]
+    if let Ok(path) = std::env::var("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("radar-rs-analyst");
+    }
+
+    #[cfg(not(windows))]
+    if let Ok(path) = std::env::var("HOME") {
+        return PathBuf::from(path).join(".cache").join("radar-rs-analyst");
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(std::env::temp_dir)
         .join("radar-rs-analyst-cache")
-        .join(name)
+}
+
+fn sanitized_cache_segment(value: &str) -> String {
+    let segment = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if segment.is_empty() {
+        "unknown".to_owned()
+    } else {
+        segment
+    }
 }
 
 fn should_preview_loads() -> bool {
@@ -170,6 +202,8 @@ fn decode_load_path_with_optional_preview(
     mut timings: LoadTimings,
     sender: &mpsc::Sender<AsyncLoadResult>,
     preview_enabled: bool,
+    status: FrameStatus,
+    source_label: String,
 ) -> Result<DecodedLoad, String> {
     let read_start = Instant::now();
     let raw = std::fs::read(&path)
@@ -186,6 +220,8 @@ fn decode_load_path_with_optional_preview(
             path,
             volume,
             timings: timings.finish(total_start),
+            status,
+            source_label,
         });
     }
 
@@ -208,6 +244,8 @@ fn decode_load_path_with_optional_preview(
                 path: preview_path.clone(),
                 volume: preview,
                 timings: preview_timings.finish(total_start),
+                status: FrameStatus::Preview,
+                source_label: preview_label.clone(),
             }),
         });
         if sent.is_ok() && !preview_head_start.is_zero() {
@@ -242,14 +280,21 @@ fn decode_load_path_with_optional_preview(
         path,
         volume,
         timings: timings.finish(total_start),
+        status,
+        source_label,
     })
 }
 
 struct ViewerApp {
-    source_path: PathBuf,
+    source_path: Option<PathBuf>,
     volume: Option<Arc<RadarVolume>>,
     selected_cut: usize,
     selected_product: DisplayProduct,
+    frame_history: Vec<FrameHistoryEntry>,
+    selected_frame_index: usize,
+    history_frame_limit: usize,
+    history_playing: bool,
+    last_history_step: Option<Instant>,
     color_tables: ColorTableSet,
     color_table_target: ColorTableFamily,
     color_table_path_text: String,
@@ -366,8 +411,9 @@ struct AsyncLoadResult {
 
 enum AsyncLoadUpdate {
     Preview(DecodedLoad),
+    History(DecodedLoadBatch, bool),
     Unchanged,
-    Final(Result<DecodedLoad, String>),
+    Final(Result<DecodedLoadBatch, String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,16 +454,79 @@ enum AsyncHazardUpdate {
     Final(Result<HazardOverlay, String>),
 }
 
+#[derive(Clone)]
 struct DecodedLoad {
     path: PathBuf,
     volume: RadarVolume,
     timings: LoadTimings,
+    status: FrameStatus,
+    source_label: String,
+}
+
+#[derive(Clone)]
+struct DecodedLoadBatch {
+    frames: Vec<DecodedLoad>,
+    selected_index: usize,
+}
+
+impl DecodedLoadBatch {
+    fn single(decoded: DecodedLoad) -> Self {
+        Self {
+            frames: vec![decoded],
+            selected_index: 0,
+        }
+    }
+
+    fn into_selected(self) -> Option<DecodedLoad> {
+        self.frames.into_iter().nth(self.selected_index)
+    }
+}
+
+#[derive(Clone)]
+struct FrameHistoryEntry {
+    identity: FrameIdentity,
+    path: PathBuf,
+    volume: Arc<RadarVolume>,
+    timings: Option<LoadTimings>,
+    status: FrameStatus,
+    source_label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct FrameIdentity {
+    site_id: String,
+    scan_time_utc: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameStatus {
+    Local,
+    Preview,
+    LivePartial,
+    LiveComplete,
+    Complete,
+    Stale,
+}
+
+impl FrameStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Preview => "preview",
+            Self::LivePartial => "live partial",
+            Self::LiveComplete => "live complete",
+            Self::Complete => "complete",
+            Self::Stale => "stale",
+        }
+    }
 }
 
 fn spawn_latest_level2_load_worker(
     site: RadarSite,
     mode: LatestLoadMode,
     current_source_path: Option<PathBuf>,
+    known_frame_paths: BTreeSet<PathBuf>,
+    history_limit: usize,
     sender: mpsc::Sender<AsyncLoadResult>,
 ) {
     thread::spawn(move || {
@@ -426,6 +535,11 @@ fn spawn_latest_level2_load_worker(
         let site_cache_dir = cache_dir(&site.level2_id);
 
         let final_update = (|| -> Result<AsyncLoadUpdate, String> {
+            let history_limit = history_limit.max(1);
+            let mut decoded_frames = Vec::new();
+            let mut selected_identity = None;
+            let mut fallback_error = None;
+
             let realtime_result = (|| -> Result<DecodedLoad, String> {
                 let mut realtime_timings = LoadTimings::default();
                 let lookup_start = Instant::now();
@@ -454,6 +568,12 @@ fn spawn_latest_level2_load_worker(
                     realtime_timings,
                     &sender,
                     should_preview_loads(),
+                    if realtime.complete {
+                        FrameStatus::LiveComplete
+                    } else {
+                        FrameStatus::LivePartial
+                    },
+                    format!("realtime L2 {site_id}"),
                 )?;
                 if global_displayable_products(&decoded.volume).is_empty() {
                     return Err("realtime chunks are not displayable yet".to_owned());
@@ -461,38 +581,113 @@ fn spawn_latest_level2_load_worker(
                 Ok(decoded)
             })();
             if let Ok(decoded) = realtime_result {
-                return Ok(AsyncLoadUpdate::Final(Ok(decoded)));
-            } else if mode == LatestLoadMode::AutoRefresh {
-                return Ok(AsyncLoadUpdate::Unchanged);
+                selected_identity = Some(frame_identity_for_volume(&decoded.volume));
+                let _ = sender.send(AsyncLoadResult {
+                    label: format!("L2 {site_id} current"),
+                    update: AsyncLoadUpdate::History(
+                        DecodedLoadBatch {
+                            frames: vec![decoded.clone()],
+                            selected_index: 0,
+                        },
+                        true,
+                    ),
+                });
+                decoded_frames.push(decoded);
+            } else if let Err(err) = realtime_result {
+                fallback_error = Some(err);
             }
 
-            let mut timings = LoadTimings::default();
             let lookup_start = Instant::now();
-            let latest = data_source::latest_level2_object_cached(
-                &site.level2_id,
-                7,
-                LATEST_OBJECT_CACHE_TTL,
-            )
-            .map_err(|err| err.to_string())?;
-            timings.lookup_ms = Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
-            timings.lookup_cache_hit = Some(latest.cache_hit);
+            match data_source::recent_level2_objects(&site.level2_id, 7, history_limit) {
+                Ok(objects) => {
+                    let lookup_ms = lookup_start.elapsed().as_secs_f32() * 1000.0;
+                    for (index, object) in objects.into_iter().enumerate() {
+                        if decoded_frames.len() >= history_limit {
+                            break;
+                        }
 
-            let fetch_start = Instant::now();
-            let downloaded =
-                data_source::download_object(LEVEL2_ARCHIVE_BUCKET, latest.object, &site_cache_dir)
-                    .map_err(|err| err.to_string())?;
-            timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
-            timings.fetch_cache_hit = Some(downloaded.cache_hit);
+                        let mut timings = LoadTimings::default();
+                        if index == 0 {
+                            timings.lookup_ms = Some(lookup_ms);
+                            timings.lookup_cache_hit = Some(false);
+                        }
 
-            let decoded = decode_load_path_with_optional_preview(
-                downloaded.path,
-                &format!("L2 {site_id}"),
-                total_start,
-                timings,
-                &sender,
-                should_preview_loads(),
-            )?;
-            Ok(AsyncLoadUpdate::Final(Ok(decoded)))
+                        let fetch_start = Instant::now();
+                        let downloaded = data_source::download_object(
+                            LEVEL2_ARCHIVE_BUCKET,
+                            object,
+                            &site_cache_dir,
+                        )
+                        .map_err(|err| err.to_string())?;
+                        timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
+                        timings.fetch_cache_hit = Some(downloaded.cache_hit);
+
+                        if mode == LatestLoadMode::AutoRefresh
+                            && downloaded.cache_hit
+                            && known_frame_paths.contains(&downloaded.path)
+                        {
+                            continue;
+                        }
+
+                        let mut decoded = decode_load_path_with_optional_preview(
+                            downloaded.path,
+                            &format!("L2 {site_id}"),
+                            total_start,
+                            timings,
+                            &sender,
+                            should_preview_loads(),
+                            FrameStatus::Complete,
+                            format!("archive L2 {site_id}"),
+                        )?;
+                        decoded.status = archive_frame_status(
+                            decoded.volume.volume_time.with_timezone(&Utc),
+                            Utc::now(),
+                        );
+                        if global_displayable_products(&decoded.volume).is_empty() {
+                            continue;
+                        }
+                        let _ = sender.send(AsyncLoadResult {
+                            label: format!("L2 {site_id} history"),
+                            update: AsyncLoadUpdate::History(
+                                DecodedLoadBatch {
+                                    frames: vec![decoded.clone()],
+                                    selected_index: 0,
+                                },
+                                false,
+                            ),
+                        });
+                        decoded_frames.push(decoded);
+                    }
+                }
+                Err(err) => {
+                    fallback_error.get_or_insert_with(|| err.to_string());
+                }
+            }
+
+            if decoded_frames.is_empty() {
+                if mode == LatestLoadMode::AutoRefresh {
+                    return Ok(AsyncLoadUpdate::Unchanged);
+                }
+                return Err(fallback_error
+                    .unwrap_or_else(|| "no displayable Level II scans found".to_owned()));
+            }
+
+            decoded_frames.sort_by(|left, right| {
+                frame_identity_for_volume(&left.volume)
+                    .cmp(&frame_identity_for_volume(&right.volume))
+            });
+            let selected_index = selected_identity
+                .and_then(|identity| {
+                    decoded_frames
+                        .iter()
+                        .position(|decoded| frame_identity_for_volume(&decoded.volume) == identity)
+                })
+                .unwrap_or_else(|| decoded_frames.len().saturating_sub(1));
+
+            Ok(AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                frames: decoded_frames,
+                selected_index,
+            })))
         })();
         let update = final_update.unwrap_or_else(|err| AsyncLoadUpdate::Final(Err(err)));
         let _ = sender.send(AsyncLoadResult {
@@ -1182,7 +1377,7 @@ fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
 }
 
 impl ViewerApp {
-    fn new(cc: &eframe::CreationContext<'_>, source_path: PathBuf) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, source_path: Option<PathBuf>) -> Self {
         configure_style(&cc.egui_ctx);
         let sites = data_source::fallback_sites();
         let selected_site_index = sites
@@ -1201,6 +1396,11 @@ impl ViewerApp {
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
+            frame_history: Vec::new(),
+            selected_frame_index: 0,
+            history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
+            history_playing: false,
+            last_history_step: None,
             color_tables: ColorTableSet::default(),
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
@@ -1258,7 +1458,13 @@ impl ViewerApp {
     }
 
     fn load_volume(&mut self, ctx: &egui::Context) {
-        self.start_local_volume_load(self.source_path.clone(), ctx);
+        if let Some(path) = self.source_path.clone() {
+            self.start_local_volume_load(path, ctx);
+        } else if let Some(site) = self.selected_site().cloned() {
+            self.start_latest_level2_load(site, ctx);
+        } else {
+            self.status = "Choose a radar site to load Level II data".to_owned();
+        }
     }
 
     fn load_live_hazards(&mut self, ctx: &egui::Context) {
@@ -1417,7 +1623,14 @@ impl ViewerApp {
         let current_source_path = (mode == LatestLoadMode::AutoRefresh)
             .then(|| layer.source_path.clone())
             .flatten();
-        spawn_latest_level2_load_worker(layer.site.clone(), mode, current_source_path, sender);
+        spawn_latest_level2_load_worker(
+            layer.site.clone(),
+            mode,
+            current_source_path,
+            BTreeSet::new(),
+            1,
+            sender,
+        );
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
@@ -1433,6 +1646,12 @@ impl ViewerApp {
                                 Self::install_radar_layer_volume(layer, decoded);
                                 layer.status = format!("Preview {}", message.label);
                             }
+                            AsyncLoadUpdate::History(batch, select_frame) => {
+                                if select_frame && let Some(decoded) = batch.into_selected() {
+                                    Self::install_radar_layer_volume(layer, decoded);
+                                    layer.status = format!("Loaded {}", message.label);
+                                }
+                            }
                             AsyncLoadUpdate::Unchanged => {
                                 layer.load_receiver = None;
                                 layer.status = format!("Current {}", message.label);
@@ -1441,8 +1660,10 @@ impl ViewerApp {
                             AsyncLoadUpdate::Final(result) => {
                                 layer.load_receiver = None;
                                 match result {
-                                    Ok(decoded) => {
-                                        Self::install_radar_layer_volume(layer, decoded);
+                                    Ok(batch) => {
+                                        if let Some(decoded) = batch.into_selected() {
+                                            Self::install_radar_layer_volume(layer, decoded);
+                                        }
                                         layer.status = format!("Loaded {}", message.label);
                                     }
                                     Err(err) => {
@@ -1505,18 +1726,142 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
-    fn install_volume(
+    fn install_preview_volume(&mut self, decoded: DecodedLoad, ctx: &egui::Context) {
+        let source_path = decoded.path;
+        self.source_path = Some(source_path.clone());
+        self.install_volume_arc(
+            Arc::new(decoded.volume),
+            Some(decoded.timings),
+            false,
+            Some(source_path),
+            ctx,
+        );
+    }
+
+    fn install_decoded_load_batch(
         &mut self,
-        volume: RadarVolume,
+        batch: DecodedLoadBatch,
+        record_final_decode: bool,
+        select_loaded_frame: bool,
+        ctx: &egui::Context,
+    ) {
+        if batch.frames.is_empty() {
+            return;
+        }
+        let selected_index = batch.selected_index.min(batch.frames.len() - 1);
+        let selected_identity = frame_identity_for_volume(&batch.frames[selected_index].volume);
+        let active_identity = self
+            .volume
+            .as_ref()
+            .map(|volume| frame_identity_for_volume(volume.as_ref()));
+        let selected_site_id = selected_identity.site_id.clone();
+        if self
+            .volume
+            .as_ref()
+            .is_some_and(|volume| volume.site.id != selected_site_id)
+        {
+            self.frame_history.clear();
+            self.selected_frame_index = 0;
+        }
+
+        for decoded in batch.frames {
+            self.upsert_history_frame(decoded);
+        }
+        self.frame_history
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
+        self.trim_frame_history();
+
+        if select_loaded_frame {
+            let next_index = self
+                .frame_history
+                .iter()
+                .position(|frame| frame.identity == selected_identity)
+                .unwrap_or_else(|| self.frame_history.len().saturating_sub(1));
+            self.select_history_frame(next_index, record_final_decode, ctx);
+        } else if let Some(active_identity) = active_identity
+            && let Some(index) = self
+                .frame_history
+                .iter()
+                .position(|frame| frame.identity == active_identity)
+        {
+            self.selected_frame_index = index;
+            self.status = format!("Backfilled {}", selected_identity.site_id);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint();
+        }
+    }
+
+    fn upsert_history_frame(&mut self, decoded: DecodedLoad) {
+        let identity = frame_identity_for_volume(&decoded.volume);
+        let frame = FrameHistoryEntry {
+            identity: identity.clone(),
+            path: decoded.path,
+            volume: Arc::new(decoded.volume),
+            timings: Some(decoded.timings),
+            status: decoded.status,
+            source_label: decoded.source_label,
+        };
+        if let Some(existing) = self
+            .frame_history
+            .iter_mut()
+            .find(|candidate| candidate.identity == identity)
+        {
+            if frame_status_priority(frame.status) >= frame_status_priority(existing.status)
+                || frame.path == existing.path
+            {
+                *existing = frame;
+            }
+        } else {
+            self.frame_history.push(frame);
+        }
+    }
+
+    fn trim_frame_history(&mut self) {
+        self.history_frame_limit = normalized_history_limit(self.history_frame_limit);
+        while self.frame_history.len() > self.history_frame_limit {
+            self.frame_history.remove(0);
+        }
+        self.selected_frame_index = self
+            .selected_frame_index
+            .min(self.frame_history.len().saturating_sub(1));
+    }
+
+    fn select_history_frame(
+        &mut self,
+        index: usize,
+        record_final_decode: bool,
+        ctx: &egui::Context,
+    ) {
+        let Some(frame) = self.frame_history.get(index).cloned() else {
+            return;
+        };
+        self.selected_frame_index = index;
+        self.history_playing &= self.frame_history.len() > 1;
+        self.source_path = Some(frame.path.clone());
+        self.install_volume_arc(
+            Arc::clone(&frame.volume),
+            frame.timings,
+            record_final_decode,
+            Some(frame.path),
+            ctx,
+        );
+        self.status = self.selected_frame_status_text();
+    }
+
+    fn install_volume_arc(
+        &mut self,
+        volume: Arc<RadarVolume>,
         load_timing: Option<LoadTimings>,
         record_final_decode: bool,
+        source_path: Option<PathBuf>,
         ctx: &egui::Context,
     ) {
         let (selected_cut, selected_product) = selection_for_installed_volume(
             self.volume.as_deref(),
             self.selected_cut,
             &self.selected_product,
-            &volume,
+            volume.as_ref(),
         );
         if let Some(index) = self
             .sites
@@ -1528,17 +1873,22 @@ impl ViewerApp {
         if record_final_decode && let Some(load_timing) = load_timing {
             self.perf.record_decode(load_timing.decode_ms);
         }
-        let preserve_texture = self
+        let previous_volume_ptr = self
             .volume
             .as_ref()
-            .is_some_and(|current| current.site.id == volume.site.id);
+            .map(|volume| Arc::as_ptr(volume) as usize);
+        let next_volume_ptr = Arc::as_ptr(&volume) as usize;
+        let same_volume = previous_volume_ptr == Some(next_volume_ptr);
+        if let Some(source_path) = source_path {
+            self.source_path = Some(source_path);
+        }
         self.load_timing = load_timing;
-        self.volume = Some(Arc::new(volume));
+        self.volume = Some(volume);
         self.dealiased_readout_cache = None;
         self.selected_cut = selected_cut;
         self.selected_product = selected_product;
         self.sanitize_selection();
-        if preserve_texture {
+        if same_volume {
             self.pending_render_key = None;
             self.render_ms = None;
             self.worker_ms = None;
@@ -1546,6 +1896,55 @@ impl ViewerApp {
             self.sample_cache_build_ms = None;
         } else {
             self.clear_texture();
+        }
+        ctx.request_repaint();
+    }
+
+    fn selected_frame_status_text(&self) -> String {
+        self.frame_history
+            .get(self.selected_frame_index)
+            .map(|frame| frame_status_text(frame, Utc::now()))
+            .unwrap_or_else(|| "No Level II frame loaded".to_owned())
+    }
+
+    fn current_history_paths(&self) -> BTreeSet<PathBuf> {
+        self.frame_history
+            .iter()
+            .map(|frame| frame.path.clone())
+            .collect()
+    }
+
+    fn maybe_advance_history_loop(&mut self, ctx: &egui::Context) {
+        if !self.history_playing || self.frame_history.len() <= 1 {
+            return;
+        }
+        let should_step = self.last_history_step.is_none_or(|last_step| {
+            last_step.elapsed() >= Duration::from_millis(HISTORY_LOOP_FRAME_MS)
+        });
+        if should_step {
+            let next_index = (self.selected_frame_index + 1) % self.frame_history.len();
+            self.last_history_step = Some(Instant::now());
+            self.select_history_frame(next_index, false, ctx);
+        }
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    fn set_history_frame_limit(&mut self, limit: usize, ctx: &egui::Context) {
+        let active_identity = self
+            .volume
+            .as_ref()
+            .map(|volume| frame_identity_for_volume(volume.as_ref()));
+        self.history_frame_limit = normalized_history_limit(limit);
+        self.trim_frame_history();
+        if let Some(identity) = active_identity
+            && let Some(index) = self
+                .frame_history
+                .iter()
+                .position(|frame| frame.identity == identity)
+        {
+            self.selected_frame_index = index;
+        } else {
+            self.selected_frame_index = self.frame_history.len().saturating_sub(1);
         }
         ctx.request_repaint();
     }
@@ -1732,9 +2131,15 @@ impl ViewerApp {
                     saw_message = true;
                     match message.update {
                         AsyncLoadUpdate::Preview(decoded) => {
-                            self.source_path = decoded.path;
-                            self.install_volume(decoded.volume, Some(decoded.timings), false, ctx);
+                            self.install_preview_volume(decoded, ctx);
                             self.status = format!("Preview {}", message.label);
+                        }
+                        AsyncLoadUpdate::History(batch, select_frame) => {
+                            self.install_decoded_load_batch(batch, false, select_frame, ctx);
+                            if select_frame {
+                                self.status =
+                                    format!("Loaded {}; backfilling history", message.label);
+                            }
                         }
                         AsyncLoadUpdate::Unchanged => {
                             self.load_receiver = None;
@@ -1747,14 +2152,8 @@ impl ViewerApp {
                             self.load_receiver = None;
                             self.pending_site_id = None;
                             match result {
-                                Ok(decoded) => {
-                                    self.source_path = decoded.path;
-                                    self.install_volume(
-                                        decoded.volume,
-                                        Some(decoded.timings),
-                                        true,
-                                        ctx,
-                                    );
+                                Ok(batch) => {
+                                    self.install_decoded_load_batch(batch, true, true, ctx);
                                     self.status = format!("Loaded {}", message.label);
                                 }
                                 Err(err) => {
@@ -2962,7 +3361,10 @@ impl ViewerApp {
                 LoadTimings::default(),
                 &sender,
                 should_preview_loads(),
-            );
+                FrameStatus::Local,
+                format!("local {label}"),
+            )
+            .map(DecodedLoadBatch::single);
             let _ = sender.send(AsyncLoadResult {
                 label,
                 update: AsyncLoadUpdate::Final(result),
@@ -3000,13 +3402,26 @@ impl ViewerApp {
         } else {
             format!("Loading latest L2 {site_id}")
         };
-        let current_source_path =
-            (mode == LatestLoadMode::AutoRefresh).then(|| self.source_path.clone());
+        let current_source_path = (mode == LatestLoadMode::AutoRefresh)
+            .then(|| self.source_path.clone())
+            .flatten();
+        let known_frame_paths = if mode == LatestLoadMode::AutoRefresh {
+            self.current_history_paths()
+        } else {
+            BTreeSet::new()
+        };
         if should_clear_display_for_latest_load(self.volume.as_deref(), &site_id, Utc::now()) {
             self.clear_displayed_volume_for_pending_load(ctx);
         }
 
-        spawn_latest_level2_load_worker(site, mode, current_source_path, sender);
+        spawn_latest_level2_load_worker(
+            site,
+            mode,
+            current_source_path,
+            known_frame_paths,
+            self.history_frame_limit,
+            sender,
+        );
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 }
@@ -3023,6 +3438,7 @@ impl eframe::App for ViewerApp {
         self.maybe_refresh_realtime_level2(&ctx);
         self.maybe_refresh_radar_layers(&ctx);
         self.maybe_refresh_live_hazards(&ctx);
+        self.maybe_advance_history_loop(&ctx);
         self.sanitize_selection();
         self.handle_keyboard_navigation(&ctx);
 
@@ -3207,6 +3623,8 @@ impl ViewerApp {
         ui.label(format!("VCP {vcp}"));
         ui.label(format!("{cut_count} cuts, {decoded_radials} radials"));
 
+        self.frame_history_panel(ui, ctx);
+
         ui.add_space(12.0);
         ui.label("Product");
         ui.horizontal_wrapped(|ui| {
@@ -3282,6 +3700,105 @@ impl ViewerApp {
                     }
                 }
             });
+    }
+
+    fn frame_history_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label("History");
+            let mut selected_limit = self.history_frame_limit;
+            egui::ComboBox::from_id_salt("history_frame_limit")
+                .selected_text(format!("{} frames", self.history_frame_limit))
+                .width(92.0)
+                .show_ui(ui, |ui| {
+                    for limit in HISTORY_SIZE_OPTIONS {
+                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
+                    }
+                });
+            if selected_limit != self.history_frame_limit {
+                self.set_history_frame_limit(selected_limit, ctx);
+            }
+        });
+
+        if self.frame_history.is_empty() {
+            ui.label("No history frames loaded");
+            return;
+        }
+
+        ui.label(self.selected_frame_status_text());
+
+        let frame_count = self.frame_history.len();
+        let mut next_frame_index = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, "<", 28.0))
+                .inner
+                .on_hover_text("Previous frame")
+                .clicked()
+            {
+                next_frame_index =
+                    Some((self.selected_frame_index + frame_count - 1) % frame_count);
+            }
+            let play_label = if self.history_playing {
+                "Pause"
+            } else {
+                "Play"
+            };
+            if ui
+                .add_enabled_ui(frame_count > 1, |ui| {
+                    fixed_action_button(ui, play_label, 54.0)
+                })
+                .inner
+                .on_hover_text("Loop loaded history frames")
+                .clicked()
+            {
+                self.history_playing = !self.history_playing;
+                self.last_history_step = Some(Instant::now());
+                ctx.request_repaint_after(Duration::from_millis(HISTORY_LOOP_FRAME_MS));
+            }
+            if ui
+                .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, ">", 28.0))
+                .inner
+                .on_hover_text("Next frame")
+                .clicked()
+            {
+                next_frame_index = Some((self.selected_frame_index + 1) % frame_count);
+            }
+        });
+
+        let mut slider_index = self.selected_frame_index.min(frame_count - 1);
+        if ui
+            .add_enabled(
+                frame_count > 1,
+                egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false),
+            )
+            .on_hover_text("Scrub decoded frame history")
+            .changed()
+        {
+            next_frame_index = Some(slider_index);
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            for (index, frame) in self.frame_history.iter().enumerate() {
+                let label = compact_frame_label(frame, Utc::now());
+                let selected = index == self.selected_frame_index;
+                if ui
+                    .add_sized(
+                        egui::vec2(72.0, PANEL_BUTTON_HEIGHT),
+                        egui::Button::selectable(selected, label),
+                    )
+                    .on_hover_text(frame_status_text(frame, Utc::now()))
+                    .clicked()
+                {
+                    next_frame_index = Some(index);
+                }
+            }
+        });
+
+        if let Some(index) = next_frame_index {
+            self.history_playing = false;
+            self.select_history_frame(index, false, ctx);
+        }
     }
 
     fn active_product_color_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -3886,7 +4403,7 @@ impl ViewerApp {
                 ui.label(format!("{} overlays", self.radar_layers.len()));
             }
             ui.separator();
-            ui.label(self.source_path.display().to_string());
+            ui.label(self.selected_frame_status_text());
         });
     }
 
@@ -7373,6 +7890,99 @@ fn should_clear_display_for_latest_load(
         > STALE_LATEST_DISPLAY_CLEAR_SECONDS
 }
 
+fn normalized_history_limit(limit: usize) -> usize {
+    if HISTORY_SIZE_OPTIONS.contains(&limit) {
+        limit
+    } else {
+        DEFAULT_HISTORY_FRAME_LIMIT
+    }
+}
+
+fn frame_identity_for_volume(volume: &RadarVolume) -> FrameIdentity {
+    FrameIdentity {
+        site_id: volume.site.id.clone(),
+        scan_time_utc: volume.volume_time.with_timezone(&Utc),
+    }
+}
+
+fn archive_frame_status(volume_time_utc: DateTime<Utc>, now_utc: DateTime<Utc>) -> FrameStatus {
+    if now_utc.signed_duration_since(volume_time_utc).num_seconds()
+        > STALE_LATEST_DISPLAY_CLEAR_SECONDS
+    {
+        FrameStatus::Stale
+    } else {
+        FrameStatus::Complete
+    }
+}
+
+fn frame_status_priority(status: FrameStatus) -> u8 {
+    match status {
+        FrameStatus::Preview => 0,
+        FrameStatus::LivePartial => 1,
+        FrameStatus::Complete | FrameStatus::Stale => 2,
+        FrameStatus::LiveComplete | FrameStatus::Local => 3,
+    }
+}
+
+fn frame_status_text(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> String {
+    format!(
+        "{} {} {} age {} ({})",
+        frame.identity.site_id,
+        frame.identity.scan_time_utc.format("%Y-%m-%d %H:%M:%S UTC"),
+        frame.status.label(),
+        frame_age_label(frame.identity.scan_time_utc, now_utc),
+        frame.source_label
+    )
+}
+
+fn compact_frame_label(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> String {
+    format!(
+        "{} {}",
+        frame.identity.scan_time_utc.format("%H:%M"),
+        short_frame_status_label(frame.status, frame.identity.scan_time_utc, now_utc)
+    )
+}
+
+fn short_frame_status_label(
+    status: FrameStatus,
+    scan_time_utc: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+) -> &'static str {
+    match status {
+        FrameStatus::LivePartial => "partial",
+        FrameStatus::LiveComplete => "live",
+        FrameStatus::Complete => "done",
+        FrameStatus::Stale => "stale",
+        FrameStatus::Local => "local",
+        FrameStatus::Preview => {
+            if now_utc
+                .signed_duration_since(scan_time_utc)
+                .num_seconds()
+                .max(0)
+                > STALE_LATEST_DISPLAY_CLEAR_SECONDS
+            {
+                "preview-old"
+            } else {
+                "preview"
+            }
+        }
+    }
+}
+
+fn frame_age_label(scan_time_utc: DateTime<Utc>, now_utc: DateTime<Utc>) -> String {
+    let age_seconds = now_utc
+        .signed_duration_since(scan_time_utc)
+        .num_seconds()
+        .max(0);
+    if age_seconds < 90 {
+        format!("{age_seconds}s")
+    } else if age_seconds < 2 * 3600 {
+        format!("{}m", age_seconds / 60)
+    } else {
+        format!("{:.1}h", age_seconds as f32 / 3600.0)
+    }
+}
+
 fn is_unchanged_realtime_refresh(
     cache_hit: bool,
     downloaded_path: &Path,
@@ -7977,7 +8587,13 @@ mod tests {
         app.map_scale = 432.1;
 
         let ctx = egui::Context::default();
-        app.install_volume(test_aliased_velocity_volume(), None, false, &ctx);
+        app.install_volume_arc(
+            Arc::new(test_aliased_velocity_volume()),
+            None,
+            false,
+            None,
+            &ctx,
+        );
 
         assert_eq!(app.selected_site_index, 1);
         assert_eq!(app.map_center_lat, 41.25);
@@ -8726,10 +9342,15 @@ mod tests {
         let (render_recycle_sender, _render_recycle_receiver) =
             mpsc::channel::<RenderRecycleBuffer>();
         ViewerApp {
-            source_path: PathBuf::new(),
+            source_path: None,
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
+            frame_history: Vec::new(),
+            selected_frame_index: 0,
+            history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
+            history_playing: false,
+            last_history_step: None,
             color_tables: ColorTableSet::default(),
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),

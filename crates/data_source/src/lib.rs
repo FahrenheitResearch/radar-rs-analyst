@@ -270,7 +270,27 @@ pub fn fetch_level2_radar_sites(days_back: i64) -> Result<Vec<RadarSite>> {
 }
 
 pub fn latest_level2_object(site: &str, days_back: i64) -> Result<S3Object> {
+    recent_level2_objects(site, days_back, 1)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| DataSourceError::NoObjects {
+            bucket: LEVEL2_ARCHIVE_BUCKET.to_owned(),
+            prefix: site.to_owned(),
+        })
+}
+
+pub fn recent_level2_objects(
+    site: &str,
+    days_back: i64,
+    max_count: usize,
+) -> Result<Vec<S3Object>> {
+    if max_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let site = site.to_ascii_uppercase();
     let today = Utc::now().date_naive();
+    let mut recent = Vec::with_capacity(max_count);
     for offset in 0..=days_back.max(0) {
         let date = today - Duration::days(offset);
         let prefix = format!(
@@ -278,7 +298,7 @@ pub fn latest_level2_object(site: &str, days_back: i64) -> Result<S3Object> {
             date.year(),
             date.month(),
             date.day(),
-            site.to_ascii_uppercase()
+            site
         );
         let mut objects = list_s3(LEVEL2_ARCHIVE_BUCKET, &prefix, None, None)?
             .contents
@@ -286,14 +306,22 @@ pub fn latest_level2_object(site: &str, days_back: i64) -> Result<S3Object> {
             .filter(|object| object.size > 0 && !object.key.ends_with("_MDM"))
             .collect::<Vec<_>>();
         objects.sort_by(|left, right| left.key.cmp(&right.key));
-        if let Some(object) = objects.pop() {
-            return Ok(object);
+        objects.reverse();
+        for object in objects {
+            recent.push(object);
+            if recent.len() >= max_count {
+                return Ok(recent);
+            }
         }
     }
-    Err(DataSourceError::NoObjects {
-        bucket: LEVEL2_ARCHIVE_BUCKET.to_owned(),
-        prefix: site.to_owned(),
-    })
+    if recent.is_empty() {
+        Err(DataSourceError::NoObjects {
+            bucket: LEVEL2_ARCHIVE_BUCKET.to_owned(),
+            prefix: site,
+        })
+    } else {
+        Ok(recent)
+    }
 }
 
 pub fn latest_level2_object_cached(
