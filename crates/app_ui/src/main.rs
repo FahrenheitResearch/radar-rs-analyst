@@ -52,6 +52,7 @@ const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
 const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30];
 const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
+const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
 const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
@@ -425,6 +426,7 @@ enum AsyncLoadUpdate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LatestLoadMode {
     User,
+    Loop,
     AutoRefresh,
 }
 
@@ -527,11 +529,117 @@ impl FrameStatus {
     }
 }
 
+fn history_archive_load_parallelism() -> usize {
+    effective_worker_threads().clamp(1, HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM)
+}
+
+fn decode_archive_history_object(
+    site_id: &str,
+    object: data_source::S3Object,
+    site_cache_dir: &Path,
+    known_frame_paths: &BTreeSet<PathBuf>,
+    archive_lookup_ms: Option<f32>,
+    total_start: Instant,
+    sender: &mpsc::Sender<AsyncLoadResult>,
+    preview: bool,
+) -> Result<Option<DecodedLoad>, String> {
+    let mut timings = LoadTimings::default();
+    timings.lookup_ms = archive_lookup_ms;
+    timings.lookup_cache_hit = archive_lookup_ms.map(|_| false);
+
+    let fetch_start = Instant::now();
+    let downloaded = data_source::download_object(LEVEL2_ARCHIVE_BUCKET, object, site_cache_dir)
+        .map_err(|err| err.to_string())?;
+    timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
+    timings.fetch_cache_hit = Some(downloaded.cache_hit);
+
+    if downloaded.cache_hit && known_frame_paths.contains(&downloaded.path) {
+        return Ok(None);
+    }
+
+    let mut decoded = decode_load_path_with_optional_preview(
+        downloaded.path,
+        &format!("archive L2 {site_id}"),
+        total_start,
+        timings,
+        sender,
+        preview,
+        FrameStatus::Complete,
+        format!("archive L2 {site_id}"),
+    )?;
+    decoded.status =
+        archive_frame_status(decoded.volume.volume_time.with_timezone(&Utc), Utc::now());
+    if global_displayable_products(&decoded.volume).is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decoded))
+}
+
+fn load_archive_history_objects_parallel(
+    site_id: &str,
+    site_cache_dir: &Path,
+    objects: Vec<(usize, data_source::S3Object)>,
+    known_frame_paths: &BTreeSet<PathBuf>,
+    archive_lookup_ms: Option<f32>,
+    total_start: Instant,
+    sender: &mpsc::Sender<AsyncLoadResult>,
+) -> (Vec<DecodedLoad>, Option<String>) {
+    let parallelism = history_archive_load_parallelism();
+    let mut decoded_frames = Vec::new();
+    let mut first_error = None;
+
+    for chunk in objects.chunks(parallelism) {
+        let batch_results = thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(chunk.len());
+            for (index, object) in chunk.iter().cloned() {
+                let site_id = site_id.to_owned();
+                let site_cache_dir = site_cache_dir.to_path_buf();
+                let sender = sender.clone();
+                workers.push(scope.spawn(move || {
+                    decode_archive_history_object(
+                        &site_id,
+                        object,
+                        &site_cache_dir,
+                        known_frame_paths,
+                        (index == 0).then_some(archive_lookup_ms).flatten(),
+                        total_start,
+                        &sender,
+                        false,
+                    )
+                }));
+            }
+
+            let mut results = Vec::with_capacity(workers.len());
+            for worker in workers {
+                results.push(
+                    worker
+                        .join()
+                        .map_err(|_| "archive history frame worker panicked".to_owned()),
+                );
+            }
+            results
+        });
+
+        for result in batch_results {
+            match result {
+                Ok(Ok(Some(decoded))) => decoded_frames.push(decoded),
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) | Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+    }
+
+    (decoded_frames, first_error)
+}
+
 fn spawn_latest_level2_load_worker(
     site: RadarSite,
     mode: LatestLoadMode,
     current_source_path: Option<PathBuf>,
     known_frame_paths: BTreeSet<PathBuf>,
+    current_frame_identity: Option<FrameIdentity>,
     history_limit: usize,
     sender: mpsc::Sender<AsyncLoadResult>,
 ) {
@@ -542,38 +650,63 @@ fn spawn_latest_level2_load_worker(
 
         let final_update = (|| -> Result<AsyncLoadUpdate, String> {
             let history_limit = history_limit.max(1);
+            let explicit_loop_load = mode == LatestLoadMode::Loop;
             let mut decoded_frames = Vec::new();
-            let mut selected_identity = None;
+            let mut selected_identity = if explicit_loop_load {
+                current_frame_identity.filter(|identity| identity.site_id == site_id)
+            } else {
+                None
+            };
             let mut fallback_error = None;
 
-            if mode == LatestLoadMode::User
-                && let Ok(Some(cached_path)) =
-                    data_source::newest_cached_level2_path(&site_cache_dir)
-                && current_source_path.as_deref() != Some(cached_path.as_path())
-            {
-                let cached_result = decode_load_path_with_optional_preview(
-                    cached_path,
-                    &format!("cached L2 {site_id}"),
-                    total_start,
-                    LoadTimings {
-                        fetch_cache_hit: Some(true),
-                        ..LoadTimings::default()
-                    },
-                    &sender,
-                    false,
-                    FrameStatus::Complete,
-                    format!("cached L2 {site_id}"),
-                );
-                if let Ok(mut decoded) = cached_result
-                    && !global_displayable_products(&decoded.volume).is_empty()
-                {
-                    decoded.status = archive_frame_status(
-                        decoded.volume.volume_time.with_timezone(&Utc),
-                        Utc::now(),
-                    );
+            let should_load_realtime = !explicit_loop_load || selected_identity.is_none();
+            if should_load_realtime {
+                let realtime_result = (|| -> Result<DecodedLoad, String> {
+                    let mut realtime_timings = LoadTimings::default();
+                    let lookup_start = Instant::now();
+                    let realtime = data_source::latest_realtime_level2_volume(&site.level2_id)
+                        .map_err(|err| err.to_string())?;
+                    realtime_timings.lookup_ms =
+                        Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
+                    realtime_timings.lookup_cache_hit = Some(false);
+
+                    let fetch_start = Instant::now();
+                    let downloaded =
+                        data_source::download_realtime_volume(&realtime, &site_cache_dir)
+                            .map_err(|err| err.to_string())?;
+                    realtime_timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
+                    realtime_timings.fetch_cache_hit = Some(downloaded.cache_hit);
+                    if is_unchanged_realtime_refresh(
+                        downloaded.cache_hit,
+                        &downloaded.path,
+                        current_source_path.as_deref(),
+                    ) {
+                        return Err("realtime chunks unchanged".to_owned());
+                    }
+
+                    let decoded = decode_load_path_with_optional_preview(
+                        downloaded.path,
+                        &format!("realtime L2 {site_id}"),
+                        total_start,
+                        realtime_timings,
+                        &sender,
+                        should_preview_loads(),
+                        if realtime.complete {
+                            FrameStatus::LiveComplete
+                        } else {
+                            FrameStatus::LivePartial
+                        },
+                        format!("realtime L2 {site_id}"),
+                    )?;
+                    if global_displayable_products(&decoded.volume).is_empty() {
+                        return Err("realtime chunks are not displayable yet".to_owned());
+                    }
+                    Ok(decoded)
+                })();
+                if let Ok(decoded) = realtime_result {
                     selected_identity = Some(frame_identity_for_volume(&decoded.volume));
                     let _ = sender.send(AsyncLoadResult {
-                        label: format!("L2 {site_id} cached"),
+                        label: format!("L2 {site_id} current"),
                         update: AsyncLoadUpdate::History(
                             DecodedLoadBatch {
                                 frames: vec![decoded.clone()],
@@ -583,202 +716,120 @@ fn spawn_latest_level2_load_worker(
                         ),
                     });
                     decoded_frames.push(decoded);
+                } else if let Err(err) = realtime_result {
+                    if mode == LatestLoadMode::AutoRefresh && current_source_path.is_some() {
+                        return Ok(AsyncLoadUpdate::Unchanged);
+                    }
+                    fallback_error = Some(err);
                 }
             }
 
-            let archive_lookup_start = Instant::now();
-            let mut archive_lookup_ms = None;
-            let mut processed_archive_keys = BTreeSet::new();
-            let recent_archive_objects =
-                match data_source::recent_level2_objects(&site.level2_id, 7, history_limit) {
-                    Ok(objects) => {
-                        archive_lookup_ms =
-                            Some(archive_lookup_start.elapsed().as_secs_f32() * 1000.0);
-                        objects
-                    }
-                    Err(err) => {
-                        fallback_error.get_or_insert_with(|| err.to_string());
-                        Vec::new()
-                    }
-                };
+            let needs_archive_frames = explicit_loop_load || decoded_frames.is_empty();
+            if needs_archive_frames {
+                let archive_limit = if explicit_loop_load { history_limit } else { 1 };
+                let archive_lookup_start = Instant::now();
+                let mut archive_lookup_ms = None;
+                let recent_archive_objects =
+                    match data_source::recent_level2_objects(&site.level2_id, 7, archive_limit) {
+                        Ok(objects) => {
+                            archive_lookup_ms =
+                                Some(archive_lookup_start.elapsed().as_secs_f32() * 1000.0);
+                            objects
+                        }
+                        Err(err) => {
+                            fallback_error.get_or_insert_with(|| err.to_string());
+                            Vec::new()
+                        }
+                    };
 
-            if mode == LatestLoadMode::User
-                && let Some(object) = recent_archive_objects.first().cloned()
-            {
-                let object_key = object.key.clone();
-                let mut timings = LoadTimings::default();
-                timings.lookup_ms = archive_lookup_ms;
-                timings.lookup_cache_hit = Some(false);
-                let fetch_start = Instant::now();
-                let downloaded =
-                    data_source::download_object(LEVEL2_ARCHIVE_BUCKET, object, &site_cache_dir)
-                        .map_err(|err| err.to_string())?;
-                timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
-                timings.fetch_cache_hit = Some(downloaded.cache_hit);
-                if !(downloaded.cache_hit && known_frame_paths.contains(&downloaded.path)) {
-                    let mut decoded = decode_load_path_with_optional_preview(
-                        downloaded.path,
-                        &format!("latest archive L2 {site_id}"),
+                let mut remaining_archive_objects = Vec::new();
+                for (index, object) in recent_archive_objects.into_iter().enumerate() {
+                    if !explicit_loop_load && !decoded_frames.is_empty() {
+                        break;
+                    }
+                    if selected_identity.is_none() {
+                        let select_archive_frame = true;
+                        match decode_archive_history_object(
+                            &site_id,
+                            object,
+                            &site_cache_dir,
+                            &known_frame_paths,
+                            (index == 0).then_some(archive_lookup_ms).flatten(),
+                            total_start,
+                            &sender,
+                            should_preview_loads(),
+                        ) {
+                            Ok(Some(decoded)) => {
+                                selected_identity =
+                                    Some(frame_identity_for_volume(&decoded.volume));
+                                let _ = sender.send(AsyncLoadResult {
+                                    label: format!("L2 {site_id} latest archive"),
+                                    update: AsyncLoadUpdate::History(
+                                        DecodedLoadBatch {
+                                            frames: vec![decoded.clone()],
+                                            selected_index: 0,
+                                        },
+                                        select_archive_frame,
+                                    ),
+                                });
+                                decoded_frames.push(decoded);
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                fallback_error.get_or_insert(err);
+                            }
+                        }
+                    } else if explicit_loop_load {
+                        remaining_archive_objects.push((index, object));
+                    }
+                }
+
+                if explicit_loop_load && !remaining_archive_objects.is_empty() {
+                    let (history_frames, history_error) = load_archive_history_objects_parallel(
+                        &site_id,
+                        &site_cache_dir,
+                        remaining_archive_objects,
+                        &known_frame_paths,
+                        archive_lookup_ms,
                         total_start,
-                        timings,
                         &sender,
-                        selected_identity.is_none() && should_preview_loads(),
-                        FrameStatus::Complete,
-                        format!("archive L2 {site_id}"),
-                    )?;
-                    decoded.status = archive_frame_status(
-                        decoded.volume.volume_time.with_timezone(&Utc),
-                        Utc::now(),
                     );
-                    if !global_displayable_products(&decoded.volume).is_empty() {
-                        let decoded_identity = frame_identity_for_volume(&decoded.volume);
-                        let select_archive_frame = selected_identity
-                            .as_ref()
-                            .is_none_or(|selected| decoded_identity > *selected);
+                    fallback_error = fallback_error.or(history_error);
+                    for decoded in history_frames {
                         let _ = sender.send(AsyncLoadResult {
-                            label: format!("L2 {site_id} latest archive"),
+                            label: format!("L2 {site_id} loop frame"),
                             update: AsyncLoadUpdate::History(
                                 DecodedLoadBatch {
                                     frames: vec![decoded.clone()],
                                     selected_index: 0,
                                 },
-                                select_archive_frame,
+                                false,
                             ),
                         });
-                        if select_archive_frame {
-                            selected_identity = Some(decoded_identity);
-                        }
                         decoded_frames.push(decoded);
                     }
                 }
-                processed_archive_keys.insert(object_key);
-            }
-
-            let realtime_result = (|| -> Result<DecodedLoad, String> {
-                let mut realtime_timings = LoadTimings::default();
-                let lookup_start = Instant::now();
-                let realtime = data_source::latest_realtime_level2_volume(&site.level2_id)
-                    .map_err(|err| err.to_string())?;
-                realtime_timings.lookup_ms = Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
-                realtime_timings.lookup_cache_hit = Some(false);
-
-                let fetch_start = Instant::now();
-                let downloaded = data_source::download_realtime_volume(&realtime, &site_cache_dir)
-                    .map_err(|err| err.to_string())?;
-                realtime_timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
-                realtime_timings.fetch_cache_hit = Some(downloaded.cache_hit);
-                if is_unchanged_realtime_refresh(
-                    downloaded.cache_hit,
-                    &downloaded.path,
-                    current_source_path.as_deref(),
-                ) {
-                    return Err("realtime chunks unchanged".to_owned());
-                }
-
-                let decoded = decode_load_path_with_optional_preview(
-                    downloaded.path,
-                    &format!("realtime L2 {site_id}"),
-                    total_start,
-                    realtime_timings,
-                    &sender,
-                    should_preview_loads(),
-                    if realtime.complete {
-                        FrameStatus::LiveComplete
-                    } else {
-                        FrameStatus::LivePartial
-                    },
-                    format!("realtime L2 {site_id}"),
-                )?;
-                if global_displayable_products(&decoded.volume).is_empty() {
-                    return Err("realtime chunks are not displayable yet".to_owned());
-                }
-                Ok(decoded)
-            })();
-            if let Ok(decoded) = realtime_result {
-                selected_identity = Some(frame_identity_for_volume(&decoded.volume));
-                let _ = sender.send(AsyncLoadResult {
-                    label: format!("L2 {site_id} current"),
-                    update: AsyncLoadUpdate::History(
-                        DecodedLoadBatch {
-                            frames: vec![decoded.clone()],
-                            selected_index: 0,
-                        },
-                        true,
-                    ),
-                });
-                decoded_frames.push(decoded);
-            } else if let Err(err) = realtime_result {
-                fallback_error = Some(err);
-            }
-
-            for (index, object) in recent_archive_objects.into_iter().enumerate() {
-                if decoded_frames.len() >= history_limit {
-                    break;
-                }
-                if processed_archive_keys.contains(&object.key) {
-                    continue;
-                }
-
-                let mut timings = LoadTimings::default();
-                if index == 0 {
-                    timings.lookup_ms = archive_lookup_ms;
-                    timings.lookup_cache_hit = Some(false);
-                }
-
-                let fetch_start = Instant::now();
-                let downloaded =
-                    data_source::download_object(LEVEL2_ARCHIVE_BUCKET, object, &site_cache_dir)
-                        .map_err(|err| err.to_string())?;
-                timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
-                timings.fetch_cache_hit = Some(downloaded.cache_hit);
-
-                if mode == LatestLoadMode::AutoRefresh
-                    && downloaded.cache_hit
-                    && known_frame_paths.contains(&downloaded.path)
-                {
-                    continue;
-                }
-
-                let select_archive_frame = selected_identity.is_none();
-                let mut decoded = decode_load_path_with_optional_preview(
-                    downloaded.path,
-                    &format!("L2 {site_id}"),
-                    total_start,
-                    timings,
-                    &sender,
-                    select_archive_frame && should_preview_loads(),
-                    FrameStatus::Complete,
-                    format!("archive L2 {site_id}"),
-                )?;
-                decoded.status = archive_frame_status(
-                    decoded.volume.volume_time.with_timezone(&Utc),
-                    Utc::now(),
-                );
-                if global_displayable_products(&decoded.volume).is_empty() {
-                    continue;
-                }
-                let _ = sender.send(AsyncLoadResult {
-                    label: format!("L2 {site_id} history"),
-                    update: AsyncLoadUpdate::History(
-                        DecodedLoadBatch {
-                            frames: vec![decoded.clone()],
-                            selected_index: 0,
-                        },
-                        select_archive_frame,
-                    ),
-                });
-                if select_archive_frame {
-                    selected_identity = Some(frame_identity_for_volume(&decoded.volume));
-                }
-                decoded_frames.push(decoded);
             }
 
             if decoded_frames.is_empty() {
+                if explicit_loop_load && selected_identity.is_some() {
+                    return Ok(AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                        frames: Vec::new(),
+                        selected_index: 0,
+                    })));
+                }
                 if mode == LatestLoadMode::AutoRefresh {
                     return Ok(AsyncLoadUpdate::Unchanged);
                 }
                 return Err(fallback_error
                     .unwrap_or_else(|| "no displayable Level II scans found".to_owned()));
+            }
+
+            if explicit_loop_load {
+                return Ok(AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                    frames: Vec::new(),
+                    selected_index: 0,
+                })));
             }
 
             decoded_frames.sort_by(|left, right| {
@@ -1740,6 +1791,7 @@ impl ViewerApp {
             mode,
             current_source_path,
             BTreeSet::new(),
+            None,
             1,
             sender,
         );
@@ -2269,8 +2321,7 @@ impl ViewerApp {
                         AsyncLoadUpdate::History(batch, select_frame) => {
                             self.install_decoded_load_batch(batch, false, select_frame, ctx);
                             if select_frame {
-                                self.status =
-                                    format!("Loaded {}; backfilling history", message.label);
+                                self.status = format!("Loaded {}", message.label);
                             }
                         }
                         AsyncLoadUpdate::Unchanged => {
@@ -3520,6 +3571,15 @@ impl ViewerApp {
         self.start_latest_level2_load(site, ctx);
     }
 
+    fn load_loop_history_for_selected_site(&mut self, ctx: &egui::Context) {
+        let Some(site) = self.selected_site().cloned() else {
+            self.status = "No site selected".to_owned();
+            return;
+        };
+
+        self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::Loop);
+    }
+
     fn start_latest_level2_load(&mut self, site: RadarSite, ctx: &egui::Context) {
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::User);
     }
@@ -3538,19 +3598,25 @@ impl ViewerApp {
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(site_id.clone());
         self.last_realtime_level2_refresh = Some(Instant::now());
-        self.status = if mode == LatestLoadMode::AutoRefresh {
-            format!("Refreshing realtime L2 {site_id}")
-        } else {
-            format!("Loading latest L2 {site_id}")
+        self.status = match mode {
+            LatestLoadMode::AutoRefresh => format!("Refreshing realtime L2 {site_id}"),
+            LatestLoadMode::Loop => format!("Loading L2 loop {site_id}"),
+            LatestLoadMode::User => format!("Loading latest L2 {site_id}"),
         };
         let current_source_path = (mode == LatestLoadMode::AutoRefresh)
             .then(|| self.source_path.clone())
             .flatten();
-        let known_frame_paths = if mode == LatestLoadMode::AutoRefresh {
-            self.current_history_paths()
-        } else {
-            BTreeSet::new()
-        };
+        let known_frame_paths =
+            if matches!(mode, LatestLoadMode::AutoRefresh | LatestLoadMode::Loop) {
+                self.current_history_paths()
+            } else {
+                BTreeSet::new()
+            };
+        let current_frame_identity = self
+            .volume
+            .as_ref()
+            .filter(|volume| volume.site.id == site_id)
+            .map(|volume| frame_identity_for_volume(volume.as_ref()));
         if should_clear_display_for_latest_load(self.volume.as_deref(), &site_id, Utc::now()) {
             self.clear_displayed_volume_for_pending_load(ctx);
         }
@@ -3560,6 +3626,7 @@ impl ViewerApp {
             mode,
             current_source_path,
             known_frame_paths,
+            current_frame_identity,
             self.history_frame_limit,
             sender,
         );
@@ -3705,6 +3772,10 @@ impl ViewerApp {
                 && self.load_receiver.is_none()
             {
                 self.load_latest_level2_for_selected_site(ui.ctx());
+            }
+            if fixed_action_button(ui, "Load Loop", 82.0).clicked() && self.load_receiver.is_none()
+            {
+                self.load_loop_history_for_selected_site(ui.ctx());
             }
             if fixed_action_button(ui, "Center", 58.0).clicked() {
                 self.center_selected_site();
