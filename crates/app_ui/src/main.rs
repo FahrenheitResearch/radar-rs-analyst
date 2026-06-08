@@ -4014,18 +4014,20 @@ impl ViewerApp {
             return;
         };
         if let Some(texture) = &self.texture {
-            let image_rect = self
-                .texture_key
-                .as_ref()
-                .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
-                .unwrap_or(rect);
+            let image_rect = if let Some(key) = self.texture_key.as_ref() {
+                self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key)
+            } else {
+                Some(rect)
+            };
 
-            painter.image(
-                texture.id(),
-                image_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            if let Some(image_rect) = image_rect {
+                painter.image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
         }
         self.draw_range_ring(
             painter,
@@ -4057,17 +4059,19 @@ impl ViewerApp {
                 continue;
             };
             if let Some(texture) = &layer.texture {
-                let image_rect = layer
-                    .texture_key
-                    .as_ref()
-                    .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
-                    .unwrap_or(rect);
-                painter.image(
-                    texture.id(),
-                    image_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    egui::Color32::from_white_alpha(layer.opacity),
-                );
+                let image_rect = if let Some(key) = layer.texture_key.as_ref() {
+                    self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key)
+                } else {
+                    Some(rect)
+                };
+                if let Some(image_rect) = image_rect {
+                    painter.image(
+                        texture.id(),
+                        image_rect,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        egui::Color32::from_white_alpha(layer.opacity),
+                    );
+                }
             }
             self.draw_range_ring(
                 painter,
@@ -4094,12 +4098,9 @@ impl ViewerApp {
         radar_lat: f32,
         radar_lon: f32,
         texture_key: &TextureKey,
-    ) -> egui::Rect {
-        let Some((current, _)) =
-            self.viewport_raster_options_for_location(ctx, rect, radar_lat, radar_lon)
-        else {
-            return rect;
-        };
+    ) -> Option<egui::Rect> {
+        let (current, _) =
+            self.viewport_raster_options_for_location(ctx, rect, radar_lat, radar_lon)?;
         anchored_radar_texture_rect(rect, ctx.pixels_per_point(), texture_key.viewport, current)
     }
 
@@ -4891,7 +4892,7 @@ fn anchored_radar_texture_rect(
     pixels_per_point: f32,
     rendered: ViewportKey,
     current: ViewportRasterOptions,
-) -> egui::Rect {
+) -> Option<egui::Rect> {
     let pixels_per_point = pixels_per_point.max(1.0);
     let rendered_radar_x_px = rendered.radar_x_px as f32 / 8.0;
     let rendered_radar_y_px = rendered.radar_y_px as f32 / 8.0;
@@ -4899,9 +4900,16 @@ fn anchored_radar_texture_rect(
     let rendered_km_per_px_y = rendered.km_per_px_y as f32 / 1_000_000.0;
     let scale_x = positive_ratio(rendered_km_per_px_x, current.km_per_px_x);
     let scale_y = positive_ratio(rendered_km_per_px_y, current.km_per_px_y);
+    if rendered.width != current.width
+        || rendered.height != current.height
+        || (scale_x - 1.0).abs() > 0.01
+        || (scale_y - 1.0).abs() > 0.01
+    {
+        return None;
+    }
     let left_px = current.radar_x_px - rendered_radar_x_px * scale_x;
     let top_px = current.radar_y_px - rendered_radar_y_px * scale_y;
-    egui::Rect::from_min_size(
+    Some(egui::Rect::from_min_size(
         egui::pos2(
             rect.left() + left_px / pixels_per_point,
             rect.top() + top_px / pixels_per_point,
@@ -4910,7 +4918,7 @@ fn anchored_radar_texture_rect(
             rendered.width as f32 * scale_x / pixels_per_point,
             rendered.height as f32 * scale_y / pixels_per_point,
         ),
-    )
+    ))
 }
 
 fn positive_ratio(numerator: f32, denominator: f32) -> f32 {
@@ -8578,7 +8586,8 @@ mod tests {
             km_per_px_y: 1.0,
         };
 
-        let image_rect = anchored_radar_texture_rect(rect, 1.0, rendered, current);
+        let image_rect = anchored_radar_texture_rect(rect, 1.0, rendered, current)
+            .expect("same-resolution stale texture can translate with pan");
 
         assert!((image_rect.left() - 10.0).abs() < 0.01);
         assert!((image_rect.top() + 5.0).abs() < 0.01);
@@ -8587,7 +8596,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_radar_texture_rect_scales_around_site_on_zoom() {
+    fn stale_radar_texture_rect_skips_scaled_zoom() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
         let rendered = ViewportKey {
             width: 100,
@@ -8606,12 +8615,7 @@ mod tests {
             km_per_px_y: 0.5,
         };
 
-        let image_rect = anchored_radar_texture_rect(rect, 1.0, rendered, current);
-
-        assert!((image_rect.left() + 50.0).abs() < 0.01);
-        assert!((image_rect.top() + 50.0).abs() < 0.01);
-        assert!((image_rect.width() - 200.0).abs() < 0.01);
-        assert!((image_rect.height() - 200.0).abs() < 0.01);
+        assert!(anchored_radar_texture_rect(rect, 1.0, rendered, current).is_none());
     }
 
     #[test]
