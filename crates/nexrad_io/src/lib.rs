@@ -10,7 +10,6 @@ use std::io::{Cursor, Read};
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr::NonNull;
-use std::thread;
 
 use bzip2::bufread::BzDecoder;
 use chrono::{DateTime, TimeZone, Utc};
@@ -124,7 +123,7 @@ pub fn decode_gzip_volume_from_reader(reader: impl Read) -> Result<RadarVolume> 
 pub fn decode_gzip_volume_from_bytes_with_preview<F>(
     raw: &[u8],
     min_displayable_radials: usize,
-    mut on_preview: F,
+    on_preview: F,
 ) -> Result<RadarVolume>
 where
     F: FnMut(RadarVolume),
@@ -136,16 +135,17 @@ where
         return decode_volume_from_bytes(raw);
     }
 
-    thread::scope(|scope| {
-        let full_decode = scope.spawn(|| decode_volume_from_bytes(raw));
-        if let Ok(Some(preview)) = decode_gzip_preview_from_bytes(raw, min_displayable_radials) {
-            on_preview(preview);
-        }
-        full_decode.join().unwrap_or_else(|_| {
-            Err(NexradError::Compression(
-                "gzip decode worker panicked".to_owned(),
-            ))
-        })
+    let mut decoder = GzDecoder::new(raw);
+    decode_volume_from_stream(
+        &mut decoder,
+        ArchiveCompression::Gzip,
+        Some(min_displayable_radials),
+        false,
+        on_preview,
+    )
+    .map(|result| {
+        debug_assert!(!result.stopped_at_preview);
+        result.volume
     })
 }
 

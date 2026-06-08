@@ -309,6 +309,45 @@ fn probe_moment(
         TimingStats::from(build),
     );
 
+    let mut last_geometry_cache = None;
+    let geometry_build = time_runs(runs, || {
+        let geometry_cache = cache.build_geometry_cache(volume, viewport)?;
+        std::hint::black_box(geometry_cache.sample_count());
+        last_geometry_cache = Some(geometry_cache);
+        Ok(())
+    })?;
+    let geometry_cache = last_geometry_cache.expect("geometry cache build run produced a cache");
+    print_stats(
+        "geometry_cache_build",
+        &format!(
+            " product={label} cut={cut} viewport={viewport_label} samples={} storage_bytes={}",
+            geometry_cache.sample_count(),
+            geometry_cache.storage_bytes()
+        ),
+        runs,
+        TimingStats::from(geometry_build),
+    );
+
+    let mut last_geometry_sample_cache = None;
+    let geometry_resolve = time_runs(runs, || {
+        let sample_cache = cache.build_sample_cache_from_geometry_cache(volume, &geometry_cache)?;
+        std::hint::black_box(sample_cache.sample_count());
+        last_geometry_sample_cache = Some(sample_cache);
+        Ok(())
+    })?;
+    let geometry_sample_cache =
+        last_geometry_sample_cache.expect("geometry cache resolve run produced a sample cache");
+    print_stats(
+        "geometry_cache_resolve",
+        &format!(
+            " product={label} cut={cut} viewport={viewport_label} samples={} storage_bytes={}",
+            geometry_sample_cache.sample_count(),
+            geometry_sample_cache.storage_bytes()
+        ),
+        runs,
+        TimingStats::from(geometry_resolve),
+    );
+
     let cached = time_runs(runs, || {
         cache.render_moment_rgba_with_sample_cache(volume, &sample_cache, &mut pixels)?;
         std::hint::black_box(&pixels);

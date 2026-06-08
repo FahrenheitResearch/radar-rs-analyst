@@ -9,7 +9,9 @@ use std::path::Path;
 
 pub use color_tables::{ColorTable, ColorTableFamily, ColorTableSet};
 use image::{ImageBuffer, ImageError, Rgba};
-use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume};
+use radar_core::{
+    ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
+};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -128,6 +130,8 @@ pub enum RenderError {
     },
     #[error("viewport render cache storage no longer matches the moment storage")]
     CacheStorageMismatch,
+    #[error("viewport geometry cache does not match this moment grid")]
+    GeometryCacheMismatch,
     #[error("image write failed: {0}")]
     Image(#[from] ImageError),
 }
@@ -304,6 +308,15 @@ pub struct ViewportSampleCache {
     samples: Vec<CachedSample>,
 }
 
+pub struct ViewportGeometryCache {
+    width: u32,
+    height: u32,
+    gate_range: GateRange,
+    sample_count: usize,
+    row_spans: Vec<CachedRowSpan>,
+    samples: Vec<CachedSample>,
+}
+
 pub struct StormRelativePaletteCache {
     volume_ptr: usize,
     cut_index: usize,
@@ -311,6 +324,36 @@ pub struct StormRelativePaletteCache {
 }
 
 impl ViewportSampleCache {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.sample_count
+    }
+
+    pub fn storage_bytes(&self) -> usize {
+        self.samples.len() * std::mem::size_of::<CachedSample>()
+            + self.row_spans.len() * std::mem::size_of::<CachedRowSpan>()
+    }
+
+    fn geometry(&self) -> CachedViewportGeometry<'_> {
+        CachedViewportGeometry {
+            row_spans: &self.row_spans,
+            samples: &self.samples,
+        }
+    }
+}
+
+impl ViewportGeometryCache {
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -645,36 +688,74 @@ impl ViewportMomentCache {
             }
         };
 
-        let sample_storage_len = row_builds.iter().map(|row| row.samples.len()).sum();
-        let mut row_spans = Vec::with_capacity(height as usize);
-        let mut samples = Vec::with_capacity(sample_storage_len);
-        let mut sample_count = 0;
-        for row in row_builds {
-            if row.samples.is_empty() {
-                row_spans.push(CachedRowSpan::empty());
-                continue;
-            }
-            let sample_offset = samples.len();
-            let end = row.start + row.samples.len() as u32;
-            sample_count += row.sample_count;
-            row_spans.push(CachedRowSpan {
-                start: row.start,
-                end,
-                sample_offset,
-            });
-            samples.extend(row.samples);
-        }
-
-        Ok(ViewportSampleCache {
-            volume_ptr: self.volume_ptr,
-            cut_index: self.cut_index,
-            moment: self.moment.clone(),
+        Ok(viewport_sample_cache_from_rows(
+            self.volume_ptr,
+            self.cut_index,
+            self.moment.clone(),
             width,
             height,
+            row_builds,
+        ))
+    }
+
+    pub fn build_geometry_cache(
+        &self,
+        volume: &RadarVolume,
+        options: ViewportRasterOptions,
+    ) -> Result<ViewportGeometryCache> {
+        let (_, grid) = self.cut_and_grid(volume)?;
+        let (width, height) = viewport_dimensions(options);
+        let geometry = viewport_geometry(grid, options);
+        let lookup_table = ViewportLookupTable::new(grid, geometry);
+        let row_builds = build_geometry_cache_rows(height, &lookup_table, &self.row_lookup);
+        let (sample_count, row_spans, samples) = flatten_cached_rows(height, row_builds);
+
+        Ok(ViewportGeometryCache {
+            width,
+            height,
+            gate_range: grid.gate_range.clone(),
             sample_count,
             row_spans,
             samples,
         })
+    }
+
+    pub fn build_sample_cache_from_geometry_cache(
+        &self,
+        volume: &RadarVolume,
+        geometry_cache: &ViewportGeometryCache,
+    ) -> Result<ViewportSampleCache> {
+        let (_, grid) = self.cut_and_grid(volume)?;
+        if grid.gate_range != geometry_cache.gate_range {
+            return Err(RenderError::GeometryCacheMismatch);
+        }
+        let geometry = geometry_cache.geometry();
+        let row_builds = match &grid.storage {
+            MomentStorage::U8(values) => {
+                build_sample_cache_rows_from_geometry(geometry_cache.height, geometry, |sample| {
+                    resolve_compact_sample(values, grid, &self.row_lookup, sample)
+                })
+            }
+            MomentStorage::U16(values) => {
+                build_sample_cache_rows_from_geometry(geometry_cache.height, geometry, |sample| {
+                    resolve_compact_sample(values, grid, &self.row_lookup, sample)
+                })
+            }
+            MomentStorage::F32(values) => {
+                build_sample_cache_rows_from_geometry(geometry_cache.height, geometry, |sample| {
+                    resolve_f32_sample(values, grid, &self.row_lookup, sample)
+                })
+            }
+        };
+
+        Ok(viewport_sample_cache_from_rows(
+            self.volume_ptr,
+            self.cut_index,
+            self.moment.clone(),
+            geometry_cache.width,
+            geometry_cache.height,
+            row_builds,
+        ))
     }
 
     pub fn sample_cache_storage_upper_bound(
@@ -1250,10 +1331,6 @@ fn render_storm_relative_velocity_viewport_grid_into(
     pixels: &mut [u8],
     clear_pixels: bool,
 ) {
-    let row_motion = render_cache
-        .storm_motion_basis
-        .map(|basis| basis.row_motion_components(storm_motion))
-        .unwrap_or_else(|| row_motion_components(cut, grid, storm_motion));
     let geometry = viewport_geometry(grid, options);
     let lookup_table = ViewportLookupTable::new(grid, geometry);
 
@@ -1263,6 +1340,10 @@ fn render_storm_relative_velocity_viewport_grid_into(
             let row_palettes = if let Some(palette_cache) = render_cache.palette_cache {
                 &palette_cache.row_palettes
             } else {
+                let row_motion = render_cache
+                    .storm_motion_basis
+                    .map(|basis| basis.row_motion_components(storm_motion))
+                    .unwrap_or_else(|| row_motion_components(cut, grid, storm_motion));
                 built_palettes = build_storm_relative_u8_row_palettes(
                     grid,
                     &row_motion,
@@ -1281,6 +1362,10 @@ fn render_storm_relative_velocity_viewport_grid_into(
             );
         }
         MomentStorage::U16(values) => {
+            let row_motion = render_cache
+                .storm_motion_basis
+                .map(|basis| basis.row_motion_components(storm_motion))
+                .unwrap_or_else(|| row_motion_components(cut, grid, storm_motion));
             render_storm_relative_viewport_storage(
                 pixels,
                 values,
@@ -1294,18 +1379,24 @@ fn render_storm_relative_velocity_viewport_grid_into(
                 clear_pixels,
             );
         }
-        MomentStorage::F32(values) => render_storm_relative_f32_viewport_storage(
-            pixels,
-            values,
-            grid,
-            render_cache.row_lookup,
-            StormRelativeValueLookup {
-                row_motion: &row_motion,
-                color_table: render_cache.color_table,
-            },
-            &lookup_table,
-            clear_pixels,
-        ),
+        MomentStorage::F32(values) => {
+            let row_motion = render_cache
+                .storm_motion_basis
+                .map(|basis| basis.row_motion_components(storm_motion))
+                .unwrap_or_else(|| row_motion_components(cut, grid, storm_motion));
+            render_storm_relative_f32_viewport_storage(
+                pixels,
+                values,
+                grid,
+                render_cache.row_lookup,
+                StormRelativeValueLookup {
+                    row_motion: &row_motion,
+                    color_table: render_cache.color_table,
+                },
+                &lookup_table,
+                clear_pixels,
+            );
+        }
     }
 }
 
@@ -1318,17 +1409,16 @@ fn render_storm_relative_velocity_sample_cache_grid_into(
     pixels: &mut [u8],
     clear_pixels: bool,
 ) {
-    let row_motion = render_cache
-        .storm_motion_basis
-        .map(|basis| basis.row_motion_components(storm_motion))
-        .unwrap_or_else(|| row_motion_components(cut, grid, storm_motion));
-
     match &grid.storage {
         MomentStorage::U8(values) => {
             let built_palettes;
             let row_palettes = if let Some(palette_cache) = render_cache.palette_cache {
                 &palette_cache.row_palettes
             } else {
+                let row_motion = render_cache
+                    .storm_motion_basis
+                    .map(|basis| basis.row_motion_components(storm_motion))
+                    .unwrap_or_else(|| row_motion_components(cut, grid, storm_motion));
                 built_palettes = build_storm_relative_u8_row_palettes(
                     grid,
                     &row_motion,
@@ -1346,6 +1436,10 @@ fn render_storm_relative_velocity_sample_cache_grid_into(
             );
         }
         MomentStorage::U16(values) => {
+            let row_motion = render_cache
+                .storm_motion_basis
+                .map(|basis| basis.row_motion_components(storm_motion))
+                .unwrap_or_else(|| row_motion_components(cut, grid, storm_motion));
             render_storm_relative_sample_cache_storage(
                 pixels,
                 values,
@@ -1356,15 +1450,21 @@ fn render_storm_relative_velocity_sample_cache_grid_into(
                 clear_pixels,
             );
         }
-        MomentStorage::F32(values) => render_storm_relative_f32_sample_cache_storage(
-            pixels,
-            values,
-            grid,
-            &row_motion,
-            render_cache.color_table,
-            sample_cache,
-            clear_pixels,
-        ),
+        MomentStorage::F32(values) => {
+            let row_motion = render_cache
+                .storm_motion_basis
+                .map(|basis| basis.row_motion_components(storm_motion))
+                .unwrap_or_else(|| row_motion_components(cut, grid, storm_motion));
+            render_storm_relative_f32_sample_cache_storage(
+                pixels,
+                values,
+                grid,
+                &row_motion,
+                render_cache.color_table,
+                sample_cache,
+                clear_pixels,
+            );
+        }
     }
 }
 
@@ -1504,7 +1604,6 @@ impl LookupGeometry for ViewportGeometry {
 #[derive(Debug)]
 struct ViewportLookupTable {
     geometry: ViewportGeometry,
-    dx_km: Vec<f32>,
     first_gate_m: f32,
     gate_spacing_m: f32,
     gate_count: usize,
@@ -1512,12 +1611,8 @@ struct ViewportLookupTable {
 
 impl ViewportLookupTable {
     fn new(grid: &MomentGrid, geometry: ViewportGeometry) -> Self {
-        let dx_km = (0..geometry.width)
-            .map(|x| (x as f32 + 0.5 - geometry.radar_x_px) * geometry.km_per_px_x)
-            .collect();
         Self {
             geometry,
-            dx_km,
             first_gate_m: grid.gate_range.first_gate_m as f32,
             gate_spacing_m: grid.gate_range.gate_spacing_m.max(1) as f32,
             gate_count: grid.gate_range.gate_count,
@@ -1528,7 +1623,7 @@ impl ViewportLookupTable {
         self.geometry.width
     }
 
-    fn row(&self, y: u32) -> Option<ViewportLookupRow<'_>> {
+    fn row(&self, y: u32) -> Option<ViewportLookupRow> {
         let dy_km = (self.geometry.radar_y_px - (y as f32 + 0.5)) * self.geometry.km_per_px_y;
         let dy_km_sq = dy_km * dy_km;
         if dy_km_sq > self.geometry.max_range_km_sq {
@@ -1547,7 +1642,8 @@ impl ViewportLookupTable {
             dy_km,
             dy_km_sq,
             max_range_km_sq: self.geometry.max_range_km_sq,
-            dx_km: &self.dx_km,
+            radar_x_px: self.geometry.radar_x_px,
+            km_per_px_x: self.geometry.km_per_px_x,
             first_gate_m: self.first_gate_m,
             gate_spacing_m: self.gate_spacing_m,
             gate_count: self.gate_count,
@@ -1556,20 +1652,21 @@ impl ViewportLookupTable {
 }
 
 #[derive(Clone, Debug)]
-struct ViewportLookupRow<'a> {
+struct ViewportLookupRow {
     x_range: Range<u32>,
     dy_km: f32,
     dy_km_sq: f32,
     max_range_km_sq: f32,
-    dx_km: &'a [f32],
+    radar_x_px: f32,
+    km_per_px_x: f32,
     first_gate_m: f32,
     gate_spacing_m: f32,
     gate_count: usize,
 }
 
-impl ViewportLookupRow<'_> {
+impl ViewportLookupRow {
     fn lookup(&self, x: u32, row_lookup: &AzimuthLookup) -> Option<SampleLookup> {
-        let dx_km = *self.dx_km.get(x as usize)?;
+        let dx_km = (x as f32 + 0.5 - self.radar_x_px) * self.km_per_px_x;
         let range_km_sq = dx_km.mul_add(dx_km, self.dy_km_sq);
         if range_km_sq > self.max_range_km_sq {
             return None;
@@ -2425,6 +2522,162 @@ where
         .collect()
 }
 
+fn build_geometry_cache_rows(
+    height: u32,
+    lookup_table: &ViewportLookupTable,
+    row_lookup: &AzimuthLookup,
+) -> Vec<CachedRowBuild> {
+    (0..height as usize)
+        .into_par_iter()
+        .map(|y| {
+            let y = y as u32;
+            let Some(row_lookup_table) = lookup_table.row(y) else {
+                return CachedRowBuild::empty();
+            };
+            let x_range = row_lookup_table.x_range.clone();
+            let mut start = None;
+            let mut next_x = 0u32;
+            let mut samples = Vec::with_capacity(x_range.len());
+            let mut count = 0usize;
+            for x in x_range {
+                if let Some(sample) = row_lookup_table.lookup(x, row_lookup)
+                    && let Some(cached_sample) = CachedSample::new(ResolvedSample {
+                        row: sample.azimuth_bin,
+                        gate: sample.gate,
+                    })
+                {
+                    let start_x = *start.get_or_insert(x);
+                    if samples.is_empty() {
+                        next_x = start_x;
+                    }
+                    if x > next_x {
+                        push_cached_sample_skip(&mut samples, x - next_x);
+                    }
+                    samples.push(cached_sample);
+                    count += 1;
+                    next_x = x + 1;
+                }
+            }
+            if samples.is_empty() {
+                CachedRowBuild::empty()
+            } else {
+                CachedRowBuild {
+                    start: start.expect("non-empty geometry row has a start"),
+                    samples,
+                    sample_count: count,
+                }
+            }
+        })
+        .collect()
+}
+
+fn build_sample_cache_rows_from_geometry<R>(
+    height: u32,
+    geometry: CachedViewportGeometry<'_>,
+    resolve: R,
+) -> Vec<CachedRowBuild>
+where
+    R: Fn(SampleLookup) -> Option<ResolvedSample> + Sync,
+{
+    (0..height as usize)
+        .into_par_iter()
+        .map(|y| {
+            let Some((row_start_x, row_samples)) = geometry.row_samples(y) else {
+                return CachedRowBuild::empty();
+            };
+            let mut start = None;
+            let mut next_x = 0u32;
+            let mut x = row_start_x;
+            let mut samples = Vec::with_capacity(row_samples.len());
+            let mut count = 0usize;
+            for cached_lookup in row_samples {
+                if let Some(skip) = cached_lookup.skip_len() {
+                    x += skip;
+                    continue;
+                }
+                let sample = SampleLookup {
+                    azimuth_bin: cached_lookup.row(),
+                    gate: cached_lookup.gate(),
+                };
+                if let Some(sample) = resolve(sample)
+                    && let Some(cached_sample) = CachedSample::new(sample)
+                {
+                    let start_x = *start.get_or_insert(x);
+                    if samples.is_empty() {
+                        next_x = start_x;
+                    }
+                    if x > next_x {
+                        push_cached_sample_skip(&mut samples, x - next_x);
+                    }
+                    samples.push(cached_sample);
+                    count += 1;
+                    next_x = x + 1;
+                }
+                x += 1;
+            }
+            if samples.is_empty() {
+                CachedRowBuild::empty()
+            } else {
+                CachedRowBuild {
+                    start: start.expect("non-empty resolved geometry row has a start"),
+                    samples,
+                    sample_count: count,
+                }
+            }
+        })
+        .collect()
+}
+
+fn viewport_sample_cache_from_rows(
+    volume_ptr: usize,
+    cut_index: usize,
+    moment: MomentType,
+    width: u32,
+    height: u32,
+    row_builds: Vec<CachedRowBuild>,
+) -> ViewportSampleCache {
+    let (sample_count, row_spans, samples) = flatten_cached_rows(height, row_builds);
+    ViewportSampleCache {
+        volume_ptr,
+        cut_index,
+        moment,
+        width,
+        height,
+        sample_count,
+        row_spans,
+        samples,
+    }
+}
+
+fn flatten_cached_rows(
+    height: u32,
+    row_builds: Vec<CachedRowBuild>,
+) -> (usize, Vec<CachedRowSpan>, Vec<CachedSample>) {
+    let sample_storage_len = row_builds.iter().map(|row| row.samples.len()).sum();
+    let mut row_spans = Vec::with_capacity(height as usize);
+    let mut samples = Vec::with_capacity(sample_storage_len);
+    let mut sample_count = 0;
+    for row in row_builds {
+        if row.samples.is_empty() {
+            row_spans.push(CachedRowSpan::empty());
+            continue;
+        }
+        let sample_offset = samples.len();
+        let end = row.start + row.samples.len() as u32;
+        sample_count += row.sample_count;
+        row_spans.push(CachedRowSpan {
+            start: row.start,
+            end,
+            sample_offset,
+        });
+        samples.extend(row.samples);
+    }
+    while row_spans.len() < height as usize {
+        row_spans.push(CachedRowSpan::empty());
+    }
+    (sample_count, row_spans, samples)
+}
+
 fn push_cached_sample_skip(samples: &mut Vec<CachedSample>, mut pixel_count: u32) {
     while pixel_count > 0 {
         let chunk = pixel_count.min(CachedSample::SKIP_MASK);
@@ -2445,8 +2698,8 @@ fn resolve_compact_sample<T: RawMomentValue>(
         if index >= values.len() {
             continue;
         }
-        let raw = values[index].to_usize();
-        if grid.nodata == Some(raw as u16) {
+        let raw = values[index].to_usize() as u16;
+        if grid.nodata == Some(raw) || grid.range_folded == Some(raw) {
             continue;
         }
         return Some(ResolvedSample {
@@ -2572,29 +2825,33 @@ pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentG
     let gate_count = source.gate_range.gate_count;
     let fallback_nyquist = median_nyquist_mps(cut, source);
     let mut corrected = vec![DEALIASED_VELOCITY_NODATA; rows.saturating_mul(gate_count)];
-    let mut row_values = vec![f32::NAN; gate_count];
 
-    for row in 0..rows {
-        let row_start = row * gate_count;
-        row_values.fill(f32::NAN);
-        let nyquist = row_nyquist_mps(cut, source, row).or(fallback_nyquist);
-        if let Some(nyquist) = nyquist.filter(|value| value.is_finite() && *value > 0.0) {
-            if let Some(seed) = pick_dealias_seed(source, row, nyquist)
-                && let Some(seed_value) = source.scaled_value(row, seed)
-            {
-                row_values[seed] = seed_value;
-                walk_dealias_radial(source, row, nyquist, None, &mut row_values, seed, 1);
-                walk_dealias_radial(source, row, nyquist, None, &mut row_values, seed, -1);
-            }
-        } else {
-            copy_scaled_velocity_row(source, row, &mut row_values);
-        }
+    corrected
+        .par_chunks_mut(gate_count.max(1))
+        .enumerate()
+        .for_each_init(
+            || (vec![f32::NAN; gate_count], vec![f32::NAN; gate_count]),
+            |(observed, row_values), (row, output)| {
+                if output.len() != gate_count {
+                    return;
+                }
 
-        encode_dealiased_velocity_row(
-            &row_values,
-            &mut corrected[row_start..row_start + gate_count],
+                copy_scaled_velocity_row(source, row, observed);
+                row_values.fill(f32::NAN);
+                let nyquist = row_nyquist_mps(cut, source, row).or(fallback_nyquist);
+                if let Some(nyquist) = nyquist.filter(|value| value.is_finite() && *value > 0.0) {
+                    if let Some(seed) = pick_dealias_seed(observed, nyquist) {
+                        row_values[seed] = observed[seed];
+                        walk_dealias_radial(observed, nyquist, None, row_values, seed, 1);
+                        walk_dealias_radial(observed, nyquist, None, row_values, seed, -1);
+                    }
+                } else {
+                    row_values.copy_from_slice(observed);
+                }
+
+                encode_dealiased_velocity_row(row_values, output);
+            },
         );
-    }
 
     MomentGrid {
         moment: MomentType::Velocity,
@@ -2629,8 +2886,45 @@ fn encode_dealiased_velocity(value: f32) -> u16 {
 }
 
 fn copy_scaled_velocity_row(source: &MomentGrid, row: usize, row_values: &mut [f32]) {
-    for (gate, value) in row_values.iter_mut().enumerate() {
-        *value = source.scaled_value(row, gate).unwrap_or(f32::NAN);
+    row_values.fill(f32::NAN);
+    let gate_count = source.gate_range.gate_count;
+    if gate_count == 0 || row_values.len() != gate_count {
+        return;
+    }
+    let Some(row_start) = row.checked_mul(gate_count) else {
+        return;
+    };
+    let row_end = row_start + gate_count;
+    match &source.storage {
+        MomentStorage::U8(values) => {
+            let Some(raw_row) = values.get(row_start..row_end) else {
+                return;
+            };
+            for (raw, value) in raw_row.iter().zip(row_values.iter_mut()) {
+                let raw = u16::from(*raw);
+                if source.nodata == Some(raw) || source.range_folded == Some(raw) {
+                    continue;
+                }
+                *value = (raw as f32 - source.offset) / source.scale;
+            }
+        }
+        MomentStorage::U16(values) => {
+            let Some(raw_row) = values.get(row_start..row_end) else {
+                return;
+            };
+            for (raw, value) in raw_row.iter().zip(row_values.iter_mut()) {
+                if source.nodata == Some(*raw) || source.range_folded == Some(*raw) {
+                    continue;
+                }
+                *value = (*raw as f32 - source.offset) / source.scale;
+            }
+        }
+        MomentStorage::F32(values) => {
+            let Some(source_row) = values.get(row_start..row_end) else {
+                return;
+            };
+            row_values.copy_from_slice(source_row);
+        }
     }
 }
 
@@ -2653,9 +2947,9 @@ fn row_nyquist_mps(cut: &ElevationCut, grid: &MomentGrid, row: usize) -> Option<
     cut.radials.get(radial_index)?.nyquist_velocity_mps
 }
 
-fn pick_dealias_seed(grid: &MomentGrid, row: usize, nyquist: f32) -> Option<usize> {
+fn pick_dealias_seed(row_values: &[f32], nyquist: f32) -> Option<usize> {
     let mut fallback = None;
-    let gate_count = grid.gate_range.gate_count;
+    let gate_count = row_values.len();
     let gate_midpoint = gate_count / 2;
     for offset in 0..gate_count {
         let left = gate_midpoint.checked_sub(offset);
@@ -2664,7 +2958,11 @@ fn pick_dealias_seed(grid: &MomentGrid, row: usize, nyquist: f32) -> Option<usiz
             .into_iter()
             .flatten()
         {
-            let Some(value) = grid.scaled_value(row, gate) else {
+            let Some(value) = row_values
+                .get(gate)
+                .copied()
+                .filter(|value| value.is_finite())
+            else {
                 continue;
             };
             fallback.get_or_insert(gate);
@@ -2677,21 +2975,24 @@ fn pick_dealias_seed(grid: &MomentGrid, row: usize, nyquist: f32) -> Option<usiz
 }
 
 fn walk_dealias_radial(
-    source: &MomentGrid,
-    row: usize,
+    observed_values: &[f32],
     nyquist: f32,
     previous_row: Option<&[f32]>,
     row_values: &mut [f32],
     seed: usize,
     direction: isize,
 ) {
-    let gate_count = source.gate_range.gate_count;
+    let gate_count = observed_values.len();
     let mut gate = seed as isize + direction;
     let mut last_gate = Some(seed);
     let mut last_two_gate: Option<usize> = None;
     while (0..gate_count as isize).contains(&gate) {
         let current_gate = gate as usize;
-        let Some(observed) = source.scaled_value(row, current_gate) else {
+        let Some(observed) = observed_values
+            .get(current_gate)
+            .copied()
+            .filter(|value| value.is_finite())
+        else {
             gate += direction;
             continue;
         };
@@ -2953,14 +3254,19 @@ fn row_valid_extent(grid: &MomentGrid, row: usize) -> usize {
         MomentStorage::U8(values) => values
             .get(start..end)
             .and_then(|row| {
-                row.iter()
-                    .rposition(|raw| grid.nodata != Some(u16::from(*raw)))
+                row.iter().rposition(|raw| {
+                    let raw = u16::from(*raw);
+                    grid.nodata != Some(raw) && grid.range_folded != Some(raw)
+                })
             })
             .map(|gate| gate + 1)
             .unwrap_or(0),
         MomentStorage::U16(values) => values
             .get(start..end)
-            .and_then(|row| row.iter().rposition(|raw| grid.nodata != Some(*raw)))
+            .and_then(|row| {
+                row.iter()
+                    .rposition(|raw| grid.nodata != Some(*raw) && grid.range_folded != Some(*raw))
+            })
             .map(|gate| gate + 1)
             .unwrap_or(0),
         MomentStorage::F32(values) => values
@@ -3460,6 +3766,59 @@ mod tests {
     }
 
     #[test]
+    fn compact_sample_resolution_skips_range_folded_candidates() {
+        let gate_range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 1_000,
+            gate_count: 4,
+        };
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        let mut grid = MomentGrid::new_u8(
+            MomentType::Velocity,
+            gate_range.clone(),
+            1.0,
+            0.0,
+            Some(0),
+            Some(1),
+        );
+        for azimuth_deg in [0.0, 0.0] {
+            cut.radials.push(Radial {
+                azimuth_deg,
+                elevation_deg: 0.5,
+                time_offset_ms: 0,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: None,
+                radial_status: None,
+            });
+        }
+        grid.push_u8_row_slice(0, &[1, 1, 1, 1])
+            .expect("range-folded row");
+        grid.push_u8_row_slice(1, &[20, 30, 40, 50])
+            .expect("drawable row");
+
+        let lookup = AzimuthLookup::new(&cut, &grid);
+        assert_eq!(row_valid_extent(&grid, 0), 0);
+        assert_eq!(row_valid_extent(&grid, 1), 4);
+
+        let MomentStorage::U8(values) = &grid.storage else {
+            panic!("test grid should use u8 storage");
+        };
+        let resolved = resolve_compact_sample(
+            values,
+            &grid,
+            &lookup,
+            SampleLookup {
+                azimuth_bin: azimuth_bin(0.0),
+                gate: 3,
+            },
+        )
+        .expect("drawable duplicate should resolve");
+
+        assert_eq!(resolved.row, 1);
+        assert_eq!(resolved.gate, 3);
+    }
+
+    #[test]
     fn viewport_render_uses_requested_screen_resolution() {
         let volume = test_volume();
         let options = ViewportRasterOptions {
@@ -3589,6 +3948,49 @@ mod tests {
             )
             .expect("sample-cache reuse viewport render");
         assert_eq!(reused_pixels, sample_cache_pixels);
+    }
+
+    #[test]
+    fn viewport_geometry_cache_resolves_across_compatible_products() {
+        let volume = test_volume();
+        let options = ViewportRasterOptions {
+            width: 333,
+            height: 217,
+            radar_x_px: 166.5,
+            radar_y_px: 108.5,
+            km_per_px_x: 0.5,
+            km_per_px_y: 0.5,
+        };
+        let reflectivity_cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
+            .expect("reflectivity cache");
+        let velocity_cache =
+            ViewportMomentCache::new(&volume, 0, MomentType::Velocity).expect("velocity cache");
+        let geometry_cache = reflectivity_cache
+            .build_geometry_cache(&volume, options)
+            .expect("geometry cache");
+        let geometry_sample_cache = velocity_cache
+            .build_sample_cache_from_geometry_cache(&volume, &geometry_cache)
+            .expect("velocity sample cache from geometry");
+        let direct_sample_cache = velocity_cache
+            .build_sample_cache(&volume, options)
+            .expect("direct velocity sample cache");
+        let mut geometry_pixels = vec![255; viewport_rgba_buffer_len(options)];
+        let mut direct_pixels = vec![255; viewport_rgba_buffer_len(options)];
+
+        velocity_cache
+            .render_moment_rgba_with_sample_cache(
+                &volume,
+                &geometry_sample_cache,
+                &mut geometry_pixels,
+            )
+            .expect("geometry-derived sample render");
+        velocity_cache
+            .render_moment_rgba_with_sample_cache(&volume, &direct_sample_cache, &mut direct_pixels)
+            .expect("direct sample render");
+
+        assert_eq!(geometry_cache.dimensions(), (333, 217));
+        assert!(geometry_cache.sample_count() >= geometry_sample_cache.sample_count());
+        assert_eq!(geometry_pixels, direct_pixels);
     }
 
     #[test]

@@ -565,7 +565,7 @@ struct RenderWorkerStormPaletteCache {
 }
 
 struct RenderWorkerSampleCache {
-    signature: RenderWorkerViewportSignature,
+    signature: RenderWorkerSampleCacheSignature,
     cache: ViewportSampleCache,
 }
 
@@ -705,6 +705,25 @@ impl RenderWorkerViewportSignature {
             cut,
             moment,
             color_table_signature,
+            viewport,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenderWorkerSampleCacheSignature {
+    volume_ptr: usize,
+    cut: usize,
+    moment: MomentType,
+    viewport: ViewportKey,
+}
+
+impl RenderWorkerSampleCacheSignature {
+    fn new(volume_ptr: usize, cut: usize, moment: MomentType, viewport: ViewportKey) -> Self {
+        Self {
+            volume_ptr,
+            cut,
+            moment,
             viewport,
         }
     }
@@ -1698,10 +1717,16 @@ impl ViewerApp {
             color_table_signature,
             request.key.viewport,
         );
+        let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
+            volume_ptr,
+            request.cut,
+            base_moment.clone(),
+            request.key.viewport,
+        );
 
         let start = Instant::now();
         let mut sample_cache_build_ms = None;
-        let sample_cache_matches = Self::touch_sample_cache(sample_caches, &viewport_signature);
+        let sample_cache_matches = Self::touch_sample_cache(sample_caches, &sample_cache_signature);
         if !sample_cache_matches
             && Self::has_direct_viewport(last_direct_viewports, &viewport_signature)
             && cache_policy.should_build_sample_cache_for_moment_cache(
@@ -1718,14 +1743,14 @@ impl ViewerApp {
             Self::insert_sample_cache(
                 sample_caches,
                 cache_policy,
-                viewport_signature.clone(),
+                sample_cache_signature.clone(),
                 built_sample_cache,
             );
             Self::forget_direct_viewport(last_direct_viewports, &viewport_signature);
         }
         let matching_sample_cache = sample_caches
             .last()
-            .filter(|cached| cached.signature == viewport_signature);
+            .filter(|cached| cached.signature == sample_cache_signature);
         let can_reuse_transparency = matching_sample_cache.is_some()
             && reusable_pixels_signature.as_ref() == Some(&viewport_signature);
         *reusable_pixels_signature = None;
@@ -1885,23 +1910,30 @@ impl ViewerApp {
         last_direct_viewports: &mut Vec<RenderWorkerViewportSignature>,
         cache_policy: RenderWorkerCachePolicy,
     ) {
-        let signature = RenderWorkerViewportSignature::new(
-            Arc::as_ptr(&request.volume) as usize,
+        let volume_ptr = Arc::as_ptr(&request.volume) as usize;
+        let viewport_signature = RenderWorkerViewportSignature::new(
+            volume_ptr,
             request.cut,
             request.product.base_moment(),
             request.key.color_table_signature,
             request.key.viewport,
         );
-        if Self::touch_sample_cache(sample_caches, &signature) {
+        let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
+            volume_ptr,
+            request.cut,
+            request.product.base_moment(),
+            request.key.viewport,
+        );
+        if Self::touch_sample_cache(sample_caches, &sample_cache_signature) {
             return;
         }
         let Some(moment_index) = Self::touch_moment_cache(
             moment_caches,
-            signature.volume_ptr,
-            signature.cut,
-            &signature.moment,
+            viewport_signature.volume_ptr,
+            viewport_signature.cut,
+            &viewport_signature.moment,
             request.product.uses_dealiased_velocity(),
-            signature.color_table_signature,
+            viewport_signature.color_table_signature,
         ) else {
             return;
         };
@@ -1922,8 +1954,8 @@ impl ViewerApp {
         else {
             return;
         };
-        Self::insert_sample_cache(sample_caches, cache_policy, signature.clone(), cache);
-        Self::forget_direct_viewport(last_direct_viewports, &signature);
+        Self::insert_sample_cache(sample_caches, cache_policy, sample_cache_signature, cache);
+        Self::forget_direct_viewport(last_direct_viewports, &viewport_signature);
     }
 
     fn warm_velocity_interaction_cache_after_direct_render(
@@ -1946,11 +1978,10 @@ impl ViewerApp {
         let velocity_color_table_signature = request
             .color_tables
             .signature_for_family(ColorTableFamily::Velocity);
-        let signature = RenderWorkerViewportSignature::new(
+        let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
             volume_ptr,
             cut,
             MomentType::Velocity,
-            velocity_color_table_signature,
             request.key.viewport,
         );
 
@@ -1987,7 +2018,7 @@ impl ViewerApp {
             );
         }
 
-        if !Self::touch_sample_cache(sample_caches, &signature)
+        if !Self::touch_sample_cache(sample_caches, &sample_cache_signature)
             && let Some(moment_cache) = moment_caches.last()
             && let Ok(true) = cache_policy.should_build_sample_cache_for_moment_cache(
                 &moment_cache.cache,
@@ -1998,7 +2029,7 @@ impl ViewerApp {
                 .cache
                 .build_sample_cache(request.volume.as_ref(), request.viewport_options)
         {
-            Self::insert_sample_cache(sample_caches, cache_policy, signature, cache);
+            Self::insert_sample_cache(sample_caches, cache_policy, sample_cache_signature, cache);
         }
 
         let Some(moment_index) = Self::touch_moment_cache(
@@ -2073,7 +2104,7 @@ impl ViewerApp {
 
     fn touch_sample_cache(
         sample_caches: &mut Vec<RenderWorkerSampleCache>,
-        signature: &RenderWorkerViewportSignature,
+        signature: &RenderWorkerSampleCacheSignature,
     ) -> bool {
         let Some(index) = sample_caches
             .iter()
@@ -2089,7 +2120,7 @@ impl ViewerApp {
     fn insert_sample_cache(
         sample_caches: &mut Vec<RenderWorkerSampleCache>,
         cache_policy: RenderWorkerCachePolicy,
-        signature: RenderWorkerViewportSignature,
+        signature: RenderWorkerSampleCacheSignature,
         cache: ViewportSampleCache,
     ) {
         sample_caches.retain(|cached| cached.signature != signature);
@@ -3493,13 +3524,24 @@ impl ViewerApp {
         if coordinates.len() < 2 {
             return;
         }
-        let points = coordinates
-            .iter()
-            .map(|(longitude_deg, latitude_deg)| {
-                self.lon_lat_to_screen(rect, *longitude_deg, *latitude_deg)
-            })
-            .collect::<Vec<_>>();
-        painter.add(egui::Shape::line(points, stroke));
+        let simplify_px_sq = basemap_line_simplification_px(self.map_scale).powi(2);
+        let mut points = Vec::with_capacity(coordinates.len());
+        for (index, (longitude_deg, latitude_deg)) in coordinates.iter().enumerate() {
+            let point = self.lon_lat_to_screen(rect, *longitude_deg, *latitude_deg);
+            let is_endpoint = index == 0 || index + 1 == coordinates.len();
+            if !is_endpoint
+                && simplify_px_sq > 0.0
+                && points
+                    .last()
+                    .is_some_and(|last: &egui::Pos2| last.distance_sq(point) < simplify_px_sq)
+            {
+                continue;
+            }
+            points.push(point);
+        }
+        if points.len() >= 2 {
+            painter.add(egui::Shape::line(points, stroke));
+        }
     }
 
     fn draw_world_place_labels(
@@ -3976,6 +4018,16 @@ fn us_detail_visible(bounds: GeoBounds) -> bool {
     BASEMAP_US_DETAIL_BOUNDS
         .iter()
         .any(|us_bounds| bounds.intersects_bbox(*us_bounds))
+}
+
+fn basemap_line_simplification_px(map_scale: f32) -> f32 {
+    if map_scale < 24.0 {
+        0.75
+    } else if map_scale < 96.0 {
+        0.45
+    } else {
+        0.0
+    }
 }
 
 impl GeoBounds {
@@ -6664,6 +6716,30 @@ mod tests {
         assert_eq!(high.sample_cache_capacity(), 6);
         assert_eq!(high.moment_cache_capacity(), 6);
         assert_eq!(high.sample_cache_bytes(), HIGH_END_SAMPLE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn sample_cache_signature_ignores_color_table_signature() {
+        let viewport = ViewportKey {
+            width: 800,
+            height: 600,
+            radar_x_px: 4_000,
+            radar_y_px: 3_000,
+            km_per_px_x: 160_000,
+            km_per_px_y: 160_000,
+        };
+
+        let first_pixels =
+            RenderWorkerViewportSignature::new(10, 1, MomentType::Reflectivity, 123, viewport);
+        let second_pixels =
+            RenderWorkerViewportSignature::new(10, 1, MomentType::Reflectivity, 456, viewport);
+        assert_ne!(first_pixels, second_pixels);
+
+        let first_samples =
+            RenderWorkerSampleCacheSignature::new(10, 1, MomentType::Reflectivity, viewport);
+        let second_samples =
+            RenderWorkerSampleCacheSignature::new(10, 1, MomentType::Reflectivity, viewport);
+        assert_eq!(first_samples, second_samples);
     }
 
     #[test]

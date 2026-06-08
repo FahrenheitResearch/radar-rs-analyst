@@ -51,6 +51,25 @@ Run it with an optional local Level II file path:
 target\release\radar-rs-analyst.exe C:\path\to\KTLX20260607_162229_V06
 ```
 
+## Performance Workflows
+
+For a fastest local build on the machine that will run the app, build with native CPU instructions:
+
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo build --release -p app_ui --bin radar-rs-analyst
+```
+
+Do not use `target-cpu=native` for broadly distributed binaries unless the target CPU family is controlled.
+
+The renderer probe measures cold decode, preview-to-final decode, direct viewport render, sample-cache build/render/reuse, DVEL, SRV, DSRV, and multiple viewport sizes:
+
+```powershell
+cargo run --release -p render2d --example perf_probe -- --runs 12 --decode-runs 8 --viewport 1320x820 C:\path\to\level2-file
+```
+
+Use that probe as the training/check workload for PGO or renderer backend experiments. The CPU renderer remains the deterministic correctness path; a future GPU backend should beat these same probe stages without changing radar pixel semantics.
+
 ## Repository Layout
 
 - `crates/app_ui` - desktop UI and interaction logic.
