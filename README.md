@@ -18,6 +18,7 @@ Windows users can download the latest `radar-rs-analyst-windows-x64.zip` from th
 - Lightweight vector basemap with state/county boundaries and zoom-aware town/county labels.
 - Live NWS warnings/advisories, SPC mesoscale discussions, and watch-style hazard polygons with click details.
 - Radar-site selection and right-click nearest-site loading without forcing the map to recenter.
+- Multi-radar overlays with independent live Level II chunk refresh, visibility, opacity, center, refresh, and promote controls.
 - VROT/source-gate readout for velocity interrogation.
 - Arrow-key product and tilt stepping for fast analyst workflows.
 - Honest timing readout split into lookup, fetch, read, decode, render, worker, texture, and cache stages.

@@ -41,6 +41,9 @@ const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 8;
 const LIVE_HAZARD_REFRESH_SECONDS: u64 = 10;
 const REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
+const MAX_RADAR_OVERLAY_LAYERS: usize = 8;
+const DEFAULT_RADAR_OVERLAY_ALPHA: u8 = 210;
+const MIN_RADAR_OVERLAY_ALPHA: u8 = 48;
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const LATEST_OBJECT_CACHE_TTL: Duration = Duration::from_secs(10);
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
@@ -265,6 +268,8 @@ struct ViewerApp {
     status: String,
     sites: Vec<RadarSite>,
     selected_site_index: usize,
+    radar_layers: Vec<RadarOverlayLayer>,
+    next_radar_layer_id: u64,
     site_catalog_receiver: Option<mpsc::Receiver<AsyncSiteCatalogResult>>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
     hazard_receiver: Option<mpsc::Receiver<AsyncHazardResult>>,
@@ -286,6 +291,75 @@ struct ViewerApp {
     storm_motion_direction_deg: f32,
     storm_motion_speed_kt: f32,
     dealiased_readout_cache: Option<DealiasedReadoutCache>,
+}
+
+struct RadarOverlayLayer {
+    id: u64,
+    site: RadarSite,
+    source_path: Option<PathBuf>,
+    volume: Option<Arc<RadarVolume>>,
+    load_timing: Option<LoadTimings>,
+    texture: Option<egui::TextureHandle>,
+    texture_key: Option<TextureKey>,
+    render_sender: mpsc::Sender<RenderRequest>,
+    render_receiver: mpsc::Receiver<AsyncRenderResult>,
+    render_recycle_sender: mpsc::Sender<RenderRecycleBuffer>,
+    pending_render_key: Option<TextureKey>,
+    load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
+    status: String,
+    last_realtime_level2_refresh: Option<Instant>,
+    opacity: u8,
+    visible: bool,
+    radar_range_km: f32,
+    render_ms: Option<f32>,
+    worker_ms: Option<f32>,
+    texture_ms: Option<f32>,
+}
+
+impl RadarOverlayLayer {
+    fn new(id: u64, site: RadarSite) -> Self {
+        let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
+        let site_id = site.level2_id.clone();
+        Self {
+            id,
+            site,
+            source_path: None,
+            volume: None,
+            load_timing: None,
+            texture: None,
+            texture_key: None,
+            render_sender,
+            render_receiver,
+            render_recycle_sender,
+            pending_render_key: None,
+            load_receiver: None,
+            status: format!("Queued {site_id}"),
+            last_realtime_level2_refresh: None,
+            opacity: DEFAULT_RADAR_OVERLAY_ALPHA,
+            visible: true,
+            radar_range_km: DEFAULT_RADAR_RANGE_KM,
+            render_ms: None,
+            worker_ms: None,
+            texture_ms: None,
+        }
+    }
+
+    fn clear_texture(&mut self) {
+        self.texture = None;
+        self.texture_key = None;
+        self.pending_render_key = None;
+        self.radar_range_km = DEFAULT_RADAR_RANGE_KM;
+        self.render_ms = None;
+        self.worker_ms = None;
+        self.texture_ms = None;
+    }
+
+    fn radar_location(&self) -> Option<(f32, f32)> {
+        self.volume
+            .as_ref()
+            .and_then(|volume| Some((volume.site.latitude_deg?, volume.site.longitude_deg?)))
+            .or_else(|| site_location(&self.site))
+    }
 }
 
 struct AsyncLoadResult {
@@ -341,6 +415,94 @@ struct DecodedLoad {
     path: PathBuf,
     volume: RadarVolume,
     timings: LoadTimings,
+}
+
+fn spawn_latest_level2_load_worker(
+    site: RadarSite,
+    mode: LatestLoadMode,
+    current_source_path: Option<PathBuf>,
+    sender: mpsc::Sender<AsyncLoadResult>,
+) {
+    thread::spawn(move || {
+        let total_start = Instant::now();
+        let site_id = site.level2_id.clone();
+        let site_cache_dir = cache_dir(&site.level2_id);
+
+        let final_update = (|| -> Result<AsyncLoadUpdate, String> {
+            let realtime_result = (|| -> Result<DecodedLoad, String> {
+                let mut realtime_timings = LoadTimings::default();
+                let lookup_start = Instant::now();
+                let realtime = data_source::latest_realtime_level2_volume(&site.level2_id)
+                    .map_err(|err| err.to_string())?;
+                realtime_timings.lookup_ms = Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
+                realtime_timings.lookup_cache_hit = Some(false);
+
+                let fetch_start = Instant::now();
+                let downloaded = data_source::download_realtime_volume(&realtime, &site_cache_dir)
+                    .map_err(|err| err.to_string())?;
+                realtime_timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
+                realtime_timings.fetch_cache_hit = Some(downloaded.cache_hit);
+                if is_unchanged_realtime_refresh(
+                    downloaded.cache_hit,
+                    &downloaded.path,
+                    current_source_path.as_deref(),
+                ) {
+                    return Err("realtime chunks unchanged".to_owned());
+                }
+
+                let decoded = decode_load_path_with_optional_preview(
+                    downloaded.path,
+                    &format!("realtime L2 {site_id}"),
+                    total_start,
+                    realtime_timings,
+                    &sender,
+                    should_preview_loads(),
+                )?;
+                if global_displayable_products(&decoded.volume).is_empty() {
+                    return Err("realtime chunks are not displayable yet".to_owned());
+                }
+                Ok(decoded)
+            })();
+            if let Ok(decoded) = realtime_result {
+                return Ok(AsyncLoadUpdate::Final(Ok(decoded)));
+            } else if mode == LatestLoadMode::AutoRefresh {
+                return Ok(AsyncLoadUpdate::Unchanged);
+            }
+
+            let mut timings = LoadTimings::default();
+            let lookup_start = Instant::now();
+            let latest = data_source::latest_level2_object_cached(
+                &site.level2_id,
+                7,
+                LATEST_OBJECT_CACHE_TTL,
+            )
+            .map_err(|err| err.to_string())?;
+            timings.lookup_ms = Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
+            timings.lookup_cache_hit = Some(latest.cache_hit);
+
+            let fetch_start = Instant::now();
+            let downloaded =
+                data_source::download_object(LEVEL2_ARCHIVE_BUCKET, latest.object, &site_cache_dir)
+                    .map_err(|err| err.to_string())?;
+            timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
+            timings.fetch_cache_hit = Some(downloaded.cache_hit);
+
+            let decoded = decode_load_path_with_optional_preview(
+                downloaded.path,
+                &format!("L2 {site_id}"),
+                total_start,
+                timings,
+                &sender,
+                should_preview_loads(),
+            )?;
+            Ok(AsyncLoadUpdate::Final(Ok(decoded)))
+        })();
+        let update = final_update.unwrap_or_else(|err| AsyncLoadUpdate::Final(Err(err)));
+        let _ = sender.send(AsyncLoadResult {
+            label: format!("L2 {site_id}"),
+            update,
+        });
+    });
 }
 
 struct AsyncRenderResult {
@@ -999,6 +1161,8 @@ impl ViewerApp {
             status: String::new(),
             sites,
             selected_site_index,
+            radar_layers: Vec::new(),
+            next_radar_layer_id: 1,
             site_catalog_receiver: None,
             load_receiver: None,
             hazard_receiver: None,
@@ -1110,6 +1274,147 @@ impl ViewerApp {
             return;
         };
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::AutoRefresh);
+    }
+
+    fn maybe_refresh_radar_layers(&mut self, ctx: &egui::Context) {
+        if !self.realtime_level2_auto_refresh {
+            return;
+        }
+
+        let mut requested_repaint = false;
+        for (index, layer) in self.radar_layers.iter_mut().enumerate() {
+            if !layer.visible || layer.load_receiver.is_some() {
+                continue;
+            }
+            let refresh_after = Duration::from_secs(REALTIME_LEVEL2_REFRESH_SECONDS)
+                + Duration::from_millis((index as u64 % 8) * 350);
+            let should_refresh = layer
+                .last_realtime_level2_refresh
+                .is_none_or(|last_refresh| last_refresh.elapsed() >= refresh_after);
+            if should_refresh {
+                Self::start_radar_layer_load(layer, LatestLoadMode::AutoRefresh, ctx);
+                requested_repaint = true;
+            }
+        }
+
+        if !requested_repaint && !self.radar_layers.is_empty() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
+    fn add_or_refresh_radar_layer(&mut self, site: RadarSite, ctx: &egui::Context) {
+        if let Some(index) = self
+            .radar_layers
+            .iter()
+            .position(|layer| layer.site.level2_id == site.level2_id)
+        {
+            let layer = &mut self.radar_layers[index];
+            layer.visible = true;
+            if layer.load_receiver.is_none() {
+                Self::start_radar_layer_load(layer, LatestLoadMode::User, ctx);
+            }
+            self.status = format!("Refreshing overlay {}", site.level2_id);
+            return;
+        }
+
+        if self.radar_layers.len() >= MAX_RADAR_OVERLAY_LAYERS {
+            let remove_index = self
+                .radar_layers
+                .iter()
+                .position(|layer| !layer.visible)
+                .unwrap_or(0);
+            self.radar_layers.remove(remove_index);
+        }
+
+        let id = self.next_radar_layer_id;
+        self.next_radar_layer_id = self.next_radar_layer_id.saturating_add(1);
+        let mut layer = RadarOverlayLayer::new(id, site.clone());
+        Self::start_radar_layer_load(&mut layer, LatestLoadMode::User, ctx);
+        self.status = format!("Added overlay {}", site.level2_id);
+        self.radar_layers.push(layer);
+    }
+
+    fn start_radar_layer_load(
+        layer: &mut RadarOverlayLayer,
+        mode: LatestLoadMode,
+        ctx: &egui::Context,
+    ) {
+        let site_id = layer.site.level2_id.clone();
+        let (sender, receiver) = mpsc::channel();
+        layer.load_receiver = Some(receiver);
+        layer.last_realtime_level2_refresh = Some(Instant::now());
+        layer.status = if mode == LatestLoadMode::AutoRefresh {
+            format!("Refreshing {site_id}")
+        } else {
+            format!("Loading {site_id}")
+        };
+        let current_source_path = (mode == LatestLoadMode::AutoRefresh)
+            .then(|| layer.source_path.clone())
+            .flatten();
+        spawn_latest_level2_load_worker(layer.site.clone(), mode, current_source_path, sender);
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    fn poll_radar_layer_loads(&mut self, ctx: &egui::Context) {
+        let mut saw_message = false;
+        for layer in &mut self.radar_layers {
+            while let Some(result) = layer.load_receiver.as_ref().map(mpsc::Receiver::try_recv) {
+                match result {
+                    Ok(message) => {
+                        saw_message = true;
+                        match message.update {
+                            AsyncLoadUpdate::Preview(decoded) => {
+                                Self::install_radar_layer_volume(layer, decoded);
+                                layer.status = format!("Preview {}", message.label);
+                            }
+                            AsyncLoadUpdate::Unchanged => {
+                                layer.load_receiver = None;
+                                layer.status = format!("Current {}", message.label);
+                                break;
+                            }
+                            AsyncLoadUpdate::Final(result) => {
+                                layer.load_receiver = None;
+                                match result {
+                                    Ok(decoded) => {
+                                        Self::install_radar_layer_volume(layer, decoded);
+                                        layer.status = format!("Loaded {}", message.label);
+                                    }
+                                    Err(err) => {
+                                        layer.status =
+                                            format!("Load failed for {}: {err}", message.label);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        layer.load_receiver = None;
+                        layer.status = "Layer load worker disconnected".to_owned();
+                        saw_message = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if saw_message {
+            ctx.request_repaint();
+        } else if self
+            .radar_layers
+            .iter()
+            .any(|layer| layer.load_receiver.is_some())
+        {
+            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+        }
+    }
+
+    fn install_radar_layer_volume(layer: &mut RadarOverlayLayer, decoded: DecodedLoad) {
+        layer.source_path = Some(decoded.path);
+        layer.load_timing = Some(decoded.timings);
+        layer.volume = Some(Arc::new(decoded.volume));
+        layer.clear_texture();
     }
 
     fn clear_texture(&mut self) {
@@ -1556,6 +1861,116 @@ impl ViewerApp {
         }
     }
 
+    fn poll_radar_layer_renders(&mut self, ctx: &egui::Context) {
+        let mut saw_message = false;
+        for layer in &mut self.radar_layers {
+            loop {
+                match layer.render_receiver.try_recv() {
+                    Ok(message) => {
+                        saw_message = true;
+                        let is_latest = layer.pending_render_key.as_ref() == Some(&message.key);
+                        match message.result {
+                            Ok(rendered) if is_latest => {
+                                layer.pending_render_key = None;
+                                Self::install_radar_layer_texture(
+                                    ctx,
+                                    layer,
+                                    message.key,
+                                    rendered,
+                                );
+                            }
+                            Ok(rendered) => {
+                                let _ = layer.render_recycle_sender.send(RenderRecycleBuffer {
+                                    rgba: rendered.rgba,
+                                    signature: Some(rendered.buffer_signature),
+                                });
+                            }
+                            Err(err) if is_latest => {
+                                layer.pending_render_key = None;
+                                layer.texture = None;
+                                layer.texture_key = None;
+                                layer.render_ms = None;
+                                layer.worker_ms = None;
+                                layer.texture_ms = None;
+                                layer.status = format!("Render failed: {err}");
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        layer.pending_render_key = None;
+                        layer.status = "Layer render worker disconnected".to_owned();
+                        saw_message = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if saw_message {
+            ctx.request_repaint();
+        } else if self
+            .radar_layers
+            .iter()
+            .any(|layer| layer.pending_render_key.is_some())
+        {
+            ctx.request_repaint_after(Duration::from_millis(8));
+        }
+    }
+
+    fn install_radar_layer_texture(
+        ctx: &egui::Context,
+        layer: &mut RadarOverlayLayer,
+        key: TextureKey,
+        rendered: RenderedTexture,
+    ) {
+        let RenderedTexture {
+            width,
+            height,
+            rgba,
+            buffer_signature,
+            render_ms,
+            worker_ms,
+            radar_range_km,
+            ..
+        } = rendered;
+        let texture_start = Instant::now();
+        let color_image = radar_color_image_from_rgba([width, height], &rgba);
+        let can_update_texture = layer
+            .texture_key
+            .as_ref()
+            .is_some_and(|old_key| old_key.viewport.dimensions() == key.viewport.dimensions());
+        if can_update_texture && let Some(texture) = &mut layer.texture {
+            texture.set(color_image, radar_texture_options());
+        } else {
+            layer.texture = Some(ctx.load_texture(
+                format!(
+                    "radar-layer-{}-{}-{}-{}x{}",
+                    layer.id,
+                    key.cut,
+                    key.product.label(),
+                    key.viewport.width,
+                    key.viewport.height
+                ),
+                color_image,
+                radar_texture_options(),
+            ));
+        }
+        layer.texture_key = Some(key);
+        layer.render_ms = Some(render_ms);
+        layer.worker_ms = Some(worker_ms);
+        layer.texture_ms = Some(texture_start.elapsed().as_secs_f32() * 1000.0);
+        layer.radar_range_km = radar_range_km;
+        let _ = layer.render_recycle_sender.send(RenderRecycleBuffer {
+            rgba,
+            signature: Some(buffer_signature),
+        });
+        if layer.load_receiver.is_none() {
+            layer.status = "Rendered".to_owned();
+        }
+    }
+
     fn recycle_render_buffer(
         &self,
         rgba: Vec<u8>,
@@ -1623,6 +2038,87 @@ impl ViewerApp {
             },
             ctx,
         );
+    }
+
+    fn request_radar_layer_renders(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+        let mut requests = Vec::new();
+        for (index, layer) in self.radar_layers.iter().enumerate() {
+            if !layer.visible {
+                continue;
+            }
+            let Some(volume) = layer.volume.clone() else {
+                continue;
+            };
+            let Some((radar_lat, radar_lon)) = layer.radar_location() else {
+                continue;
+            };
+            let Some((viewport_options, viewport_key)) =
+                self.viewport_raster_options_for_location(ctx, rect, radar_lat, radar_lon)
+            else {
+                continue;
+            };
+            let product = self.selected_product.clone();
+            let Some(cut) = best_cut_for_product(volume.as_ref(), self.selected_cut, &product)
+            else {
+                continue;
+            };
+            let color_table_signature = self
+                .color_tables
+                .signature_for_family(product.color_family());
+            let key = TextureKey {
+                cut,
+                product: product.clone(),
+                color_table_signature,
+                storm_motion_key: self.storm_motion_key(),
+                viewport: viewport_key,
+            };
+            if layer.texture_key.as_ref() == Some(&key)
+                || layer.pending_render_key.as_ref() == Some(&key)
+            {
+                continue;
+            }
+            let radar_range_km = selected_grid_range_km_for(volume.as_ref(), cut, &product)
+                .unwrap_or(DEFAULT_RADAR_RANGE_KM);
+            requests.push((
+                index,
+                RenderRequest {
+                    key,
+                    volume,
+                    cut,
+                    product,
+                    color_tables: self.color_tables.clone(),
+                    storm_motion: self.current_storm_motion(),
+                    viewport_options,
+                    radar_range_km,
+                },
+            ));
+        }
+
+        for (index, request) in requests {
+            if let Some(layer) = self.radar_layers.get_mut(index) {
+                let key = request.key.clone();
+                match layer.render_sender.send(request) {
+                    Ok(()) => {
+                        layer.pending_render_key = Some(key);
+                        if layer.load_receiver.is_none() {
+                            layer.status = "Rendering".to_owned();
+                        }
+                    }
+                    Err(_) => {
+                        layer.pending_render_key = None;
+                        layer.status = "Layer render worker disconnected".to_owned();
+                    }
+                }
+            }
+        }
+
+        if self
+            .radar_layers
+            .iter()
+            .any(|layer| layer.pending_render_key.is_some())
+        {
+            ctx.request_repaint_after(Duration::from_millis(8));
+        }
     }
 
     fn take_newest_render_request(
@@ -2244,6 +2740,16 @@ impl ViewerApp {
         rect: egui::Rect,
     ) -> Option<(ViewportRasterOptions, ViewportKey)> {
         let (radar_lat, radar_lon) = self.radar_location()?;
+        self.viewport_raster_options_for_location(ctx, rect, radar_lat, radar_lon)
+    }
+
+    fn viewport_raster_options_for_location(
+        &self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        radar_lat: f32,
+        radar_lon: f32,
+    ) -> Option<(ViewportRasterOptions, ViewportKey)> {
         let pixels_per_point = ctx.pixels_per_point().max(1.0);
         let width = (rect.width() * pixels_per_point).round().max(1.0) as u32;
         let height = (rect.height() * pixels_per_point).round().max(1.0) as u32;
@@ -2310,9 +2816,7 @@ impl ViewerApp {
 
     fn selected_grid_range_km(&self) -> Option<f32> {
         let volume = self.volume.as_ref()?;
-        let cut = volume.cuts.get(self.selected_cut)?;
-        let grid = cut.moments.get(&self.selected_product.base_moment())?;
-        grid_range_km(grid)
+        selected_grid_range_km_for(volume, self.selected_cut, &self.selected_product)
     }
 
     fn current_storm_motion(&self) -> StormMotion {
@@ -2419,90 +2923,7 @@ impl ViewerApp {
             self.clear_displayed_volume_for_pending_load(ctx);
         }
 
-        thread::spawn(move || {
-            let total_start = Instant::now();
-            let site_cache_dir = cache_dir(&site.level2_id);
-
-            let final_update = (|| -> Result<AsyncLoadUpdate, String> {
-                let realtime_result = (|| -> Result<DecodedLoad, String> {
-                    let mut realtime_timings = LoadTimings::default();
-                    let lookup_start = Instant::now();
-                    let realtime = data_source::latest_realtime_level2_volume(&site.level2_id)
-                        .map_err(|err| err.to_string())?;
-                    realtime_timings.lookup_ms =
-                        Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
-                    realtime_timings.lookup_cache_hit = Some(false);
-
-                    let fetch_start = Instant::now();
-                    let downloaded =
-                        data_source::download_realtime_volume(&realtime, &site_cache_dir)
-                            .map_err(|err| err.to_string())?;
-                    realtime_timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
-                    realtime_timings.fetch_cache_hit = Some(downloaded.cache_hit);
-                    if is_unchanged_realtime_refresh(
-                        downloaded.cache_hit,
-                        &downloaded.path,
-                        current_source_path.as_deref(),
-                    ) {
-                        return Err("realtime chunks unchanged".to_owned());
-                    }
-
-                    let decoded = decode_load_path_with_optional_preview(
-                        downloaded.path,
-                        &format!("realtime L2 {site_id}"),
-                        total_start,
-                        realtime_timings,
-                        &sender,
-                        should_preview_loads(),
-                    )?;
-                    if global_displayable_products(&decoded.volume).is_empty() {
-                        return Err("realtime chunks are not displayable yet".to_owned());
-                    }
-                    Ok(decoded)
-                })();
-                if let Ok(decoded) = realtime_result {
-                    return Ok(AsyncLoadUpdate::Final(Ok(decoded)));
-                } else if mode == LatestLoadMode::AutoRefresh {
-                    return Ok(AsyncLoadUpdate::Unchanged);
-                }
-
-                let mut timings = LoadTimings::default();
-                let lookup_start = Instant::now();
-                let latest = data_source::latest_level2_object_cached(
-                    &site.level2_id,
-                    7,
-                    LATEST_OBJECT_CACHE_TTL,
-                )
-                .map_err(|err| err.to_string())?;
-                timings.lookup_ms = Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
-                timings.lookup_cache_hit = Some(latest.cache_hit);
-
-                let fetch_start = Instant::now();
-                let downloaded = data_source::download_object(
-                    LEVEL2_ARCHIVE_BUCKET,
-                    latest.object,
-                    &site_cache_dir,
-                )
-                .map_err(|err| err.to_string())?;
-                timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
-                timings.fetch_cache_hit = Some(downloaded.cache_hit);
-
-                let decoded = decode_load_path_with_optional_preview(
-                    downloaded.path,
-                    &format!("L2 {site_id}"),
-                    total_start,
-                    timings,
-                    &sender,
-                    should_preview_loads(),
-                )?;
-                Ok(AsyncLoadUpdate::Final(Ok(decoded)))
-            })();
-            let update = final_update.unwrap_or_else(|err| AsyncLoadUpdate::Final(Err(err)));
-            let _ = sender.send(AsyncLoadResult {
-                label: format!("L2 {site_id}"),
-                update,
-            });
-        });
+        spawn_latest_level2_load_worker(site, mode, current_source_path, sender);
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 }
@@ -2512,9 +2933,12 @@ impl eframe::App for ViewerApp {
         let ctx = ui.ctx().clone();
         self.poll_async_site_catalog(&ctx);
         self.poll_async_load(&ctx);
+        self.poll_radar_layer_loads(&ctx);
         self.poll_async_render(&ctx);
+        self.poll_radar_layer_renders(&ctx);
         self.poll_async_hazards(&ctx);
         self.maybe_refresh_realtime_level2(&ctx);
+        self.maybe_refresh_radar_layers(&ctx);
         self.maybe_refresh_live_hazards(&ctx);
         self.sanitize_selection();
         self.handle_keyboard_navigation(&ctx);
@@ -2589,6 +3013,8 @@ impl ViewerApp {
             }
             ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live");
         });
+
+        self.radar_layers_panel(ui, ctx);
 
         ui.add_space(12.0);
         let Some(volume) = &self.volume else {
@@ -2763,6 +3189,106 @@ impl ViewerApp {
                     }
                 }
             });
+    }
+
+    fn radar_layers_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(format!("Overlays {}", self.radar_layers.len()));
+            if ui
+                .add_enabled(!self.radar_layers.is_empty(), egui::Button::new("Clear"))
+                .clicked()
+            {
+                self.radar_layers.clear();
+                self.status = "Cleared radar overlays".to_owned();
+                ctx.request_repaint();
+            }
+        });
+
+        if self.radar_layers.is_empty() {
+            ui.label("No overlays");
+            return;
+        }
+
+        let mut remove_index = None;
+        let mut center_site = None;
+        let mut refresh_index = None;
+        let mut promote_site = None;
+        for (index, layer) in self.radar_layers.iter_mut().enumerate() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut layer.visible, "").changed() {
+                    ctx.request_repaint();
+                }
+                ui.label(&layer.site.level2_id);
+                if layer.load_receiver.is_some() {
+                    ui.label("loading");
+                } else if layer.volume.is_some() {
+                    ui.label("live");
+                } else {
+                    ui.label("queued");
+                }
+                if ui.button("Center").clicked() {
+                    center_site = Some(layer.site.clone());
+                }
+                if ui
+                    .add_enabled(layer.load_receiver.is_none(), egui::Button::new("Refresh"))
+                    .clicked()
+                {
+                    refresh_index = Some(index);
+                }
+                if ui.button("Primary").clicked() {
+                    promote_site = Some(layer.site.clone());
+                }
+                if ui.button("X").clicked() {
+                    remove_index = Some(index);
+                }
+            });
+            if ui
+                .add(
+                    egui::Slider::new(&mut layer.opacity, MIN_RADAR_OVERLAY_ALPHA..=u8::MAX)
+                        .text("Opacity"),
+                )
+                .changed()
+            {
+                ctx.request_repaint();
+            }
+            ui.label(&layer.status);
+            if let Some(path) = &layer.source_path {
+                ui.small(path.display().to_string());
+            }
+            if let Some(render_ms) = layer.render_ms {
+                let texture_ms = layer.texture_ms.unwrap_or(0.0);
+                ui.small(format!(
+                    "render {render_ms:.1} ms texture {texture_ms:.1} ms"
+                ));
+            }
+        }
+
+        if let Some(index) = refresh_index
+            && let Some(layer) = self.radar_layers.get_mut(index)
+        {
+            Self::start_radar_layer_load(layer, LatestLoadMode::User, ctx);
+        }
+        if let Some(site) = center_site
+            && let Some((latitude_deg, longitude_deg)) = site_location(&site)
+        {
+            self.center_map_on(latitude_deg, longitude_deg);
+        }
+        if let Some(site) = promote_site {
+            if let Some(index) = self
+                .sites
+                .iter()
+                .position(|candidate| candidate.level2_id == site.level2_id)
+            {
+                self.selected_site_index = index;
+            }
+            self.start_latest_level2_load(site, ctx);
+        }
+        if let Some(index) = remove_index {
+            self.radar_layers.remove(index);
+            ctx.request_repaint();
+        }
     }
 
     fn color_table_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -3203,6 +3729,10 @@ impl ViewerApp {
             ui.label(format!("map {:.0} px/deg", self.map_scale));
             ui.separator();
             ui.label(format!("{:.0} km range", self.radar_range_km));
+            if !self.radar_layers.is_empty() {
+                ui.separator();
+                ui.label(format!("{} overlays", self.radar_layers.len()));
+            }
             ui.separator();
             ui.label(self.source_path.display().to_string());
         });
@@ -3249,8 +3779,10 @@ impl ViewerApp {
         self.draw_basemap(&painter, rect);
         self.draw_graticule(&painter, rect);
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
+        self.request_radar_layer_renders(ui.ctx(), rect);
         self.request_texture_render(ui.ctx(), rect);
-        self.draw_radar_layer(&painter, rect);
+        self.draw_radar_overlay_layers(ui.ctx(), &painter, rect);
+        self.draw_radar_layer(ui.ctx(), &painter, rect);
         let overlay_start = Instant::now();
         self.draw_basemap_overlay(&painter, rect);
         self.draw_hazard_overlays(&painter, rect);
@@ -3288,7 +3820,11 @@ impl ViewerApp {
             && let Some(site) = self.sites.get(index).cloned()
         {
             self.selected_site_index = index;
-            self.start_latest_level2_load(site, ui.ctx());
+            if ui.input(|input| input.modifiers.ctrl) {
+                self.add_or_refresh_radar_layer(site, ui.ctx());
+            } else {
+                self.start_latest_level2_load(site, ui.ctx());
+            }
         }
 
         if response.clicked()
@@ -3299,9 +3835,15 @@ impl ViewerApp {
         }
 
         self.draw_site_markers(&painter, &site_points);
+        self.draw_radar_layer_markers(&painter, rect);
         self.draw_loaded_volume_marker(&painter, rect);
 
-        if self.texture.is_none() {
+        if self.texture.is_none()
+            && self
+                .radar_layers
+                .iter()
+                .all(|layer| layer.texture.is_none())
+        {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -3312,21 +3854,90 @@ impl ViewerApp {
         }
     }
 
-    fn draw_radar_layer(&self, painter: &egui::Painter, rect: egui::Rect) {
+    fn draw_radar_layer(&self, ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect) {
         let Some(texture) = &self.texture else {
             return;
         };
         let Some((latitude_deg, longitude_deg)) = self.radar_location() else {
             return;
         };
+        let image_rect = self
+            .texture_key
+            .as_ref()
+            .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
+            .unwrap_or(rect);
 
         painter.image(
             texture.id(),
-            rect,
+            image_rect,
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
-        self.draw_range_ring(painter, rect, latitude_deg, longitude_deg);
+        self.draw_range_ring(
+            painter,
+            rect,
+            latitude_deg,
+            longitude_deg,
+            self.radar_range_km,
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(104, 128, 148)),
+        );
+    }
+
+    fn draw_radar_overlay_layers(
+        &self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+    ) {
+        for layer in &self.radar_layers {
+            if !layer.visible {
+                continue;
+            }
+            let Some(texture) = &layer.texture else {
+                continue;
+            };
+            let Some((latitude_deg, longitude_deg)) = layer.radar_location() else {
+                continue;
+            };
+            let image_rect = layer
+                .texture_key
+                .as_ref()
+                .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
+                .unwrap_or(rect);
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::from_white_alpha(layer.opacity),
+            );
+            self.draw_range_ring(
+                painter,
+                rect,
+                latitude_deg,
+                longitude_deg,
+                layer.radar_range_km,
+                egui::Stroke::new(
+                    1.2,
+                    egui::Color32::from_rgba_unmultiplied(88, 190, 245, layer.opacity),
+                ),
+            );
+        }
+    }
+
+    fn radar_texture_rect(
+        &self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        radar_lat: f32,
+        radar_lon: f32,
+        texture_key: &TextureKey,
+    ) -> egui::Rect {
+        let Some((current, _)) =
+            self.viewport_raster_options_for_location(ctx, rect, radar_lat, radar_lon)
+        else {
+            return rect;
+        };
+        anchored_radar_texture_rect(rect, ctx.pixels_per_point(), texture_key.viewport, current)
     }
 
     fn draw_hazard_overlays(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -3779,8 +4390,10 @@ impl ViewerApp {
         rect: egui::Rect,
         latitude_deg: f32,
         longitude_deg: f32,
+        range_km: f32,
+        stroke: egui::Stroke,
     ) {
-        let (lat_radius, lon_radius) = range_radius_deg(latitude_deg, self.radar_range_km);
+        let (lat_radius, lon_radius) = range_radius_deg(latitude_deg, range_km);
         let mut points = Vec::with_capacity(97);
         for index in 0..=96 {
             let angle = index as f32 / 96.0 * std::f32::consts::TAU;
@@ -3788,10 +4401,7 @@ impl ViewerApp {
             let longitude = longitude_deg + lon_radius * angle.cos();
             points.push(self.lon_lat_to_screen(rect, longitude, latitude));
         }
-        painter.add(egui::Shape::line(
-            points,
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(104, 128, 148)),
-        ));
+        painter.add(egui::Shape::line(points, stroke));
     }
 
     fn draw_site_markers(&self, painter: &egui::Painter, site_points: &[(usize, egui::Pos2)]) {
@@ -3848,6 +4458,38 @@ impl ViewerApp {
             egui::FontId::proportional(13.0),
             egui::Color32::from_rgb(244, 252, 255),
         );
+    }
+
+    fn draw_radar_layer_markers(&self, painter: &egui::Painter, rect: egui::Rect) {
+        for layer in &self.radar_layers {
+            if !layer.visible {
+                continue;
+            }
+            let Some((latitude_deg, longitude_deg)) = layer.radar_location() else {
+                continue;
+            };
+            let position = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
+            if !rect.expand(18.0).contains(position) {
+                continue;
+            }
+            let color = egui::Color32::from_rgba_unmultiplied(88, 190, 245, layer.opacity);
+            painter.circle_filled(position, 4.5, color);
+            painter.circle_stroke(
+                position,
+                8.5,
+                egui::Stroke::new(
+                    1.3,
+                    egui::Color32::from_rgba_unmultiplied(214, 242, 255, layer.opacity),
+                ),
+            );
+            painter.text(
+                position + egui::vec2(10.0, 10.0),
+                egui::Align2::LEFT_CENTER,
+                &layer.site.level2_id,
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgba_unmultiplied(214, 242, 255, layer.opacity),
+            );
+        }
     }
 
     fn nearest_site_to_position(&self, rect: egui::Rect, position: egui::Pos2) -> Option<usize> {
@@ -4077,6 +4719,41 @@ struct ViewportKey {
 impl ViewportKey {
     fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+}
+
+fn anchored_radar_texture_rect(
+    rect: egui::Rect,
+    pixels_per_point: f32,
+    rendered: ViewportKey,
+    current: ViewportRasterOptions,
+) -> egui::Rect {
+    let pixels_per_point = pixels_per_point.max(1.0);
+    let rendered_radar_x_px = rendered.radar_x_px as f32 / 8.0;
+    let rendered_radar_y_px = rendered.radar_y_px as f32 / 8.0;
+    let rendered_km_per_px_x = rendered.km_per_px_x as f32 / 1_000_000.0;
+    let rendered_km_per_px_y = rendered.km_per_px_y as f32 / 1_000_000.0;
+    let scale_x = positive_ratio(rendered_km_per_px_x, current.km_per_px_x);
+    let scale_y = positive_ratio(rendered_km_per_px_y, current.km_per_px_y);
+    let left_px = current.radar_x_px - rendered_radar_x_px * scale_x;
+    let top_px = current.radar_y_px - rendered_radar_y_px * scale_y;
+    egui::Rect::from_min_size(
+        egui::pos2(
+            rect.left() + left_px / pixels_per_point,
+            rect.top() + top_px / pixels_per_point,
+        ),
+        egui::vec2(
+            rendered.width as f32 * scale_x / pixels_per_point,
+            rendered.height as f32 * scale_y / pixels_per_point,
+        ),
+    )
+}
+
+fn positive_ratio(numerator: f32, denominator: f32) -> f32 {
+    if numerator.is_finite() && denominator.is_finite() && numerator > 0.0 && denominator > 0.0 {
+        numerator / denominator
+    } else {
+        1.0
     }
 }
 
@@ -6445,6 +7122,16 @@ fn is_unchanged_realtime_refresh(
     cache_hit && current_source_path.is_some_and(|current| current == downloaded_path)
 }
 
+fn selected_grid_range_km_for(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &DisplayProduct,
+) -> Option<f32> {
+    let cut = volume.cuts.get(cut_index)?;
+    let grid = cut.moments.get(&product.base_moment())?;
+    grid_range_km(grid)
+}
+
 fn best_cut_for_product(
     volume: &RadarVolume,
     current_cut: usize,
@@ -6740,6 +7427,30 @@ mod tests {
         let second_samples =
             RenderWorkerSampleCacheSignature::new(10, 1, MomentType::Reflectivity, viewport);
         assert_eq!(first_samples, second_samples);
+    }
+
+    #[test]
+    fn radar_overlay_layer_starts_visible_with_independent_workers() {
+        let site = RadarSite::new("KTLX");
+        let layer = RadarOverlayLayer::new(7, site);
+
+        assert_eq!(layer.id, 7);
+        assert_eq!(layer.site.level2_id, "KTLX");
+        assert!(layer.visible);
+        assert_eq!(layer.opacity, DEFAULT_RADAR_OVERLAY_ALPHA);
+        assert!(layer.volume.is_none());
+        assert!(layer.texture.is_none());
+        assert!(layer.load_receiver.is_none());
+        assert!(layer.pending_render_key.is_none());
+    }
+
+    #[test]
+    fn selected_grid_range_tracks_product_cut() {
+        let volume = test_aliased_velocity_volume();
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let range = selected_grid_range_km_for(&volume, 0, &product).expect("velocity range");
+
+        assert!(range > 0.0);
     }
 
     #[test]
@@ -7543,6 +8254,62 @@ mod tests {
     }
 
     #[test]
+    fn stale_radar_texture_rect_moves_with_map_pan() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let rendered = ViewportKey {
+            width: 100,
+            height: 100,
+            radar_x_px: 50 * 8,
+            radar_y_px: 50 * 8,
+            km_per_px_x: 1_000_000,
+            km_per_px_y: 1_000_000,
+        };
+        let current = ViewportRasterOptions {
+            width: 100,
+            height: 100,
+            radar_x_px: 60.0,
+            radar_y_px: 45.0,
+            km_per_px_x: 1.0,
+            km_per_px_y: 1.0,
+        };
+
+        let image_rect = anchored_radar_texture_rect(rect, 1.0, rendered, current);
+
+        assert!((image_rect.left() - 10.0).abs() < 0.01);
+        assert!((image_rect.top() + 5.0).abs() < 0.01);
+        assert!((image_rect.width() - 100.0).abs() < 0.01);
+        assert!((image_rect.height() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn stale_radar_texture_rect_scales_around_site_on_zoom() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let rendered = ViewportKey {
+            width: 100,
+            height: 100,
+            radar_x_px: 50 * 8,
+            radar_y_px: 50 * 8,
+            km_per_px_x: 1_000_000,
+            km_per_px_y: 1_000_000,
+        };
+        let current = ViewportRasterOptions {
+            width: 100,
+            height: 100,
+            radar_x_px: 50.0,
+            radar_y_px: 50.0,
+            km_per_px_x: 0.5,
+            km_per_px_y: 0.5,
+        };
+
+        let image_rect = anchored_radar_texture_rect(rect, 1.0, rendered, current);
+
+        assert!((image_rect.left() + 50.0).abs() < 0.01);
+        assert!((image_rect.top() + 50.0).abs() < 0.01);
+        assert!((image_rect.width() - 200.0).abs() < 0.01);
+        assert!((image_rect.height() - 200.0).abs() < 0.01);
+    }
+
+    #[test]
     fn hazard_refresh_selection_matches_event_id_in_new_overlay() {
         let records = vec![
             test_hazard_record(
@@ -7682,6 +8449,8 @@ mod tests {
             status: String::new(),
             sites: Vec::new(),
             selected_site_index: 0,
+            radar_layers: Vec::new(),
+            next_radar_layer_id: 1,
             site_catalog_receiver: None,
             load_receiver: None,
             hazard_receiver: None,
