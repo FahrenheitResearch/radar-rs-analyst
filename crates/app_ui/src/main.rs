@@ -310,6 +310,9 @@ struct ViewerApp {
     map_scale: f32,
     radar_range_km: f32,
     load_timing: Option<LoadTimings>,
+    active_load_started_at: Option<Instant>,
+    first_data_ms: Option<f32>,
+    first_texture_ms: Option<f32>,
     render_ms: Option<f32>,
     worker_ms: Option<f32>,
     texture_ms: Option<f32>,
@@ -540,6 +543,114 @@ fn spawn_latest_level2_load_worker(
             let mut selected_identity = None;
             let mut fallback_error = None;
 
+            if mode == LatestLoadMode::User
+                && let Ok(Some(cached_path)) =
+                    data_source::newest_cached_level2_path(&site_cache_dir)
+                && current_source_path.as_deref() != Some(cached_path.as_path())
+            {
+                let cached_result = decode_load_path_with_optional_preview(
+                    cached_path,
+                    &format!("cached L2 {site_id}"),
+                    total_start,
+                    LoadTimings {
+                        fetch_cache_hit: Some(true),
+                        ..LoadTimings::default()
+                    },
+                    &sender,
+                    false,
+                    FrameStatus::Complete,
+                    format!("cached L2 {site_id}"),
+                );
+                if let Ok(mut decoded) = cached_result
+                    && !global_displayable_products(&decoded.volume).is_empty()
+                {
+                    decoded.status = archive_frame_status(
+                        decoded.volume.volume_time.with_timezone(&Utc),
+                        Utc::now(),
+                    );
+                    selected_identity = Some(frame_identity_for_volume(&decoded.volume));
+                    let _ = sender.send(AsyncLoadResult {
+                        label: format!("L2 {site_id} cached"),
+                        update: AsyncLoadUpdate::History(
+                            DecodedLoadBatch {
+                                frames: vec![decoded.clone()],
+                                selected_index: 0,
+                            },
+                            true,
+                        ),
+                    });
+                    decoded_frames.push(decoded);
+                }
+            }
+
+            let archive_lookup_start = Instant::now();
+            let mut archive_lookup_ms = None;
+            let mut processed_archive_keys = BTreeSet::new();
+            let recent_archive_objects =
+                match data_source::recent_level2_objects(&site.level2_id, 7, history_limit) {
+                    Ok(objects) => {
+                        archive_lookup_ms =
+                            Some(archive_lookup_start.elapsed().as_secs_f32() * 1000.0);
+                        objects
+                    }
+                    Err(err) => {
+                        fallback_error.get_or_insert_with(|| err.to_string());
+                        Vec::new()
+                    }
+                };
+
+            if mode == LatestLoadMode::User
+                && let Some(object) = recent_archive_objects.first().cloned()
+            {
+                let object_key = object.key.clone();
+                let mut timings = LoadTimings::default();
+                timings.lookup_ms = archive_lookup_ms;
+                timings.lookup_cache_hit = Some(false);
+                let fetch_start = Instant::now();
+                let downloaded =
+                    data_source::download_object(LEVEL2_ARCHIVE_BUCKET, object, &site_cache_dir)
+                        .map_err(|err| err.to_string())?;
+                timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
+                timings.fetch_cache_hit = Some(downloaded.cache_hit);
+                if !(downloaded.cache_hit && known_frame_paths.contains(&downloaded.path)) {
+                    let mut decoded = decode_load_path_with_optional_preview(
+                        downloaded.path,
+                        &format!("latest archive L2 {site_id}"),
+                        total_start,
+                        timings,
+                        &sender,
+                        selected_identity.is_none() && should_preview_loads(),
+                        FrameStatus::Complete,
+                        format!("archive L2 {site_id}"),
+                    )?;
+                    decoded.status = archive_frame_status(
+                        decoded.volume.volume_time.with_timezone(&Utc),
+                        Utc::now(),
+                    );
+                    if !global_displayable_products(&decoded.volume).is_empty() {
+                        let decoded_identity = frame_identity_for_volume(&decoded.volume);
+                        let select_archive_frame = selected_identity
+                            .as_ref()
+                            .is_none_or(|selected| decoded_identity > *selected);
+                        let _ = sender.send(AsyncLoadResult {
+                            label: format!("L2 {site_id} latest archive"),
+                            update: AsyncLoadUpdate::History(
+                                DecodedLoadBatch {
+                                    frames: vec![decoded.clone()],
+                                    selected_index: 0,
+                                },
+                                select_archive_frame,
+                            ),
+                        });
+                        if select_archive_frame {
+                            selected_identity = Some(decoded_identity);
+                        }
+                        decoded_frames.push(decoded);
+                    }
+                }
+                processed_archive_keys.insert(object_key);
+            }
+
             let realtime_result = (|| -> Result<DecodedLoad, String> {
                 let mut realtime_timings = LoadTimings::default();
                 let lookup_start = Instant::now();
@@ -597,71 +708,66 @@ fn spawn_latest_level2_load_worker(
                 fallback_error = Some(err);
             }
 
-            let lookup_start = Instant::now();
-            match data_source::recent_level2_objects(&site.level2_id, 7, history_limit) {
-                Ok(objects) => {
-                    let lookup_ms = lookup_start.elapsed().as_secs_f32() * 1000.0;
-                    for (index, object) in objects.into_iter().enumerate() {
-                        if decoded_frames.len() >= history_limit {
-                            break;
-                        }
+            for (index, object) in recent_archive_objects.into_iter().enumerate() {
+                if decoded_frames.len() >= history_limit {
+                    break;
+                }
+                if processed_archive_keys.contains(&object.key) {
+                    continue;
+                }
 
-                        let mut timings = LoadTimings::default();
-                        if index == 0 {
-                            timings.lookup_ms = Some(lookup_ms);
-                            timings.lookup_cache_hit = Some(false);
-                        }
+                let mut timings = LoadTimings::default();
+                if index == 0 {
+                    timings.lookup_ms = archive_lookup_ms;
+                    timings.lookup_cache_hit = Some(false);
+                }
 
-                        let fetch_start = Instant::now();
-                        let downloaded = data_source::download_object(
-                            LEVEL2_ARCHIVE_BUCKET,
-                            object,
-                            &site_cache_dir,
-                        )
+                let fetch_start = Instant::now();
+                let downloaded =
+                    data_source::download_object(LEVEL2_ARCHIVE_BUCKET, object, &site_cache_dir)
                         .map_err(|err| err.to_string())?;
-                        timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
-                        timings.fetch_cache_hit = Some(downloaded.cache_hit);
+                timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
+                timings.fetch_cache_hit = Some(downloaded.cache_hit);
 
-                        if mode == LatestLoadMode::AutoRefresh
-                            && downloaded.cache_hit
-                            && known_frame_paths.contains(&downloaded.path)
-                        {
-                            continue;
-                        }
+                if mode == LatestLoadMode::AutoRefresh
+                    && downloaded.cache_hit
+                    && known_frame_paths.contains(&downloaded.path)
+                {
+                    continue;
+                }
 
-                        let mut decoded = decode_load_path_with_optional_preview(
-                            downloaded.path,
-                            &format!("L2 {site_id}"),
-                            total_start,
-                            timings,
-                            &sender,
-                            should_preview_loads(),
-                            FrameStatus::Complete,
-                            format!("archive L2 {site_id}"),
-                        )?;
-                        decoded.status = archive_frame_status(
-                            decoded.volume.volume_time.with_timezone(&Utc),
-                            Utc::now(),
-                        );
-                        if global_displayable_products(&decoded.volume).is_empty() {
-                            continue;
-                        }
-                        let _ = sender.send(AsyncLoadResult {
-                            label: format!("L2 {site_id} history"),
-                            update: AsyncLoadUpdate::History(
-                                DecodedLoadBatch {
-                                    frames: vec![decoded.clone()],
-                                    selected_index: 0,
-                                },
-                                false,
-                            ),
-                        });
-                        decoded_frames.push(decoded);
-                    }
+                let select_archive_frame = selected_identity.is_none();
+                let mut decoded = decode_load_path_with_optional_preview(
+                    downloaded.path,
+                    &format!("L2 {site_id}"),
+                    total_start,
+                    timings,
+                    &sender,
+                    select_archive_frame && should_preview_loads(),
+                    FrameStatus::Complete,
+                    format!("archive L2 {site_id}"),
+                )?;
+                decoded.status = archive_frame_status(
+                    decoded.volume.volume_time.with_timezone(&Utc),
+                    Utc::now(),
+                );
+                if global_displayable_products(&decoded.volume).is_empty() {
+                    continue;
                 }
-                Err(err) => {
-                    fallback_error.get_or_insert_with(|| err.to_string());
+                let _ = sender.send(AsyncLoadResult {
+                    label: format!("L2 {site_id} history"),
+                    update: AsyncLoadUpdate::History(
+                        DecodedLoadBatch {
+                            frames: vec![decoded.clone()],
+                            selected_index: 0,
+                        },
+                        select_archive_frame,
+                    ),
+                });
+                if select_archive_frame {
+                    selected_identity = Some(frame_identity_for_volume(&decoded.volume));
                 }
+                decoded_frames.push(decoded);
             }
 
             if decoded_frames.is_empty() {
@@ -1417,6 +1523,9 @@ impl ViewerApp {
             map_scale: DEFAULT_MAP_SCALE,
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
             load_timing: None,
+            active_load_started_at: None,
+            first_data_ms: None,
+            first_texture_ms: None,
             render_ms: None,
             worker_ms: None,
             texture_ms: None,
@@ -1729,6 +1838,7 @@ impl ViewerApp {
     fn install_preview_volume(&mut self, decoded: DecodedLoad, ctx: &egui::Context) {
         let source_path = decoded.path;
         self.source_path = Some(source_path.clone());
+        self.record_first_data_if_needed();
         self.install_volume_arc(
             Arc::new(decoded.volume),
             Some(decoded.timings),
@@ -1807,8 +1917,12 @@ impl ViewerApp {
             .iter_mut()
             .find(|candidate| candidate.identity == identity)
         {
-            if frame_status_priority(frame.status) >= frame_status_priority(existing.status)
-                || frame.path == existing.path
+            if frame.path == existing.path && frame.status == existing.status {
+                existing.timings = frame.timings;
+                existing.source_label = frame.source_label;
+            } else if frame_status_priority(frame.status) > frame_status_priority(existing.status)
+                || (frame_status_priority(frame.status) == frame_status_priority(existing.status)
+                    && frame.path != existing.path)
             {
                 *existing = frame;
             }
@@ -1836,6 +1950,7 @@ impl ViewerApp {
         let Some(frame) = self.frame_history.get(index).cloned() else {
             return;
         };
+        self.record_first_data_if_needed();
         self.selected_frame_index = index;
         self.history_playing &= self.frame_history.len() > 1;
         self.source_path = Some(frame.path.clone());
@@ -1947,6 +2062,20 @@ impl ViewerApp {
             self.selected_frame_index = self.frame_history.len().saturating_sub(1);
         }
         ctx.request_repaint();
+    }
+
+    fn begin_primary_load_telemetry(&mut self) {
+        self.active_load_started_at = Some(Instant::now());
+        self.first_data_ms = None;
+        self.first_texture_ms = None;
+    }
+
+    fn record_first_data_if_needed(&mut self) {
+        if self.first_data_ms.is_none()
+            && let Some(started_at) = self.active_load_started_at
+        {
+            self.first_data_ms = Some(started_at.elapsed().as_secs_f32() * 1000.0);
+        }
     }
 
     fn poll_async_hazards(&mut self, ctx: &egui::Context) {
@@ -3198,6 +3327,11 @@ impl ViewerApp {
         }
         let texture_ms = texture_start.elapsed().as_secs_f32() * 1000.0;
         self.texture_key = Some(key);
+        if self.first_texture_ms.is_none()
+            && let Some(started_at) = self.active_load_started_at
+        {
+            self.first_texture_ms = Some(started_at.elapsed().as_secs_f32() * 1000.0);
+        }
         self.perf.record_render(
             render_ms,
             used_sample_cache,
@@ -3347,6 +3481,7 @@ impl ViewerApp {
             .and_then(|name| name.to_str())
             .unwrap_or("local L2")
             .to_owned();
+        self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(label.clone());
@@ -3393,6 +3528,9 @@ impl ViewerApp {
         mode: LatestLoadMode,
     ) {
         let site_id = site.level2_id.clone();
+        if mode == LatestLoadMode::User || self.volume.is_none() {
+            self.begin_primary_load_telemetry();
+        }
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(site_id.clone());
@@ -4346,6 +4484,12 @@ impl ViewerApp {
             if let Some(preview_ms) = timing.preview_ms {
                 ui.label(format!("Preview {:.1} ms", preview_ms));
             }
+        }
+        if let Some(first_data_ms) = self.first_data_ms {
+            ui.label(format!("First data {:.1} ms", first_data_ms));
+        }
+        if let Some(first_texture_ms) = self.first_texture_ms {
+            ui.label(format!("First visible {:.1} ms", first_texture_ms));
         }
         if let Some(render_ms) = self.render_ms {
             ui.label(format!("Render {:.1} ms", render_ms));
@@ -9366,6 +9510,9 @@ mod tests {
             map_scale: 100.0,
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
             load_timing: None,
+            active_load_started_at: None,
+            first_data_ms: None,
+            first_texture_ms: None,
             render_ms: None,
             worker_ms: None,
             texture_ms: None,
