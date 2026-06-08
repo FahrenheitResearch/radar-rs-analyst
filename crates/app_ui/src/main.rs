@@ -63,6 +63,9 @@ const HOT_TEXT_PRODUCTS_RECENT_WINDOW_MINUTES: i64 = 60;
 const HOT_TEXT_DETAIL_CACHE_MAX: usize = 512;
 const HAZARD_CLICK_TOLERANCE_PX: f32 = 12.0;
 const HAZARD_LABEL_CLICK_RADIUS_PX: f32 = 18.0;
+const HAZARD_MAX_RENDER_LON_SPAN_DEG: f32 = 45.0;
+const HAZARD_MAX_RENDER_LAT_SPAN_DEG: f32 = 30.0;
+const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
 const DEFAULT_HAZARD_FILL_ALPHA: u8 = 24;
 const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
@@ -4348,7 +4351,7 @@ impl ViewerApp {
         let mut best_near = None::<(usize, f32, f32, u8)>;
         let mut best_label = None::<(usize, f32, f32, u8)>;
         for (index, record) in overlay.records.iter().enumerate() {
-            if !self.hazard_record_visible(record) {
+            if !self.hazard_record_visible(record) || !hazard_points_renderable(&record.points) {
                 continue;
             }
             let screen_area = self.hazard_screen_area(rect, &record.points);
@@ -4773,7 +4776,10 @@ impl ViewerApp {
         };
         let bounds = self.visible_geo_bounds(rect).expand(0.05);
         for (index, record) in overlay.records.iter().enumerate() {
-            if !self.hazard_record_visible(record) || !bounds.intersects_bbox(record.bbox) {
+            if !self.hazard_record_visible(record)
+                || !hazard_points_renderable(&record.points)
+                || !bounds.intersects_bbox(record.bbox)
+            {
                 continue;
             }
             let points = record
@@ -7735,6 +7741,50 @@ fn hazard_bbox(points: &[HazardPoint]) -> [f32; 4] {
     [west, south, east, north]
 }
 
+fn hazard_points_renderable(points: &[HazardPoint]) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    if points.iter().any(|point| {
+        !point.lon.is_finite()
+            || !point.lat.is_finite()
+            || point.lon < -180.0
+            || point.lon > 180.0
+            || point.lat < -90.0
+            || point.lat > 90.0
+    }) {
+        return false;
+    }
+
+    let bbox = hazard_bbox(points);
+    if bbox[2] - bbox[0] > HAZARD_MAX_RENDER_LON_SPAN_DEG
+        || bbox[3] - bbox[1] > HAZARD_MAX_RENDER_LAT_SPAN_DEG
+    {
+        return false;
+    }
+
+    let mut previous = points[points.len() - 1];
+    for current in points {
+        if hazard_point_distance_km(previous, *current) > HAZARD_MAX_RENDER_EDGE_KM {
+            return false;
+        }
+        previous = *current;
+    }
+    true
+}
+
+fn hazard_point_distance_km(a: HazardPoint, b: HazardPoint) -> f32 {
+    const EARTH_RADIUS_KM: f32 = 6_371.0;
+    let lat1 = a.lat.to_radians();
+    let lat2 = b.lat.to_radians();
+    let dlat = (b.lat - a.lat).to_radians();
+    let dlon = (b.lon - a.lon).to_radians();
+    let half_dlat = (dlat * 0.5).sin();
+    let half_dlon = (dlon * 0.5).sin();
+    let h = half_dlat * half_dlat + lat1.cos() * lat2.cos() * half_dlon * half_dlon;
+    2.0 * EARTH_RADIUS_KM * h.clamp(0.0, 1.0).sqrt().asin()
+}
+
 fn bbox_contains(bbox: [f32; 4], lon: f32, lat: f32) -> bool {
     lon >= bbox[0] && lon <= bbox[2] && lat >= bbox[1] && lat <= bbox[3]
 }
@@ -9153,6 +9203,34 @@ mod tests {
 
         assert_eq!(app.hazard_at_position(rect, near_edge), Some(0));
         assert_eq!(app.hazard_at_position(rect, far_edge), None);
+    }
+
+    #[test]
+    fn hazard_geometry_accepts_broad_regional_polygon() {
+        let points = square_hazard_points(-101.0, 34.0, -90.0, 41.0);
+
+        assert!(hazard_points_renderable(&points));
+    }
+
+    #[test]
+    fn hazard_geometry_rejects_cross_country_edge_artifact() {
+        let points = square_hazard_points(-74.0, 41.0, 10.0, 42.0);
+
+        assert!(!hazard_points_renderable(&points));
+    }
+
+    #[test]
+    fn hazard_click_ignores_rejected_artifact_geometry() {
+        let rect = test_map_rect();
+        let artifact = test_hazard_record(
+            "spc-md-artifact",
+            "MD BAD",
+            "mesoscale discussion",
+            square_hazard_points(-74.0, -0.1, 10.0, 0.1),
+        );
+        let app = test_viewer_app_with_hazards(vec![artifact]);
+
+        assert_eq!(app.hazard_at_position(rect, rect.center()), None);
     }
 
     #[test]
