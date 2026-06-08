@@ -6,7 +6,20 @@ This is early analyst software. The priority is a small, fast desktop app that p
 
 ## Download
 
-Windows users can download the latest `radar-rs-analyst-windows-x64.zip` from the GitHub Releases page, unzip it, and run `radar-rs-analyst.exe`.
+Download the newest build from the GitHub Releases page:
+
+- Windows x64: `radar-rs-analyst-windows-x64.zip`
+- Windows ARM64: `radar-rs-analyst-windows-arm64.zip`
+- macOS Apple Silicon: `radar-rs-analyst-macos-apple-silicon.zip`
+- macOS Intel: `radar-rs-analyst-macos-intel.zip`
+- Linux x64: `radar-rs-analyst-linux-x64.tar.gz`
+- Linux ARM64: `radar-rs-analyst-linux-arm64.tar.gz`
+
+Windows users can unzip the archive and run `radar-rs-analyst.exe`.
+
+macOS users can unzip the archive and open `Radar RS Analyst.app`. Current builds are unsigned, so macOS may require right-clicking the app and choosing Open the first time.
+
+Linux users can extract the archive and run `radar-rs-analyst/radar-rs-analyst`.
 
 ## Features
 

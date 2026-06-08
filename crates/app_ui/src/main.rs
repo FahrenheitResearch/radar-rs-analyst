@@ -41,9 +41,12 @@ const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 8;
 const LIVE_HAZARD_REFRESH_SECONDS: u64 = 10;
 const REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
-const MAX_RADAR_OVERLAY_LAYERS: usize = 8;
+const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
 const DEFAULT_RADAR_OVERLAY_ALPHA: u8 = 210;
 const MIN_RADAR_OVERLAY_ALPHA: u8 = 48;
+const FRESH_RING_GREEN_SECONDS: i64 = 6 * 60;
+const FRESH_RING_YELLOW_SECONDS: i64 = 10 * 60;
+const FRESH_RING_RED_SECONDS: i64 = 15 * 60;
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const LATEST_OBJECT_CACHE_TTL: Duration = Duration::from_secs(10);
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
@@ -63,8 +66,11 @@ const DEFAULT_HAZARD_FILL_ALPHA: u8 = 24;
 const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
 const HAZARD_DETAIL_SCROLL_HEIGHT: f32 = 150.0;
-const PERF_STATS_SCROLL_HEIGHT: f32 = 142.0;
 const TILT_LIST_SCROLL_HEIGHT: f32 = 168.0;
+const PANEL_BUTTON_HEIGHT: f32 = 24.0;
+const SIDEBAR_DEFAULT_WIDTH: f32 = 380.0;
+const SIDEBAR_MIN_WIDTH: f32 = 300.0;
+const SIDEBAR_MAX_WIDTH: f32 = 560.0;
 const DEFAULT_HIDDEN_HAZARD_FAMILIES: &[&str] = &[];
 const HAZARD_FILTER_FAMILIES: &[(&str, &str)] = &[
     ("tornado", "TOR"),
@@ -93,8 +99,8 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1320.0, 900.0])
-            .with_min_inner_size([960.0, 640.0]),
+            .with_inner_size([1500.0, 950.0])
+            .with_min_inner_size([1120.0, 700.0]),
         ..Default::default()
     };
 
@@ -286,6 +292,7 @@ struct ViewerApp {
     last_realtime_level2_refresh: Option<Instant>,
     live_hazard_auto_refresh: bool,
     show_performance_stats: bool,
+    sidebar_tab: SidebarTab,
     last_live_hazard_refresh: Option<Instant>,
     selected_hazard_index: Option<usize>,
     storm_motion_direction_deg: f32,
@@ -318,7 +325,7 @@ struct RadarOverlayLayer {
 
 impl RadarOverlayLayer {
     fn new(id: u64, site: RadarSite) -> Self {
-        let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
+        let (render_sender, render_receiver, render_recycle_sender) = spawn_overlay_render_worker();
         let site_id = site.level2_id.clone();
         Self {
             id,
@@ -342,16 +349,6 @@ impl RadarOverlayLayer {
             worker_ms: None,
             texture_ms: None,
         }
-    }
-
-    fn clear_texture(&mut self) {
-        self.texture = None;
-        self.texture_key = None;
-        self.pending_render_key = None;
-        self.radar_range_km = DEFAULT_RADAR_RANGE_KM;
-        self.render_ms = None;
-        self.worker_ms = None;
-        self.texture_ms = None;
     }
 
     fn radar_location(&self) -> Option<(f32, f32)> {
@@ -734,16 +731,27 @@ struct RenderWorkerSampleCache {
 #[derive(Clone, Copy, Debug)]
 struct RenderWorkerCachePolicy {
     threads: usize,
+    mode: RenderWorkerCacheMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderWorkerCacheMode {
+    Primary,
+    Overlay,
 }
 
 impl RenderWorkerCachePolicy {
-    fn detect() -> Self {
+    fn detect(mode: RenderWorkerCacheMode) -> Self {
         Self {
             threads: effective_worker_threads(),
+            mode,
         }
     }
 
     fn should_speculatively_warm_sample_cache(&self, rendered: &RenderedTexture) -> bool {
+        if self.mode == RenderWorkerCacheMode::Overlay {
+            return false;
+        }
         if rendered.used_sample_cache {
             return false;
         }
@@ -776,6 +784,9 @@ impl RenderWorkerCachePolicy {
     }
 
     fn should_prefetch_interaction_cache(&self, dimensions: (u32, u32)) -> bool {
+        if self.mode == RenderWorkerCacheMode::Overlay {
+            return false;
+        }
         let (width, height) = dimensions;
         let pixels = width as u64 * height as u64;
         self.threads >= 8
@@ -814,6 +825,9 @@ impl RenderWorkerCachePolicy {
     }
 
     fn sample_cache_capacity(&self) -> usize {
+        if self.mode == RenderWorkerCacheMode::Overlay {
+            return 1;
+        }
         match self.threads {
             0..=7 => 1,
             8..=15 => 3,
@@ -822,6 +836,9 @@ impl RenderWorkerCachePolicy {
     }
 
     fn sample_cache_bytes(&self) -> usize {
+        if self.mode == RenderWorkerCacheMode::Overlay {
+            return LOW_END_SAMPLE_CACHE_BYTES;
+        }
         match self.threads {
             0..=7 => LOW_END_SAMPLE_CACHE_BYTES,
             8..=15 => MID_RANGE_SAMPLE_CACHE_BYTES,
@@ -830,6 +847,9 @@ impl RenderWorkerCachePolicy {
     }
 
     fn sample_cache_build_bytes(&self) -> usize {
+        if self.mode == RenderWorkerCacheMode::Overlay {
+            return LOW_END_SAMPLE_CACHE_BYTES;
+        }
         match self.threads {
             0..=7 => LOW_END_SAMPLE_CACHE_BUILD_BYTES,
             _ => self.sample_cache_bytes(),
@@ -841,6 +861,9 @@ impl RenderWorkerCachePolicy {
     }
 
     fn moment_cache_capacity(&self) -> usize {
+        if self.mode == RenderWorkerCacheMode::Overlay {
+            return 1;
+        }
         self.sample_cache_capacity()
     }
 }
@@ -896,12 +919,30 @@ fn spawn_render_worker() -> (
     mpsc::Receiver<AsyncRenderResult>,
     mpsc::Sender<RenderRecycleBuffer>,
 ) {
+    spawn_render_worker_with_mode(RenderWorkerCacheMode::Primary)
+}
+
+fn spawn_overlay_render_worker() -> (
+    mpsc::Sender<RenderRequest>,
+    mpsc::Receiver<AsyncRenderResult>,
+    mpsc::Sender<RenderRecycleBuffer>,
+) {
+    spawn_render_worker_with_mode(RenderWorkerCacheMode::Overlay)
+}
+
+fn spawn_render_worker_with_mode(
+    mode: RenderWorkerCacheMode,
+) -> (
+    mpsc::Sender<RenderRequest>,
+    mpsc::Receiver<AsyncRenderResult>,
+    mpsc::Sender<RenderRecycleBuffer>,
+) {
     let (request_sender, request_receiver) = mpsc::channel::<RenderRequest>();
     let (result_sender, result_receiver) = mpsc::channel::<AsyncRenderResult>();
     let (recycle_sender, recycle_receiver) = mpsc::channel::<RenderRecycleBuffer>();
 
     thread::spawn(move || {
-        let cache_policy = RenderWorkerCachePolicy::detect();
+        let cache_policy = RenderWorkerCachePolicy::detect(mode);
         let mut reusable_pixels = Vec::new();
         let mut reusable_pixels_signature: Option<RenderWorkerViewportSignature> = None;
         let mut moment_caches: Vec<RenderWorkerMomentCache> = Vec::new();
@@ -1116,6 +1157,30 @@ struct VrotGate {
     azimuth_deg: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidebarTab {
+    Radar,
+    Hazards,
+    Colors,
+    Stats,
+}
+
+const SIDEBAR_TABS: &[(SidebarTab, &str)] = &[
+    (SidebarTab::Radar, "Radar"),
+    (SidebarTab::Hazards, "Hazards"),
+    (SidebarTab::Colors, "Colors"),
+    (SidebarTab::Stats, "Stats"),
+];
+
+fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
+    match tab {
+        SidebarTab::Radar => "Radar site, overlays, product, and tilt controls",
+        SidebarTab::Hazards => "Warnings, watches, mesoscale discussions, and alert filters",
+        SidebarTab::Colors => "Built-in and custom radar color tables",
+        SidebarTab::Stats => "Performance timings and render/load diagnostics",
+    }
+}
+
 impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, source_path: PathBuf) -> Self {
         configure_style(&cc.egui_ctx);
@@ -1179,6 +1244,7 @@ impl ViewerApp {
             last_realtime_level2_refresh: None,
             live_hazard_auto_refresh: true,
             show_performance_stats: false,
+            sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
             selected_hazard_index: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
@@ -1414,7 +1480,10 @@ impl ViewerApp {
         layer.source_path = Some(decoded.path);
         layer.load_timing = Some(decoded.timings);
         layer.volume = Some(Arc::new(decoded.volume));
-        layer.clear_texture();
+        layer.pending_render_key = None;
+        layer.render_ms = None;
+        layer.worker_ms = None;
+        layer.texture_ms = None;
     }
 
     fn clear_texture(&mut self) {
@@ -1459,13 +1528,25 @@ impl ViewerApp {
         if record_final_decode && let Some(load_timing) = load_timing {
             self.perf.record_decode(load_timing.decode_ms);
         }
+        let preserve_texture = self
+            .volume
+            .as_ref()
+            .is_some_and(|current| current.site.id == volume.site.id);
         self.load_timing = load_timing;
         self.volume = Some(Arc::new(volume));
         self.dealiased_readout_cache = None;
         self.selected_cut = selected_cut;
         self.selected_product = selected_product;
         self.sanitize_selection();
-        self.clear_texture();
+        if preserve_texture {
+            self.pending_render_key = None;
+            self.render_ms = None;
+            self.worker_ms = None;
+            self.texture_ms = None;
+            self.sample_cache_build_ms = None;
+        } else {
+            self.clear_texture();
+        }
         ctx.request_repaint();
     }
 
@@ -2009,6 +2090,7 @@ impl ViewerApp {
             .color_tables
             .signature_for_family(self.selected_product.color_family());
         let key = TextureKey {
+            volume_ptr: Arc::as_ptr(&volume) as usize,
             cut: self.selected_cut,
             product: self.selected_product.clone(),
             color_table_signature,
@@ -2066,6 +2148,7 @@ impl ViewerApp {
                 .color_tables
                 .signature_for_family(product.color_family());
             let key = TextureKey {
+                volume_ptr: Arc::as_ptr(&volume) as usize,
                 cut,
                 product: product.clone(),
                 color_table_signature,
@@ -2948,8 +3031,9 @@ impl eframe::App for ViewerApp {
             .show_inside(ui, |ui| self.top_bar(ui));
 
         egui::Panel::right("product_tilt_panel")
-            .resizable(false)
-            .exact_size(260.0)
+            .resizable(true)
+            .default_size(SIDEBAR_DEFAULT_WIDTH)
+            .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
             .show_inside(ui, |ui| self.side_panel(ui, &ctx));
 
         egui::Panel::bottom("status_bar")
@@ -2965,19 +3049,80 @@ impl ViewerApp {
         ui.horizontal_centered(|ui| {
             ui.heading("Radar RS Analyst");
             ui.separator();
-            if ui.button("Reset View").clicked() {
+            if fixed_action_button(ui, "Reset View", 90.0).clicked() {
                 self.reset_view();
             }
-            if ui.button("Reload").clicked() {
+            if fixed_action_button(ui, "Reload", 62.0).clicked() {
                 self.load_volume(ui.ctx());
             }
         });
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Radar");
-        ui.add_space(8.0);
+        ui.heading("Controls");
+        ui.add_space(6.0);
+        self.sidebar_tab_bar(ui);
+        ui.separator();
 
+        match self.sidebar_tab {
+            SidebarTab::Radar => {
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_radar_tab")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.radar_controls_panel(ui, ctx);
+                    });
+            }
+            SidebarTab::Hazards => {
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_hazards_tab")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.hazard_panel(ui);
+                    });
+            }
+            SidebarTab::Colors => {
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_colors_tab")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.color_table_panel(ui, ctx);
+                    });
+            }
+            SidebarTab::Stats => {
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_stats_tab")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.stats_panel(ui);
+                    });
+            }
+        }
+    }
+
+    fn sidebar_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for (tab, label) in SIDEBAR_TABS {
+                let selected = self.sidebar_tab == *tab;
+                let response = ui
+                    .add_sized(
+                        egui::vec2(67.0, PANEL_BUTTON_HEIGHT),
+                        egui::Button::selectable(selected, *label),
+                    )
+                    .on_hover_text(sidebar_tab_tooltip(*tab));
+                if response.clicked() {
+                    self.sidebar_tab = *tab;
+                }
+            }
+        });
+    }
+
+    fn radar_controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("Level 2");
         ui.add_space(8.0);
         ui.label("Site");
@@ -2999,16 +3144,12 @@ impl ViewerApp {
         }
 
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.load_receiver.is_none(),
-                    egui::Button::new("Load Selected"),
-                )
-                .clicked()
+            if fixed_action_button(ui, "Load Selected", 100.0).clicked()
+                && self.load_receiver.is_none()
             {
                 self.load_latest_level2_for_selected_site(ui.ctx());
             }
-            if ui.button("Center").clicked() {
+            if fixed_action_button(ui, "Center", 58.0).clicked() {
                 self.center_selected_site();
             }
             ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live");
@@ -3125,42 +3266,20 @@ impl ViewerApp {
                         "#{:02}  {:>4.2} deg  {:>4} radials",
                         index, elevation_deg, radial_count
                     );
-                    let response = ui.add_enabled(
-                        *has_selected_product,
-                        egui::Button::selectable(*is_selected, label),
-                    );
+                    let response = ui
+                        .add_enabled_ui(*has_selected_product, |ui| {
+                            ui.add_sized(
+                                egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
+                                egui::Button::selectable(*is_selected, label),
+                            )
+                        })
+                        .inner;
                     if response.clicked() {
                         self.selected_cut = *index;
                         self.sanitize_selection();
                         self.clear_texture();
                         ctx.request_repaint();
                     }
-                }
-            });
-
-        ui.add_space(12.0);
-        egui::ScrollArea::vertical()
-            .id_salt("side_panel_tools")
-            .auto_shrink([false, false])
-            .max_height(ui.available_height())
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                self.hazard_panel(ui);
-
-                ui.add_space(12.0);
-                self.color_table_panel(ui, ctx);
-
-                ui.add_space(12.0);
-                ui.checkbox(&mut self.show_performance_stats, "Stats");
-                if self.show_performance_stats {
-                    fixed_height_scroll(
-                        ui,
-                        "performance_stats_text",
-                        PERF_STATS_SCROLL_HEIGHT,
-                        |ui| {
-                            self.timing_readout(ui);
-                        },
-                    );
                 }
             });
     }
@@ -3196,7 +3315,10 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             ui.label(format!("Overlays {}", self.radar_layers.len()));
             if ui
-                .add_enabled(!self.radar_layers.is_empty(), egui::Button::new("Clear"))
+                .add_enabled_ui(!self.radar_layers.is_empty(), |ui| {
+                    fixed_action_button(ui, "Clear", 52.0)
+                })
+                .inner
                 .clicked()
             {
                 self.radar_layers.clear();
@@ -3215,54 +3337,69 @@ impl ViewerApp {
         let mut refresh_index = None;
         let mut promote_site = None;
         for (index, layer) in self.radar_layers.iter_mut().enumerate() {
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.checkbox(&mut layer.visible, "").changed() {
-                    ctx.request_repaint();
-                }
-                ui.label(&layer.site.level2_id);
-                if layer.load_receiver.is_some() {
-                    ui.label("loading");
-                } else if layer.volume.is_some() {
-                    ui.label("live");
-                } else {
-                    ui.label("queued");
-                }
-                if ui.button("Center").clicked() {
-                    center_site = Some(layer.site.clone());
-                }
-                if ui
-                    .add_enabled(layer.load_receiver.is_none(), egui::Button::new("Refresh"))
-                    .clicked()
-                {
-                    refresh_index = Some(index);
-                }
-                if ui.button("Primary").clicked() {
-                    promote_site = Some(layer.site.clone());
-                }
-                if ui.button("X").clicked() {
-                    remove_index = Some(index);
-                }
-            });
-            if ui
-                .add(
-                    egui::Slider::new(&mut layer.opacity, MIN_RADAR_OVERLAY_ALPHA..=u8::MAX)
-                        .text("Opacity"),
-                )
-                .changed()
-            {
-                ctx.request_repaint();
-            }
-            ui.label(&layer.status);
+            let state = if layer.volume.is_some() {
+                "live"
+            } else if layer.load_receiver.is_some() {
+                "loading"
+            } else {
+                "queued"
+            };
+            let mut details = vec![layer.status.clone()];
             if let Some(path) = &layer.source_path {
-                ui.small(path.display().to_string());
+                details.push(path.display().to_string());
             }
             if let Some(render_ms) = layer.render_ms {
                 let texture_ms = layer.texture_ms.unwrap_or(0.0);
-                ui.small(format!(
+                details.push(format!(
                     "render {render_ms:.1} ms texture {texture_ms:.1} ms"
                 ));
             }
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                if ui.checkbox(&mut layer.visible, "").changed() {
+                    ctx.request_repaint();
+                }
+                fixed_status_label(ui, &layer.site.level2_id, 42.0)
+                    .on_hover_text(details.join("\n"));
+                fixed_state_dot(ui, layer_state_color(state), state);
+                if ui
+                    .add_sized(
+                        egui::vec2(48.0, PANEL_BUTTON_HEIGHT),
+                        egui::Slider::new(&mut layer.opacity, MIN_RADAR_OVERLAY_ALPHA..=u8::MAX)
+                            .show_value(false),
+                    )
+                    .on_hover_text(format!("Opacity {}", layer.opacity))
+                    .changed()
+                {
+                    ctx.request_repaint();
+                }
+                if fixed_action_button(ui, "Go", 28.0)
+                    .on_hover_text("Center map on this overlay radar")
+                    .clicked()
+                {
+                    center_site = Some(layer.site.clone());
+                }
+                if fixed_action_button(ui, "Ref", 32.0)
+                    .on_hover_text("Refresh this overlay radar")
+                    .clicked()
+                    && layer.load_receiver.is_none()
+                {
+                    refresh_index = Some(index);
+                }
+                if fixed_action_button(ui, "Pri", 30.0)
+                    .on_hover_text("Make this radar the primary radar")
+                    .clicked()
+                {
+                    promote_site = Some(layer.site.clone());
+                }
+                if fixed_action_button(ui, "x", 20.0)
+                    .on_hover_text(details.join("\n"))
+                    .clicked()
+                {
+                    remove_index = Some(index);
+                }
+            });
         }
 
         if let Some(index) = refresh_index
@@ -3307,7 +3444,7 @@ impl ViewerApp {
                         ui.selectable_value(&mut self.color_table_target, family, family.label());
                     }
                 });
-            if ui.button("Current").clicked() {
+            if fixed_action_button(ui, "Current", 64.0).clicked() {
                 self.color_table_target = self.selected_product.color_family();
             }
         });
@@ -3338,13 +3475,10 @@ impl ViewerApp {
         );
         ui.horizontal(|ui| {
             let has_path = !self.color_table_path_text.trim().is_empty();
-            if ui
-                .add_enabled(has_path, egui::Button::new("Load Table"))
-                .clicked()
-            {
+            if fixed_disabled_action_button(ui, has_path, "Load Table", 84.0).clicked() {
                 self.load_color_table_path(ctx);
             }
-            if ui.button("Reset Slot").clicked() {
+            if fixed_action_button(ui, "Reset Slot", 84.0).clicked() {
                 self.reset_color_table_slot(ctx);
             }
         });
@@ -3437,13 +3571,10 @@ impl ViewerApp {
         }
         ui.horizontal(|ui| {
             let loading = self.hazard_receiver.is_some();
-            if ui
-                .add_enabled(!loading, egui::Button::new("Refresh Live"))
-                .clicked()
-            {
+            if fixed_action_button(ui, "Refresh Live", 96.0).clicked() && !loading {
                 self.load_live_hazards(ui.ctx());
             }
-            if ui.button("Clear").clicked() {
+            if fixed_action_button(ui, "Clear", 52.0).clicked() {
                 self.hazard_overlay = None;
                 self.selected_hazard_index = None;
                 self.hazard_status = "No hazard polygons loaded".to_owned();
@@ -3487,13 +3618,34 @@ impl ViewerApp {
                         .hint_text("Path"),
                 );
                 let loading = self.hazard_receiver.is_some();
-                if ui
-                    .add_enabled(!loading, egui::Button::new("Load Path"))
-                    .clicked()
-                {
+                if fixed_action_button(ui, "Load Path", 82.0).clicked() && !loading {
                     self.load_local_hazards(ui.ctx());
                 }
             });
+    }
+
+    fn stats_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label("Performance");
+        ui.checkbox(&mut self.show_performance_stats, "Details");
+        if let Some(render_ms) = self.render_ms {
+            ui.label(format!("Render {render_ms:.1} ms"));
+        }
+        if let Some(worker_ms) = self.worker_ms {
+            ui.label(format!("Worker {worker_ms:.1} ms"));
+        }
+        if let Some(texture_ms) = self.texture_ms {
+            ui.label(format!("Texture {texture_ms:.1} ms"));
+        }
+        if let Some(load_timing) = &self.load_timing {
+            ui.label(format!("Decode {:.1} ms", load_timing.decode_ms));
+            ui.label(format!("Load {:.1} ms", load_timing.total_ms));
+        }
+        ui.label(format!("{} overlays", self.radar_layers.len()));
+        ui.label(format!("{:.0} km range", self.radar_range_km));
+        if self.show_performance_stats {
+            ui.separator();
+            self.timing_readout(ui);
+        }
     }
 
     fn hazard_summary_lines(&self) -> Vec<String> {
@@ -3855,31 +4007,36 @@ impl ViewerApp {
     }
 
     fn draw_radar_layer(&self, ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect) {
-        let Some(texture) = &self.texture else {
+        let Some(volume) = self.volume.as_ref() else {
             return;
         };
         let Some((latitude_deg, longitude_deg)) = self.radar_location() else {
             return;
         };
-        let image_rect = self
-            .texture_key
-            .as_ref()
-            .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
-            .unwrap_or(rect);
+        if let Some(texture) = &self.texture {
+            let image_rect = self
+                .texture_key
+                .as_ref()
+                .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
+                .unwrap_or(rect);
 
-        painter.image(
-            texture.id(),
-            image_rect,
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
         self.draw_range_ring(
             painter,
             rect,
             latitude_deg,
             longitude_deg,
             self.radar_range_km,
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(104, 128, 148)),
+            egui::Stroke::new(
+                1.8,
+                freshness_ring_color(volume.volume_time.with_timezone(&Utc), Utc::now(), 230),
+            ),
         );
     }
 
@@ -3893,23 +4050,25 @@ impl ViewerApp {
             if !layer.visible {
                 continue;
             }
-            let Some(texture) = &layer.texture else {
+            let Some(volume) = layer.volume.as_ref() else {
                 continue;
             };
             let Some((latitude_deg, longitude_deg)) = layer.radar_location() else {
                 continue;
             };
-            let image_rect = layer
-                .texture_key
-                .as_ref()
-                .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
-                .unwrap_or(rect);
-            painter.image(
-                texture.id(),
-                image_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::from_white_alpha(layer.opacity),
-            );
+            if let Some(texture) = &layer.texture {
+                let image_rect = layer
+                    .texture_key
+                    .as_ref()
+                    .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
+                    .unwrap_or(rect);
+                painter.image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::from_white_alpha(layer.opacity),
+                );
+            }
             self.draw_range_ring(
                 painter,
                 rect,
@@ -3917,8 +4076,12 @@ impl ViewerApp {
                 longitude_deg,
                 layer.radar_range_km,
                 egui::Stroke::new(
-                    1.2,
-                    egui::Color32::from_rgba_unmultiplied(88, 190, 245, layer.opacity),
+                    1.5,
+                    freshness_ring_color(
+                        volume.volume_time.with_timezone(&Utc),
+                        Utc::now(),
+                        layer.opacity,
+                    ),
                 ),
             );
         }
@@ -4699,6 +4862,7 @@ impl GeoBounds {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TextureKey {
+    volume_ptr: usize,
     cut: usize,
     product: DisplayProduct,
     color_table_signature: u64,
@@ -4755,6 +4919,63 @@ fn positive_ratio(numerator: f32, denominator: f32) -> f32 {
     } else {
         1.0
     }
+}
+
+fn freshness_ring_color(
+    volume_time_utc: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+    alpha: u8,
+) -> egui::Color32 {
+    let age_seconds = now_utc
+        .signed_duration_since(volume_time_utc)
+        .num_seconds()
+        .max(0);
+    let (start, end, t) = if age_seconds <= FRESH_RING_GREEN_SECONDS {
+        ((65, 238, 104), (65, 238, 104), 0.0)
+    } else if age_seconds <= FRESH_RING_YELLOW_SECONDS {
+        (
+            (65, 238, 104),
+            (238, 218, 62),
+            ratio_between(
+                age_seconds,
+                FRESH_RING_GREEN_SECONDS,
+                FRESH_RING_YELLOW_SECONDS,
+            ),
+        )
+    } else if age_seconds <= FRESH_RING_RED_SECONDS {
+        (
+            (238, 218, 62),
+            (246, 76, 48),
+            ratio_between(
+                age_seconds,
+                FRESH_RING_YELLOW_SECONDS,
+                FRESH_RING_RED_SECONDS,
+            ),
+        )
+    } else {
+        ((246, 76, 48), (205, 34, 48), 1.0)
+    };
+    let (r, g, b) = lerp_rgb(start, end, t);
+    egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
+fn ratio_between(value: i64, start: i64, end: i64) -> f32 {
+    if end <= start {
+        return 1.0;
+    }
+    ((value - start) as f32 / (end - start) as f32).clamp(0.0, 1.0)
+}
+
+fn lerp_rgb(start: (u8, u8, u8), end: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    (
+        lerp_u8(start.0, end.0, t),
+        lerp_u8(start.1, end.1, t),
+        lerp_u8(start.2, end.2, t),
+    )
+}
+
+fn lerp_u8(start: u8, end: u8, t: f32) -> u8 {
+    (start as f32 + (end as f32 - start as f32) * t.clamp(0.0, 1.0)).round() as u8
 }
 
 fn site_location(site: &RadarSite) -> Option<(f32, f32)> {
@@ -4976,6 +5197,44 @@ fn fixed_height_scroll(
 
 fn wrapped_label(ui: &mut egui::Ui, text: &str) {
     ui.add(egui::Label::new(text).wrap());
+}
+
+fn fixed_action_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+    ui.add_sized(
+        egui::vec2(width, PANEL_BUTTON_HEIGHT),
+        egui::Button::new(label),
+    )
+}
+
+fn fixed_disabled_action_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    width: f32,
+) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| fixed_action_button(ui, label, width))
+        .inner
+}
+
+fn fixed_status_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width, PANEL_BUTTON_HEIGHT), egui::Sense::hover());
+    ui.put(rect, egui::Label::new(text).truncate())
+}
+
+fn fixed_state_dot(ui: &mut egui::Ui, color: egui::Color32, hover_text: &str) {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(14.0, PANEL_BUTTON_HEIGHT), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+    response.on_hover_text(hover_text);
+}
+
+fn layer_state_color(state: &str) -> egui::Color32 {
+    match state {
+        "loading" => egui::Color32::from_rgb(238, 218, 62),
+        "live" => egui::Color32::from_rgb(65, 238, 104),
+        _ => egui::Color32::from_rgb(106, 132, 154),
+    }
 }
 
 fn hazard_record_detail_lines(record: &HazardRecord) -> Vec<String> {
@@ -7157,12 +7416,14 @@ fn best_cut_for_product(
 
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.global_style()).clone();
+    style.animation_time = 0.0;
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = egui::Color32::from_rgb(18, 22, 28);
     style.visuals.window_fill = egui::Color32::from_rgb(18, 22, 28);
     style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(50, 96, 138);
     style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(46, 58, 72);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.button_padding = egui::vec2(6.0, 4.0);
+    style.spacing.item_spacing = egui::vec2(4.0, 4.0);
     ctx.set_global_style(style);
 }
 
@@ -7390,9 +7651,9 @@ mod tests {
 
     #[test]
     fn cache_policy_scales_with_cpu_budget() {
-        let low = RenderWorkerCachePolicy { threads: 4 };
-        let mid = RenderWorkerCachePolicy { threads: 8 };
-        let high = RenderWorkerCachePolicy { threads: 16 };
+        let low = test_cache_policy(4);
+        let mid = test_cache_policy(8);
+        let high = test_cache_policy(16);
 
         assert_eq!(low.sample_cache_capacity(), 1);
         assert_eq!(low.moment_cache_capacity(), 1);
@@ -7498,8 +7759,8 @@ mod tests {
 
     #[test]
     fn cache_policy_warms_slow_low_end_direct_renders() {
-        let low = RenderWorkerCachePolicy { threads: 2 };
-        let mid = RenderWorkerCachePolicy { threads: 8 };
+        let low = test_cache_policy(2);
+        let mid = test_cache_policy(8);
 
         assert!(!low.should_speculatively_warm_sample_cache(&test_rendered_texture(3.5, false)));
         assert!(low.should_speculatively_warm_sample_cache(&test_rendered_texture(4.0, false)));
@@ -7509,8 +7770,8 @@ mod tests {
 
     #[test]
     fn cache_policy_skips_sample_caches_that_cannot_fit_budget() {
-        let low = RenderWorkerCachePolicy { threads: 2 };
-        let high = RenderWorkerCachePolicy { threads: 16 };
+        let low = test_cache_policy(2);
+        let high = test_cache_policy(16);
 
         assert!(!low.should_build_sample_cache_for_viewport(test_viewport_key(1920, 1080)));
         assert!(
@@ -7523,7 +7784,7 @@ mod tests {
 
     #[test]
     fn cache_policy_uses_exact_radar_footprint_for_active_cache_builds() {
-        let low = RenderWorkerCachePolicy { threads: 2 };
+        let low = test_cache_policy(2);
         let volume = test_ref_then_velocity_volume();
         let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("reflectivity cache");
@@ -7545,14 +7806,29 @@ mod tests {
 
     #[test]
     fn cache_policy_prefetches_interaction_cache_only_with_cpu_budget() {
-        let low = RenderWorkerCachePolicy { threads: 4 };
-        let mid = RenderWorkerCachePolicy { threads: 8 };
-        let high = RenderWorkerCachePolicy { threads: 16 };
+        let low = test_cache_policy(4);
+        let mid = test_cache_policy(8);
+        let high = test_cache_policy(16);
 
         assert!(!low.should_prefetch_interaction_cache((1320, 820)));
         assert!(mid.should_prefetch_interaction_cache((1320, 820)));
         assert!(!mid.should_prefetch_interaction_cache((320, 240)));
         assert!(high.should_prefetch_interaction_cache((3840, 2160)));
+    }
+
+    #[test]
+    fn overlay_cache_policy_keeps_background_radars_lightweight() {
+        let overlay = test_overlay_cache_policy(16);
+
+        assert_eq!(overlay.sample_cache_capacity(), 1);
+        assert_eq!(overlay.moment_cache_capacity(), 1);
+        assert_eq!(overlay.sample_cache_bytes(), LOW_END_SAMPLE_CACHE_BYTES);
+        assert!(!overlay.should_prefetch_interaction_cache((3840, 2160)));
+        assert!(
+            !overlay.should_speculatively_warm_sample_cache(&test_rendered_texture_with_size(
+                20.0, false, 1920, 1080
+            ))
+        );
     }
 
     #[test]
@@ -7563,6 +7839,7 @@ mod tests {
             color_tables.signature_for_family(ColorTableFamily::Reflectivity);
         let request = RenderRequest {
             key: TextureKey {
+                volume_ptr: Arc::as_ptr(&volume) as usize,
                 cut: 0,
                 product: DisplayProduct::Moment(MomentType::Reflectivity),
                 color_table_signature,
@@ -7592,7 +7869,7 @@ mod tests {
         assert!(ViewerApp::should_prefetch_velocity_interaction_cache(
             &request,
             &test_rendered_texture_with_size(1.0, false, 1320, 820),
-            RenderWorkerCachePolicy { threads: 8 },
+            test_cache_policy(8),
         ));
     }
 
@@ -7737,6 +8014,34 @@ mod tests {
     }
 
     #[test]
+    fn freshness_ring_color_tracks_scan_age() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
+
+        let fresh = freshness_ring_color(now - chrono::Duration::minutes(2), now, 210);
+        let yellow = freshness_ring_color(now - chrono::Duration::minutes(10), now, 210);
+        let red = freshness_ring_color(now - chrono::Duration::minutes(15), now, 210);
+
+        assert_eq!(
+            fresh,
+            egui::Color32::from_rgba_unmultiplied(65, 238, 104, 210)
+        );
+        assert_eq!(
+            yellow,
+            egui::Color32::from_rgba_unmultiplied(238, 218, 62, 210)
+        );
+        assert_eq!(red, egui::Color32::from_rgba_unmultiplied(246, 76, 48, 210));
+    }
+
+    #[test]
+    fn freshness_ring_color_preserves_overlay_alpha() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
+        let color = freshness_ring_color(now - chrono::Duration::minutes(20), now, 123);
+
+        assert_eq!(color.a(), 123);
+        assert!(color.r() > color.g());
+    }
+
+    #[test]
     fn unchanged_realtime_refresh_requires_cache_hit_and_same_path() {
         let current = Path::new("KTLX20260608_003703_RT081_V06");
         let other = Path::new("KTLX20260608_003718_RT081_V06");
@@ -7753,7 +8058,7 @@ mod tests {
 
     #[test]
     fn direct_viewport_lru_keeps_newest_signatures() {
-        let policy = RenderWorkerCachePolicy { threads: 4 };
+        let policy = test_cache_policy(4);
         let mut signatures = Vec::new();
         let first = test_viewport_signature(1);
         let second = test_viewport_signature(2);
@@ -8467,6 +8772,7 @@ mod tests {
             last_realtime_level2_refresh: None,
             live_hazard_auto_refresh: false,
             show_performance_stats: false,
+            sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
             selected_hazard_index: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
@@ -8671,6 +8977,20 @@ mod tests {
 
     fn test_rendered_texture(render_ms: f32, used_sample_cache: bool) -> RenderedTexture {
         test_rendered_texture_with_size(render_ms, used_sample_cache, 720, 480)
+    }
+
+    fn test_cache_policy(threads: usize) -> RenderWorkerCachePolicy {
+        RenderWorkerCachePolicy {
+            threads,
+            mode: RenderWorkerCacheMode::Primary,
+        }
+    }
+
+    fn test_overlay_cache_policy(threads: usize) -> RenderWorkerCachePolicy {
+        RenderWorkerCachePolicy {
+            threads,
+            mode: RenderWorkerCacheMode::Overlay,
+        }
     }
 
     fn test_rendered_texture_with_size(
