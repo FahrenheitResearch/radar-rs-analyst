@@ -5042,7 +5042,7 @@ fn select_hot_text_summaries(
     mut products: Vec<NwsProductSummary>,
     query_time_utc: DateTime<Utc>,
 ) -> Vec<NwsProductSummary> {
-    products.sort_by(|left, right| right.issuance_time.cmp(&left.issuance_time));
+    products.sort_by_key(|product| std::cmp::Reverse(product.issuance_time));
     let recent_start =
         query_time_utc - chrono::Duration::minutes(HOT_TEXT_PRODUCTS_RECENT_WINDOW_MINUTES);
     let near_future = query_time_utc + chrono::Duration::minutes(5);
