@@ -2,11 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -16,6 +18,9 @@ const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(4);
 const HTTP_METADATA_TIMEOUT: StdDuration = StdDuration::from_secs(8);
 const HTTP_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(45);
 const HTTP_USER_AGENT: &str = "radar-rs-analyst/0.1 local-desktop";
+const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
+const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
+const REALTIME_CHUNK_DOWNLOAD_BATCH: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RadarDataLevel {
@@ -65,6 +70,48 @@ pub struct LatestObject {
     pub cache_hit: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealtimeChunkType {
+    Start,
+    Intermediate,
+    End,
+}
+
+impl RealtimeChunkType {
+    fn from_code(value: &str) -> Option<Self> {
+        match value {
+            "S" => Some(Self::Start),
+            "I" => Some(Self::Intermediate),
+            "E" => Some(Self::End),
+            _ => None,
+        }
+    }
+
+    fn is_end(self) -> bool {
+        matches!(self, Self::End)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeChunkObject {
+    pub object: S3Object,
+    pub site: String,
+    pub volume_id: u16,
+    pub volume_time: DateTime<Utc>,
+    pub chunk_id: u16,
+    pub chunk_type: RealtimeChunkType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeLevel2Volume {
+    pub site: String,
+    pub volume_id: u16,
+    pub volume_time: DateTime<Utc>,
+    pub chunks: Vec<RealtimeChunkObject>,
+    pub complete: bool,
+    pub total_size: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum DataSourceError {
     #[error("HTTP request failed: {0}")]
@@ -77,6 +124,14 @@ pub enum DataSourceError {
     Io(#[from] std::io::Error),
     #[error("no objects found for {bucket}/{prefix}")]
     NoObjects { bucket: String, prefix: String },
+    #[error("downloaded {url} size mismatch: expected {expected} bytes, got {actual}")]
+    DownloadSizeMismatch {
+        url: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("realtime chunk download worker panicked")]
+    DownloadWorkerPanic,
 }
 
 pub type Result<T> = std::result::Result<T, DataSourceError>;
@@ -186,6 +241,14 @@ pub fn fetch_weather_gov_radar_sites() -> Result<Vec<RadarSite>> {
     Ok(sites)
 }
 
+pub fn fetch_text(url: &str) -> Result<String> {
+    Ok(metadata_http_client()
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .text()?)
+}
+
 pub fn fetch_level2_radar_sites(days_back: i64) -> Result<Vec<RadarSite>> {
     let weather_sites = fetch_weather_gov_radar_sites().unwrap_or_default();
     let weather_by_id = weather_sites
@@ -270,6 +333,191 @@ pub fn latest_level2_object_cached(
     })
 }
 
+pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume> {
+    let site = site.to_ascii_uppercase();
+    let site_prefix = format!("{site}/");
+    let mut active_ids = list_s3(LEVEL2_CHUNKS_BUCKET, &site_prefix, Some("/"), None)?
+        .common_prefixes
+        .into_iter()
+        .filter_map(|prefix| realtime_volume_id_from_prefix(&site, &prefix.prefix))
+        .collect::<Vec<_>>();
+    active_ids.sort_unstable();
+    active_ids.dedup();
+
+    let Some(volume_id) = latest_realtime_volume_id_from_active_ids(&active_ids) else {
+        return Err(DataSourceError::NoObjects {
+            bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+            prefix: site_prefix,
+        });
+    };
+
+    let volume_prefix = format!("{site}/{volume_id}/");
+    let mut chunks = list_s3_limited(
+        LEVEL2_CHUNKS_BUCKET,
+        &volume_prefix,
+        None,
+        None,
+        Some(REALTIME_CHUNK_LIST_MAX_KEYS),
+    )?
+    .contents
+    .into_iter()
+    .filter(|object| object.size > 0)
+    .filter_map(parse_realtime_chunk_object)
+    .collect::<Vec<_>>();
+    chunks.sort_by_key(|chunk| chunk.chunk_id);
+
+    let Some(first_chunk) = chunks.first() else {
+        return Err(DataSourceError::NoObjects {
+            bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+            prefix: volume_prefix,
+        });
+    };
+
+    let volume_time = first_chunk.volume_time;
+    let complete = chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end());
+    let total_size = chunks.iter().map(|chunk| chunk.object.size).sum();
+
+    Ok(RealtimeLevel2Volume {
+        site,
+        volume_id,
+        volume_time,
+        chunks,
+        complete,
+        total_size,
+    })
+}
+
+pub fn download_realtime_volume(
+    volume: &RealtimeLevel2Volume,
+    cache_dir: &Path,
+) -> Result<DownloadedObject> {
+    fs::create_dir_all(cache_dir)?;
+    let filename = realtime_volume_cache_filename(volume);
+    let path = cache_dir.join(&filename);
+    let url = format!(
+        "https://{}.s3.amazonaws.com/{}/{}/",
+        LEVEL2_CHUNKS_BUCKET, volume.site, volume.volume_id
+    );
+
+    if path
+        .metadata()
+        .map(|metadata| metadata.len() == volume.total_size)
+        .unwrap_or(false)
+    {
+        return Ok(DownloadedObject {
+            object: S3Object {
+                key: filename,
+                size: volume.total_size,
+            },
+            path,
+            url,
+            cache_hit: true,
+        });
+    }
+
+    let chunk_cache_dir = cache_dir.join(".chunks").join(format!(
+        "{}_{}_{:03}",
+        volume.site,
+        volume.volume_time.format("%Y%m%d_%H%M%S"),
+        volume.volume_id
+    ));
+    fs::create_dir_all(&chunk_cache_dir)?;
+
+    let mut chunk_paths = Vec::with_capacity(volume.chunks.len());
+    let mut missing = Vec::new();
+    for chunk in &volume.chunks {
+        let chunk_filename = chunk
+            .object
+            .key
+            .rsplit('/')
+            .next()
+            .unwrap_or(&chunk.object.key);
+        let chunk_path = chunk_cache_dir.join(chunk_filename);
+        let cache_hit = chunk_path
+            .metadata()
+            .map(|metadata| metadata.len() == chunk.object.size)
+            .unwrap_or(false);
+        if !cache_hit {
+            missing.push((chunk.object.clone(), chunk_path.clone()));
+        }
+        chunk_paths.push(chunk_path);
+    }
+
+    for batch in missing.chunks(REALTIME_CHUNK_DOWNLOAD_BATCH) {
+        thread::scope(|scope| -> Result<()> {
+            let mut workers = Vec::with_capacity(batch.len());
+            for (object, path) in batch {
+                let object = object.clone();
+                let path = path.clone();
+                workers.push(scope.spawn(move || {
+                    download_s3_object_to_path(LEVEL2_CHUNKS_BUCKET, &object, &path)
+                }));
+            }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| DataSourceError::DownloadWorkerPanic)??;
+            }
+            Ok(())
+        })?;
+    }
+
+    if let Ok(existing_len) = path.metadata().map(|metadata| metadata.len())
+        && let Some(prefix_chunks) = chunk_prefix_count_for_size(volume, existing_len)
+        && prefix_chunks > 0
+        && prefix_chunks < chunk_paths.len()
+    {
+        append_realtime_chunks(
+            &path,
+            &chunk_paths[prefix_chunks..],
+            existing_len,
+            volume.total_size,
+            &url,
+        )?;
+        return Ok(DownloadedObject {
+            object: S3Object {
+                key: filename,
+                size: volume.total_size,
+            },
+            path,
+            url,
+            cache_hit: false,
+        });
+    }
+
+    let temp_path = path.with_extension("download");
+    let mut temp_file = fs::File::create(&temp_path)?;
+    for chunk_path in &chunk_paths {
+        let mut chunk_file = fs::File::open(chunk_path)?;
+        io::copy(&mut chunk_file, &mut temp_file)?;
+    }
+    drop(temp_file);
+
+    let copied = temp_path.metadata()?.len();
+    if copied != volume.total_size {
+        let _ = fs::remove_file(&temp_path);
+        return Err(DataSourceError::DownloadSizeMismatch {
+            url,
+            expected: volume.total_size,
+            actual: copied,
+        });
+    }
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    fs::rename(&temp_path, &path)?;
+
+    Ok(DownloadedObject {
+        object: S3Object {
+            key: filename,
+            size: volume.total_size,
+        },
+        path,
+        url,
+        cache_hit: false,
+    })
+}
+
 pub fn download_object(
     bucket: &str,
     object: S3Object,
@@ -292,14 +540,7 @@ pub fn download_object(
         });
     }
 
-    let bytes = download_http_client()
-        .get(&url)
-        .send()?
-        .error_for_status()?
-        .bytes()?;
-    let temp_path = path.with_extension("download");
-    fs::write(&temp_path, bytes)?;
-    fs::rename(&temp_path, &path)?;
+    download_s3_object_to_path(bucket, &object, &path)?;
     Ok(DownloadedObject {
         object,
         path,
@@ -308,20 +549,65 @@ pub fn download_object(
     })
 }
 
+pub fn newest_cached_level2_path(cache_dir: &Path) -> Result<Option<PathBuf>> {
+    if !cache_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut newest: Option<(String, PathBuf)> = None;
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".download") || name.ends_with("_MDM") {
+            continue;
+        }
+        if path.metadata().map(|metadata| metadata.len() == 0)? {
+            continue;
+        }
+        if newest
+            .as_ref()
+            .is_none_or(|(newest_name, _)| name > newest_name.as_str())
+        {
+            newest = Some((name.to_owned(), path));
+        }
+    }
+
+    Ok(newest.map(|(_, path)| path))
+}
+
 fn list_s3(
     bucket: &str,
     prefix: &str,
     delimiter: Option<&str>,
     continuation_token: Option<&str>,
 ) -> Result<S3Listing> {
+    list_s3_limited(bucket, prefix, delimiter, continuation_token, None)
+}
+
+fn list_s3_limited(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    continuation_token: Option<&str>,
+    max_keys: Option<usize>,
+) -> Result<S3Listing> {
     let url = format!("https://{bucket}.s3.amazonaws.com/");
     let client = metadata_http_client();
-    let mut query = vec![("list-type", "2"), ("prefix", prefix)];
+    let mut query = vec![("list-type", "2".to_owned()), ("prefix", prefix.to_owned())];
     if let Some(delimiter) = delimiter {
-        query.push(("delimiter", delimiter));
+        query.push(("delimiter", delimiter.to_owned()));
     }
     if let Some(token) = continuation_token {
-        query.push(("continuation-token", token));
+        query.push(("continuation-token", token.to_owned()));
+    }
+    if let Some(max_keys) = max_keys {
+        query.push(("max-keys", max_keys.to_string()));
     }
     let text = client
         .get(url)
@@ -331,6 +617,171 @@ fn list_s3(
         .text()?;
     let parsed: S3ListingXml = quick_xml::de::from_str(&text)?;
     Ok(parsed.into())
+}
+
+fn realtime_volume_id_from_prefix(site: &str, prefix: &str) -> Option<u16> {
+    let trimmed = prefix.trim_end_matches('/');
+    let mut parts = trimmed.split('/');
+    let prefix_site = parts.next()?;
+    if prefix_site != site {
+        return None;
+    }
+    let volume_id = parts.next()?.parse::<u16>().ok()?;
+    if parts.next().is_some() || volume_id >= REALTIME_VOLUME_ID_MODULUS {
+        return None;
+    }
+    Some(volume_id)
+}
+
+fn latest_realtime_volume_id_from_active_ids(ids: &[u16]) -> Option<u16> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return None;
+    }
+    if ids.len() == 1 {
+        return ids.first().copied();
+    }
+
+    let mut largest_gap = 0u16;
+    let mut latest_id = *ids.last()?;
+    for (index, current) in ids.iter().copied().enumerate() {
+        let next = if index + 1 == ids.len() {
+            ids[0] + REALTIME_VOLUME_ID_MODULUS
+        } else {
+            ids[index + 1]
+        };
+        let gap = next - current;
+        if gap > largest_gap {
+            largest_gap = gap;
+            latest_id = current;
+        }
+    }
+
+    if largest_gap <= 1 {
+        ids.last().copied()
+    } else {
+        Some(latest_id)
+    }
+}
+
+fn parse_realtime_chunk_object(object: S3Object) -> Option<RealtimeChunkObject> {
+    let key = object.key.clone();
+    let mut path_parts = key.split('/');
+    let site = path_parts.next()?.to_owned();
+    let volume_id = path_parts.next()?.parse::<u16>().ok()?;
+    let filename = path_parts.next()?;
+    if path_parts.next().is_some() || volume_id >= REALTIME_VOLUME_ID_MODULUS {
+        return None;
+    }
+
+    let mut name_parts = filename.split('-');
+    let date = name_parts.next()?;
+    let time = name_parts.next()?;
+    let chunk_id = name_parts.next()?.parse::<u16>().ok()?;
+    let chunk_type = RealtimeChunkType::from_code(name_parts.next()?)?;
+    if name_parts.next().is_some() {
+        return None;
+    }
+
+    let volume_time = NaiveDateTime::parse_from_str(&format!("{date}{time}"), "%Y%m%d%H%M%S")
+        .ok()?
+        .and_utc();
+
+    Some(RealtimeChunkObject {
+        object,
+        site,
+        volume_id,
+        volume_time,
+        chunk_id,
+        chunk_type,
+    })
+}
+
+fn realtime_volume_cache_filename(volume: &RealtimeLevel2Volume) -> String {
+    format!(
+        "{}{}_RT{:03}_V06",
+        volume.site,
+        volume.volume_time.format("%Y%m%d_%H%M%S"),
+        volume.volume_id
+    )
+}
+
+fn chunk_prefix_count_for_size(volume: &RealtimeLevel2Volume, size: u64) -> Option<usize> {
+    if size == 0 {
+        return Some(0);
+    }
+
+    let mut prefix_size = 0u64;
+    for (index, chunk) in volume.chunks.iter().enumerate() {
+        prefix_size = prefix_size.checked_add(chunk.object.size)?;
+        if prefix_size == size {
+            return Some(index + 1);
+        }
+        if prefix_size > size {
+            return None;
+        }
+    }
+
+    None
+}
+
+fn append_realtime_chunks(
+    path: &Path,
+    chunk_paths: &[PathBuf],
+    expected_existing: u64,
+    expected_total: u64,
+    url: &str,
+) -> Result<()> {
+    let mut output = fs::OpenOptions::new().append(true).open(path)?;
+    for chunk_path in chunk_paths {
+        let mut chunk_file = fs::File::open(chunk_path)?;
+        io::copy(&mut chunk_file, &mut output)?;
+    }
+    drop(output);
+
+    let actual = path.metadata()?.len();
+    if actual != expected_total {
+        return Err(DataSourceError::DownloadSizeMismatch {
+            url: url.to_owned(),
+            expected: expected_total,
+            actual,
+        });
+    }
+    if actual < expected_existing {
+        return Err(DataSourceError::DownloadSizeMismatch {
+            url: url.to_owned(),
+            expected: expected_existing,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn download_s3_object_to_path(bucket: &str, object: &S3Object, path: &Path) -> Result<()> {
+    let url = format!("https://{bucket}.s3.amazonaws.com/{}", object.key);
+    let mut response = download_http_client()
+        .get(&url)
+        .send()?
+        .error_for_status()?;
+    let temp_path = path.with_extension("download");
+    let mut temp_file = fs::File::create(&temp_path)?;
+    let copied = io::copy(&mut response, &mut temp_file)?;
+    drop(temp_file);
+    if copied != object.size {
+        let _ = fs::remove_file(&temp_path);
+        return Err(DataSourceError::DownloadSizeMismatch {
+            url,
+            expected: object.size,
+            actual: copied,
+        });
+    }
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(&temp_path, path)?;
+    Ok(())
 }
 
 fn metadata_http_client() -> reqwest::blocking::Client {
@@ -483,6 +934,7 @@ const FALLBACK_SITE_IDS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn site_can_carry_location() {
@@ -498,5 +950,148 @@ mod tests {
     #[test]
     fn fallback_has_many_sites() {
         assert!(fallback_sites().len() > 150);
+    }
+
+    #[test]
+    fn newest_cached_level2_path_ignores_partial_empty_and_mdm_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "radar-rs-analyst-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("test cache dir");
+
+        fs::write(dir.join("KTLX20260607_180000_V06"), b"old").expect("old cache file");
+        fs::write(dir.join("KTLX20260607_181000_V06.download"), b"partial")
+            .expect("partial cache file");
+        fs::write(dir.join("KTLX20260607_182000_MDM"), b"mdm").expect("mdm cache file");
+        fs::write(dir.join("KTLX20260607_183000_V06"), []).expect("empty cache file");
+        fs::write(dir.join("KTLX20260607_184000_V06"), b"new").expect("new cache file");
+
+        let newest = newest_cached_level2_path(&dir)
+            .expect("cache scan")
+            .expect("newest cache file");
+
+        assert_eq!(
+            newest.file_name().and_then(|name| name.to_str()),
+            Some("KTLX20260607_184000_V06")
+        );
+
+        fs::remove_dir_all(&dir).expect("clean test cache dir");
+    }
+
+    #[test]
+    fn realtime_latest_volume_id_handles_wraparound_window() {
+        let wrapped_ids = [998, 999, 1, 2, 3];
+        assert_eq!(
+            latest_realtime_volume_id_from_active_ids(&wrapped_ids),
+            Some(3)
+        );
+
+        let contiguous_ids = (102..=628).collect::<Vec<_>>();
+        assert_eq!(
+            latest_realtime_volume_id_from_active_ids(&contiguous_ids),
+            Some(628)
+        );
+    }
+
+    #[test]
+    fn realtime_chunk_key_parser_extracts_volume_metadata() {
+        let chunk = parse_realtime_chunk_object(S3Object {
+            key: "KGGW/628/20260608-002828-025-I".to_owned(),
+            size: 129_481,
+        })
+        .expect("valid realtime chunk key");
+
+        assert_eq!(chunk.site, "KGGW");
+        assert_eq!(chunk.volume_id, 628);
+        assert_eq!(chunk.chunk_id, 25);
+        assert_eq!(chunk.chunk_type, RealtimeChunkType::Intermediate);
+        assert_eq!(chunk.volume_time.to_rfc3339(), "2026-06-08T00:28:28+00:00");
+    }
+
+    #[test]
+    fn realtime_chunk_prefix_size_accepts_only_chunk_boundaries() {
+        let volume = test_realtime_volume_with_sizes(&[4, 6, 10]);
+
+        assert_eq!(chunk_prefix_count_for_size(&volume, 0), Some(0));
+        assert_eq!(chunk_prefix_count_for_size(&volume, 4), Some(1));
+        assert_eq!(chunk_prefix_count_for_size(&volume, 10), Some(2));
+        assert_eq!(chunk_prefix_count_for_size(&volume, 20), Some(3));
+        assert_eq!(chunk_prefix_count_for_size(&volume, 5), None);
+        assert_eq!(chunk_prefix_count_for_size(&volume, 21), None);
+    }
+
+    #[test]
+    fn realtime_append_adds_only_missing_chunk_bytes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "radar-rs-append-test-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("test dir");
+
+        let assembled = dir.join("assembled");
+        let chunk_two = dir.join("002-I");
+        let chunk_three = dir.join("003-E");
+        fs::write(&assembled, b"aaaa").expect("existing prefix");
+        fs::write(&chunk_two, b"bb").expect("chunk two");
+        fs::write(&chunk_three, b"cccc").expect("chunk three");
+
+        append_realtime_chunks(
+            &assembled,
+            &[chunk_two, chunk_three],
+            4,
+            10,
+            "test://chunks",
+        )
+        .expect("append missing chunks");
+
+        assert_eq!(
+            fs::read(&assembled).expect("assembled bytes"),
+            b"aaaabbcccc"
+        );
+        fs::remove_dir_all(&dir).expect("clean append test dir");
+    }
+
+    fn test_realtime_volume_with_sizes(sizes: &[u64]) -> RealtimeLevel2Volume {
+        let volume_time = Utc.with_ymd_and_hms(2026, 6, 8, 0, 0, 0).unwrap();
+        let chunks = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| {
+                let chunk_id = u16::try_from(index + 1).expect("test chunk id");
+                let chunk_type = if index == 0 {
+                    RealtimeChunkType::Start
+                } else if index + 1 == sizes.len() {
+                    RealtimeChunkType::End
+                } else {
+                    RealtimeChunkType::Intermediate
+                };
+                RealtimeChunkObject {
+                    object: S3Object {
+                        key: format!("KTLX/1/20260608-000000-{chunk_id:03}-I"),
+                        size: *size,
+                    },
+                    site: "KTLX".to_owned(),
+                    volume_id: 1,
+                    volume_time,
+                    chunk_id,
+                    chunk_type,
+                }
+            })
+            .collect::<Vec<_>>();
+        RealtimeLevel2Volume {
+            site: "KTLX".to_owned(),
+            volume_id: 1,
+            volume_time,
+            total_size: sizes.iter().sum(),
+            complete: chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end()),
+            chunks,
+        }
     }
 }

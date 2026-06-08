@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+const LOW_CORE_PREVIEW_THREADS: usize = 4;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(input) = std::env::args_os().nth(1).map(PathBuf::from) else {
         eprintln!("usage: cargo run -p nexrad_io --example bench_decode -- <level2-file>");
@@ -27,16 +29,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_preview_start = Instant::now();
     let mut app_preview = None;
     let app_preview_volume = if raw.starts_with(&[0x1f, 0x8b]) {
-        if let Some(volume) = nexrad_io::decode_gzip_preview_from_bytes(&raw, 180)? {
+        nexrad_io::decode_gzip_volume_from_bytes_with_preview(&raw, 180, |volume| {
             app_preview = Some((
                 app_preview_start.elapsed(),
                 volume.site.id,
                 volume.cuts.len(),
                 volume.metadata.decoded_radial_count,
             ));
-        }
-        nexrad_io::decode_volume_from_bytes(&raw)?
-    } else {
+        })?
+    } else if should_preview_block_bzip_loads_for_threads(rayon::current_num_threads()) {
         nexrad_io::decode_volume_from_bytes_with_bzip_preview(&raw, 180, |volume| {
             app_preview = Some((
                 app_preview_start.elapsed(),
@@ -45,6 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 volume.metadata.decoded_radial_count,
             ));
         })?
+    } else {
+        nexrad_io::decode_volume_from_bytes(&raw)?
     };
     let app_preview_elapsed = app_preview_start.elapsed();
 
@@ -173,4 +176,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn elapsed_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+fn should_preview_block_bzip_loads_for_threads(threads: usize) -> bool {
+    threads <= LOW_CORE_PREVIEW_THREADS
 }

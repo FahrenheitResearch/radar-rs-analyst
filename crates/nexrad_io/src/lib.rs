@@ -10,6 +10,7 @@ use std::io::{Cursor, Read};
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr::NonNull;
+use std::thread;
 
 use bzip2::bufread::BzDecoder;
 use chrono::{DateTime, TimeZone, Utc};
@@ -117,6 +118,34 @@ pub fn decode_gzip_volume_from_reader(reader: impl Read) -> Result<RadarVolume> 
     decode_volume_from_stream_until(&mut decoder, ArchiveCompression::Gzip, None).map(|result| {
         debug_assert!(!result.stopped_at_preview);
         result.volume
+    })
+}
+
+pub fn decode_gzip_volume_from_bytes_with_preview<F>(
+    raw: &[u8],
+    min_displayable_radials: usize,
+    mut on_preview: F,
+) -> Result<RadarVolume>
+where
+    F: FnMut(RadarVolume),
+{
+    if raw.len() < VOLUME_HEADER_LEN {
+        return Err(NexradError::ShortVolumeHeader { actual: raw.len() });
+    }
+    if !raw.starts_with(&[0x1f, 0x8b]) {
+        return decode_volume_from_bytes(raw);
+    }
+
+    thread::scope(|scope| {
+        let full_decode = scope.spawn(|| decode_volume_from_bytes(raw));
+        if let Ok(Some(preview)) = decode_gzip_preview_from_bytes(raw, min_displayable_radials) {
+            on_preview(preview);
+        }
+        full_decode.join().unwrap_or_else(|_| {
+            Err(NexradError::Compression(
+                "gzip decode worker panicked".to_owned(),
+            ))
+        })
     })
 }
 
@@ -501,6 +530,19 @@ fn decode_volume_from_stream_until<R: Read>(
     compression: ArchiveCompression,
     preview_min_radials: Option<usize>,
 ) -> Result<StreamDecodeResult> {
+    decode_volume_from_stream(reader, compression, preview_min_radials, true, |_| {})
+}
+
+fn decode_volume_from_stream<R: Read, F>(
+    reader: &mut R,
+    compression: ArchiveCompression,
+    preview_min_radials: Option<usize>,
+    stop_at_preview: bool,
+    mut on_preview: F,
+) -> Result<StreamDecodeResult>
+where
+    F: FnMut(RadarVolume),
+{
     let mut volume_header_bytes = [0; VOLUME_HEADER_LEN];
     read_exact_required(reader, &mut volume_header_bytes, "volume header", 0)?;
     let volume_header = parse_volume_header(&volume_header_bytes)?;
@@ -515,6 +557,7 @@ fn decode_volume_from_stream_until<R: Read>(
     let mut record_index = 0usize;
     let mut prefix = [0; CONTROL_WORD_LEN + MESSAGE_HEADER_LEN];
     let mut body_buffer = Vec::with_capacity(RECORD_BYTES);
+    let mut preview_emitted = false;
     while read_record_prefix(reader, &mut prefix, cursor)? {
         let header_offset = cursor + CONTROL_WORD_LEN;
         let header = parse_message_header_bytes(&prefix[CONTROL_WORD_LEN..]);
@@ -568,12 +611,17 @@ fn decode_volume_from_stream_until<R: Read>(
                 parse_message_31(&body_buffer, &header, &mut volume)?;
                 skip_record_padding(reader, record_len, prefix.len() + body_len, cursor)?;
                 if let Some(min_radials) = preview_min_radials
+                    && !preview_emitted
                     && has_complete_displayable_cut(&volume, min_radials)
                 {
-                    return Ok(StreamDecodeResult {
-                        volume,
-                        stopped_at_preview: true,
-                    });
+                    preview_emitted = true;
+                    if stop_at_preview {
+                        return Ok(StreamDecodeResult {
+                            volume,
+                            stopped_at_preview: true,
+                        });
+                    }
+                    on_preview(volume.clone());
                 }
             }
             5 => {
@@ -1549,6 +1597,27 @@ mod tests {
         assert_eq!(preview.cuts.len(), 1);
         assert_eq!(preview.cuts[0].radials.len(), 1);
         assert!(preview.cuts[0].moments.contains_key(&MomentType::Velocity));
+    }
+
+    #[test]
+    fn gzip_preview_callback_continues_to_full_volume() {
+        let mut bytes = synthetic_archive(false);
+        set_first_synthetic_radial_status(&mut bytes, RadialStatus::EndElevation);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut preview_radials = None;
+
+        let volume = decode_gzip_volume_from_bytes_with_preview(&compressed, 1, |preview| {
+            preview_radials = Some(preview.metadata.decoded_radial_count);
+        })
+        .unwrap();
+
+        assert_eq!(preview_radials, Some(1));
+        assert_eq!(volume.site.id, "KTLX");
+        assert_eq!(volume.metadata.compression, Some("gzip".to_owned()));
+        assert_eq!(volume.metadata.decoded_radial_count, 1);
+        assert!(volume.cuts[0].moments.contains_key(&MomentType::Velocity));
     }
 
     #[test]

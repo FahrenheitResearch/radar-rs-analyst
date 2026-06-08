@@ -7,6 +7,7 @@ use std::f32::consts::PI;
 use std::ops::Range;
 use std::path::Path;
 
+pub use color_tables::{ColorTable, ColorTableFamily, ColorTableSet};
 use image::{ImageBuffer, ImageError, Rgba};
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume};
 use rayon::prelude::*;
@@ -180,7 +181,8 @@ pub fn render_moment_image(
     let max_range_m = max_range_m(grid).max(1.0);
 
     let mut pixels = vec![0; width as usize * height as usize * 4];
-    let color_table = ColorTable::new(cut, grid, moment_color_family(&grid.moment));
+    let color_tables = ColorTableSet::default();
+    let color_table = color_tables.for_family(color_family_for_moment(&grid.moment));
 
     match &grid.storage {
         MomentStorage::U8(values) => {
@@ -288,6 +290,7 @@ pub struct ViewportMomentCache {
     row_lookup: AzimuthLookup,
     color_lookup: CachedColorLookup,
     storm_motion_basis: Option<StormMotionBasis>,
+    dealiased_grid: Option<MomentGrid>,
 }
 
 pub struct ViewportSampleCache {
@@ -380,8 +383,9 @@ struct CachedSample(u32);
 impl CachedSample {
     const GATE_BITS: u32 = 16;
     const GATE_MASK: u32 = (1 << Self::GATE_BITS) - 1;
-    const ROW_LIMIT: usize = 1 << (u32::BITS - Self::GATE_BITS);
-    const INVALID: Self = Self(u32::MAX);
+    const SKIP_FLAG: u32 = 1 << 31;
+    const SKIP_MASK: u32 = Self::SKIP_FLAG - 1;
+    const ROW_LIMIT: usize = 1 << (u32::BITS - Self::GATE_BITS - 1);
 
     fn new(sample: ResolvedSample) -> Option<Self> {
         if sample.row >= Self::ROW_LIMIT || sample.gate > Self::GATE_MASK as usize {
@@ -392,17 +396,27 @@ impl CachedSample {
         ))
     }
 
+    fn skip(pixel_count: u32) -> Option<Self> {
+        (pixel_count > 0 && pixel_count <= Self::SKIP_MASK)
+            .then_some(Self(Self::SKIP_FLAG | pixel_count))
+    }
+
     #[cfg(test)]
     fn sample(self) -> Option<ResolvedSample> {
-        (self != Self::INVALID).then_some(ResolvedSample {
+        (!self.is_skip()).then_some(ResolvedSample {
             row: (self.0 >> Self::GATE_BITS) as usize,
             gate: (self.0 & Self::GATE_MASK) as usize,
         })
     }
 
     #[inline]
-    fn is_invalid(self) -> bool {
-        self == Self::INVALID
+    fn is_skip(self) -> bool {
+        self.0 & Self::SKIP_FLAG != 0
+    }
+
+    #[inline]
+    fn skip_len(self) -> Option<u32> {
+        self.is_skip().then_some(self.0 & Self::SKIP_MASK)
     }
 
     #[inline]
@@ -464,32 +478,43 @@ enum CachedColorLookup {
 }
 
 impl CachedColorLookup {
-    fn new(cut: &ElevationCut, grid: &MomentGrid) -> Self {
-        let color_table = ColorTable::new(cut, grid, moment_color_family(&grid.moment));
+    fn new(grid: &MomentGrid, color_tables: &ColorTableSet) -> Self {
+        let color_table = color_tables
+            .for_family(color_family_for_moment(&grid.moment))
+            .clone();
         match &grid.storage {
             MomentStorage::U8(_) => Self::U8 {
-                palette: Box::new(build_u8_palette(grid, color_table)),
+                palette: Box::new(build_u8_palette(grid, &color_table)),
                 color_table,
             },
             MomentStorage::U16(_) => Self::U16 {
-                palette: build_u16_palette(grid, color_table),
+                palette: build_u16_palette(grid, &color_table),
                 color_table,
             },
             MomentStorage::F32(_) => Self::F32 { color_table },
         }
     }
 
-    fn color_table(&self) -> ColorTable {
+    fn color_table(&self) -> &ColorTable {
         match self {
             Self::U8 { color_table, .. }
             | Self::U16 { color_table, .. }
-            | Self::F32 { color_table } => *color_table,
+            | Self::F32 { color_table } => color_table,
         }
     }
 }
 
 impl ViewportMomentCache {
     pub fn new(volume: &RadarVolume, cut_index: usize, moment: MomentType) -> Result<Self> {
+        Self::new_with_color_tables(volume, cut_index, moment, &ColorTableSet::default())
+    }
+
+    pub fn new_with_color_tables(
+        volume: &RadarVolume,
+        cut_index: usize,
+        moment: MomentType,
+        color_tables: &ColorTableSet,
+    ) -> Result<Self> {
         let cut = volume
             .cuts
             .get(cut_index)
@@ -516,7 +541,51 @@ impl ViewportMomentCache {
                 .then(|| StormMotionBasis::new(cut, grid)),
             moment,
             row_lookup: AzimuthLookup::new(cut, grid),
-            color_lookup: CachedColorLookup::new(cut, grid),
+            color_lookup: CachedColorLookup::new(grid, color_tables),
+            dealiased_grid: None,
+        })
+    }
+
+    pub fn new_dealiased_velocity(volume: &RadarVolume, cut_index: usize) -> Result<Self> {
+        Self::new_dealiased_velocity_with_color_tables(volume, cut_index, &ColorTableSet::default())
+    }
+
+    pub fn new_dealiased_velocity_with_color_tables(
+        volume: &RadarVolume,
+        cut_index: usize,
+        color_tables: &ColorTableSet,
+    ) -> Result<Self> {
+        let cut = volume
+            .cuts
+            .get(cut_index)
+            .ok_or(RenderError::CutOutOfRange {
+                index: cut_index,
+                cut_count: volume.cuts.len(),
+            })?;
+        let source_grid =
+            cut.moments
+                .get(&MomentType::Velocity)
+                .ok_or_else(|| RenderError::MissingMoment {
+                    cut_index,
+                    moment: MomentType::Velocity,
+                })?;
+
+        if source_grid.radial_indices.is_empty() {
+            return Err(RenderError::EmptyMoment {
+                cut_index,
+                moment: MomentType::Velocity,
+            });
+        }
+
+        let dealiased_grid = dealias_velocity_grid(cut, source_grid);
+        Ok(Self {
+            volume_ptr: volume as *const RadarVolume as usize,
+            cut_index,
+            moment: MomentType::Velocity,
+            row_lookup: AzimuthLookup::new(cut, &dealiased_grid),
+            color_lookup: CachedColorLookup::new(&dealiased_grid, color_tables),
+            storm_motion_basis: Some(StormMotionBasis::new(cut, &dealiased_grid)),
+            dealiased_grid: Some(dealiased_grid),
         })
     }
 
@@ -912,7 +981,7 @@ impl ViewportMomentCache {
     }
 
     fn cut_and_grid<'a>(
-        &self,
+        &'a self,
         volume: &'a RadarVolume,
     ) -> Result<(&'a ElevationCut, &'a MomentGrid)> {
         if self.volume_ptr != volume as *const RadarVolume as usize {
@@ -926,6 +995,9 @@ impl ViewportMomentCache {
                 index: self.cut_index,
                 cut_count: volume.cuts.len(),
             })?;
+        if let Some(grid) = &self.dealiased_grid {
+            return Ok((cut, grid));
+        }
         let grid = cut
             .moments
             .get(&self.moment)
@@ -1068,7 +1140,8 @@ pub fn render_storm_relative_velocity_image(
     let max_range_m = max_range_m(grid).max(1.0);
 
     let mut pixels = vec![0; width as usize * height as usize * 4];
-    let color_table = ColorTable::new(cut, grid, MomentColorFamily::Velocity);
+    let color_tables = ColorTableSet::default();
+    let color_table = color_tables.for_family(ColorTableFamily::Velocity);
     let geometry = RasterGeometry {
         width,
         center_x,
@@ -1298,14 +1371,14 @@ fn render_storm_relative_velocity_sample_cache_grid_into(
 struct StormRelativeRenderCache<'a> {
     row_lookup: &'a AzimuthLookup,
     storm_motion_basis: Option<&'a StormMotionBasis>,
-    color_table: ColorTable,
+    color_table: &'a ColorTable,
     palette_cache: Option<&'a StormRelativePaletteCache>,
 }
 
 #[derive(Clone, Copy)]
 struct StormRelativeValueLookup<'a> {
     row_motion: &'a [f32],
-    color_table: ColorTable,
+    color_table: &'a ColorTable,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1673,14 +1746,15 @@ fn render_compact_sample_cache_storage<T: RawMomentValue>(
             };
             let mut pixel = row_start_x as usize * 4;
             for cached_sample in row_samples {
-                if !cached_sample.is_invalid() {
-                    let index = cached_sample.row() * gate_count + cached_sample.gate();
-                    if let Some(raw) = values.get(index).copied() {
-                        let color = palette[raw.to_usize()];
-                        if color[3] != 0 {
-                            row_pixels[pixel..pixel + 4].copy_from_slice(&color);
-                        }
-                    }
+                if let Some(skip) = cached_sample.skip_len() {
+                    pixel += skip as usize * 4;
+                    continue;
+                }
+                let index = cached_sample.row() * gate_count + cached_sample.gate();
+                debug_assert!(index < values.len());
+                let color = palette[values[index].to_usize()];
+                if color[3] != 0 {
+                    row_pixels[pixel..pixel + 4].copy_from_slice(&color);
                 }
                 pixel += 4;
             }
@@ -1692,7 +1766,7 @@ fn render_f32_storage<G: LookupGeometry>(
     values: &[f32],
     grid: &MomentGrid,
     row_lookup: &AzimuthLookup,
-    color_table: ColorTable,
+    color_table: &ColorTable,
     geometry: G,
     clear_pixels: bool,
 ) {
@@ -1737,7 +1811,7 @@ fn render_f32_viewport_storage(
     values: &[f32],
     grid: &MomentGrid,
     row_lookup: &AzimuthLookup,
-    color_table: ColorTable,
+    color_table: &ColorTable,
     lookup_table: &ViewportLookupTable,
     clear_pixels: bool,
 ) {
@@ -1781,7 +1855,7 @@ fn render_f32_sample_cache_storage(
     pixels: &mut [u8],
     values: &[f32],
     grid: &MomentGrid,
-    color_table: ColorTable,
+    color_table: &ColorTable,
     sample_cache: &ViewportSampleCache,
     clear_pixels: bool,
 ) {
@@ -1801,15 +1875,17 @@ fn render_f32_sample_cache_storage(
             };
             let mut pixel = row_start_x as usize * 4;
             for cached_sample in row_samples {
-                if !cached_sample.is_invalid() {
-                    let index = cached_sample.row() * gate_count + cached_sample.gate();
-                    if let Some(value) =
-                        values.get(index).copied().filter(|value| value.is_finite())
-                    {
-                        let color = color_table.color_for_value(value);
-                        if color[3] != 0 {
-                            row_pixels[pixel..pixel + 4].copy_from_slice(&color);
-                        }
+                if let Some(skip) = cached_sample.skip_len() {
+                    pixel += skip as usize * 4;
+                    continue;
+                }
+                let index = cached_sample.row() * gate_count + cached_sample.gate();
+                debug_assert!(index < values.len());
+                let value = values[index];
+                if value.is_finite() {
+                    let color = color_table.color_for_value(value);
+                    if color[3] != 0 {
+                        row_pixels[pixel..pixel + 4].copy_from_slice(&color);
                     }
                 }
                 pixel += 4;
@@ -1852,18 +1928,17 @@ fn render_storm_relative_storage<T: RawMomentValue, G: LookupGeometry>(
                     if grid.nodata == Some(raw as u16) {
                         continue;
                     }
-                    let color = if grid.range_folded == Some(raw as u16) {
-                        value_lookup.color_table.range_folded_color()
-                    } else {
-                        let velocity = (raw as f32 - grid.offset) / grid.scale;
-                        let relative = velocity
-                            - value_lookup
-                                .row_motion
-                                .get(candidate.row)
-                                .copied()
-                                .unwrap_or(0.0);
-                        value_lookup.color_table.color_for_value(relative)
-                    };
+                    if grid.range_folded == Some(raw as u16) {
+                        continue;
+                    }
+                    let velocity = (raw as f32 - grid.offset) / grid.scale;
+                    let relative = velocity
+                        - value_lookup
+                            .row_motion
+                            .get(candidate.row)
+                            .copied()
+                            .unwrap_or(0.0);
+                    let color = value_lookup.color_table.color_for_value(relative);
                     if color[3] == 0 {
                         continue;
                     }
@@ -1910,18 +1985,17 @@ fn render_storm_relative_viewport_storage<T: RawMomentValue>(
                     if grid.nodata == Some(raw as u16) {
                         continue;
                     }
-                    let color = if grid.range_folded == Some(raw as u16) {
-                        value_lookup.color_table.range_folded_color()
-                    } else {
-                        let velocity = (raw as f32 - grid.offset) / grid.scale;
-                        let relative = velocity
-                            - value_lookup
-                                .row_motion
-                                .get(candidate.row)
-                                .copied()
-                                .unwrap_or(0.0);
-                        value_lookup.color_table.color_for_value(relative)
-                    };
+                    if grid.range_folded == Some(raw as u16) {
+                        continue;
+                    }
+                    let velocity = (raw as f32 - grid.offset) / grid.scale;
+                    let relative = velocity
+                        - value_lookup
+                            .row_motion
+                            .get(candidate.row)
+                            .copied()
+                            .unwrap_or(0.0);
+                    let color = value_lookup.color_table.color_for_value(relative);
                     if color[3] == 0 {
                         continue;
                     }
@@ -1936,7 +2010,7 @@ fn render_storm_relative_viewport_storage<T: RawMomentValue>(
 fn build_storm_relative_u8_row_palettes(
     grid: &MomentGrid,
     row_motion: &[f32],
-    color_table: ColorTable,
+    color_table: &ColorTable,
 ) -> Vec<[[u8; 4]; 256]> {
     row_motion
         .par_iter()
@@ -1953,7 +2027,7 @@ fn build_storm_relative_u8_row_palettes(
 
 fn storm_relative_u8_color_for_raw(
     grid: &MomentGrid,
-    color_table: ColorTable,
+    color_table: &ColorTable,
     raw: u8,
     row_motion: f32,
 ) -> [u8; 4] {
@@ -1962,7 +2036,7 @@ fn storm_relative_u8_color_for_raw(
         return [0, 0, 0, 0];
     }
     if grid.range_folded == Some(raw) {
-        return color_table.range_folded_color();
+        return [0, 0, 0, 0];
     }
     let velocity = (raw as f32 - grid.offset) / grid.scale;
     color_table.color_for_value(velocity - row_motion)
@@ -2086,17 +2160,17 @@ fn render_storm_relative_u8_sample_cache_storage(
             };
             let mut pixel = row_start_x as usize * 4;
             for cached_sample in row_samples {
-                if !cached_sample.is_invalid() {
-                    let row = cached_sample.row();
-                    let index = row * gate_count + cached_sample.gate();
-                    if let Some(raw) = values.get(index).copied()
-                        && let Some(palette) = row_palettes.get(row)
-                    {
-                        let color = palette[usize::from(raw)];
-                        if color[3] != 0 {
-                            row_pixels[pixel..pixel + 4].copy_from_slice(&color);
-                        }
-                    }
+                if let Some(skip) = cached_sample.skip_len() {
+                    pixel += skip as usize * 4;
+                    continue;
+                }
+                let row = cached_sample.row();
+                let index = row * gate_count + cached_sample.gate();
+                debug_assert!(index < values.len());
+                debug_assert!(row < row_palettes.len());
+                let color = row_palettes[row][usize::from(values[index])];
+                if color[3] != 0 {
+                    row_pixels[pixel..pixel + 4].copy_from_slice(&color);
                 }
                 pixel += 4;
             }
@@ -2108,7 +2182,7 @@ fn render_storm_relative_sample_cache_storage<T: RawMomentValue>(
     values: &[T],
     grid: &MomentGrid,
     row_motion: &[f32],
-    color_table: ColorTable,
+    color_table: &ColorTable,
     sample_cache: &ViewportSampleCache,
     clear_pixels: bool,
 ) {
@@ -2128,22 +2202,21 @@ fn render_storm_relative_sample_cache_storage<T: RawMomentValue>(
             };
             let mut pixel = row_start_x as usize * 4;
             for cached_sample in row_samples {
-                if !cached_sample.is_invalid() {
-                    let row = cached_sample.row();
-                    let index = row * gate_count + cached_sample.gate();
-                    if let Some(raw) = values.get(index).copied().map(RawMomentValue::to_usize)
-                        && grid.nodata != Some(raw as u16)
-                    {
-                        let color = if grid.range_folded == Some(raw as u16) {
-                            color_table.range_folded_color()
-                        } else {
-                            let velocity = (raw as f32 - grid.offset) / grid.scale;
-                            let relative = velocity - row_motion.get(row).copied().unwrap_or(0.0);
-                            color_table.color_for_value(relative)
-                        };
-                        if color[3] != 0 {
-                            row_pixels[pixel..pixel + 4].copy_from_slice(&color);
-                        }
+                if let Some(skip) = cached_sample.skip_len() {
+                    pixel += skip as usize * 4;
+                    continue;
+                }
+                let row = cached_sample.row();
+                let index = row * gate_count + cached_sample.gate();
+                debug_assert!(index < values.len());
+                debug_assert!(row < row_motion.len());
+                let raw = values[index].to_usize();
+                if grid.nodata != Some(raw as u16) && grid.range_folded != Some(raw as u16) {
+                    let velocity = (raw as f32 - grid.offset) / grid.scale;
+                    let relative = velocity - row_motion[row];
+                    let color = color_table.color_for_value(relative);
+                    if color[3] != 0 {
+                        row_pixels[pixel..pixel + 4].copy_from_slice(&color);
                     }
                 }
                 pixel += 4;
@@ -2260,7 +2333,7 @@ fn render_storm_relative_f32_sample_cache_storage(
     values: &[f32],
     grid: &MomentGrid,
     row_motion: &[f32],
-    color_table: ColorTable,
+    color_table: &ColorTable,
     sample_cache: &ViewportSampleCache,
     clear_pixels: bool,
 ) {
@@ -2280,17 +2353,20 @@ fn render_storm_relative_f32_sample_cache_storage(
             };
             let mut pixel = row_start_x as usize * 4;
             for cached_sample in row_samples {
-                if !cached_sample.is_invalid() {
-                    let row = cached_sample.row();
-                    let index = row * gate_count + cached_sample.gate();
-                    if let Some(velocity) =
-                        values.get(index).copied().filter(|value| value.is_finite())
-                    {
-                        let relative = velocity - row_motion.get(row).copied().unwrap_or(0.0);
-                        let color = color_table.color_for_value(relative);
-                        if color[3] != 0 {
-                            row_pixels[pixel..pixel + 4].copy_from_slice(&color);
-                        }
+                if let Some(skip) = cached_sample.skip_len() {
+                    pixel += skip as usize * 4;
+                    continue;
+                }
+                let row = cached_sample.row();
+                let index = row * gate_count + cached_sample.gate();
+                debug_assert!(index < values.len());
+                debug_assert!(row < row_motion.len());
+                let velocity = values[index];
+                if velocity.is_finite() {
+                    let relative = velocity - row_motion[row];
+                    let color = color_table.color_for_value(relative);
+                    if color[3] != 0 {
+                        row_pixels[pixel..pixel + 4].copy_from_slice(&color);
                     }
                 }
                 pixel += 4;
@@ -2317,6 +2393,7 @@ where
             let x_range = row_lookup_table.x_range.clone();
             let x_range_len = x_range.len();
             let mut start = None;
+            let mut next_x = 0u32;
             let mut samples = Vec::with_capacity(x_range_len);
             let mut count = 0;
             for x in x_range {
@@ -2324,12 +2401,15 @@ where
                     && let Some(cached_sample) = CachedSample::new(sample)
                 {
                     let start_x = *start.get_or_insert(x);
-                    let target_len = (x - start_x) as usize;
-                    if samples.len() < target_len {
-                        samples.resize(target_len, CachedSample::INVALID);
+                    if samples.is_empty() {
+                        next_x = start_x;
+                    }
+                    if x > next_x {
+                        push_cached_sample_skip(&mut samples, x - next_x);
                     }
                     samples.push(cached_sample);
                     count += 1;
+                    next_x = x + 1;
                 }
             }
             if samples.is_empty() {
@@ -2343,6 +2423,14 @@ where
             }
         })
         .collect()
+}
+
+fn push_cached_sample_skip(samples: &mut Vec<CachedSample>, mut pixel_count: u32) {
+    while pixel_count > 0 {
+        let chunk = pixel_count.min(CachedSample::SKIP_MASK);
+        samples.push(CachedSample::skip(chunk).expect("positive skip chunk fits"));
+        pixel_count -= chunk;
+    }
 }
 
 fn resolve_compact_sample<T: RawMomentValue>(
@@ -2449,7 +2537,7 @@ fn viewport_lookup(
     })
 }
 
-fn build_u8_palette(grid: &MomentGrid, color_table: ColorTable) -> [[u8; 4]; 256] {
+fn build_u8_palette(grid: &MomentGrid, color_table: &ColorTable) -> [[u8; 4]; 256] {
     let mut palette = [[0, 0, 0, 0]; 256];
     for raw in 0..=u8::MAX {
         palette[usize::from(raw)] = color_for_raw(grid, color_table, u16::from(raw));
@@ -2457,22 +2545,221 @@ fn build_u8_palette(grid: &MomentGrid, color_table: ColorTable) -> [[u8; 4]; 256
     palette
 }
 
-fn build_u16_palette(grid: &MomentGrid, color_table: ColorTable) -> Vec<[u8; 4]> {
-    let mut palette = vec![[0, 0, 0, 0]; usize::from(u16::MAX) + 1];
-    for raw in 0..=u16::MAX {
+fn build_u16_palette(grid: &MomentGrid, color_table: &ColorTable) -> Vec<[u8; 4]> {
+    let max_raw = match &grid.storage {
+        MomentStorage::U16(values) => values.iter().copied().max().unwrap_or(0),
+        _ => u16::MAX,
+    };
+    let mut palette = vec![[0, 0, 0, 0]; usize::from(max_raw) + 1];
+    for raw in 0..=max_raw {
         palette[usize::from(raw)] = color_for_raw(grid, color_table, raw);
     }
     palette
 }
 
-fn color_for_raw(grid: &MomentGrid, color_table: ColorTable, raw: u16) -> [u8; 4] {
+fn color_for_raw(grid: &MomentGrid, color_table: &ColorTable, raw: u16) -> [u8; 4] {
     if grid.nodata == Some(raw) {
         return [0, 0, 0, 0];
     }
     if grid.range_folded == Some(raw) {
-        return color_table.range_folded_color();
+        return [0, 0, 0, 0];
     }
     color_table.color_for_value((raw as f32 - grid.offset) / grid.scale)
+}
+
+pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentGrid {
+    let rows = source.radial_count();
+    let gate_count = source.gate_range.gate_count;
+    let fallback_nyquist = median_nyquist_mps(cut, source);
+    let mut corrected = vec![DEALIASED_VELOCITY_NODATA; rows.saturating_mul(gate_count)];
+    let mut row_values = vec![f32::NAN; gate_count];
+
+    for row in 0..rows {
+        let row_start = row * gate_count;
+        row_values.fill(f32::NAN);
+        let nyquist = row_nyquist_mps(cut, source, row).or(fallback_nyquist);
+        if let Some(nyquist) = nyquist.filter(|value| value.is_finite() && *value > 0.0) {
+            if let Some(seed) = pick_dealias_seed(source, row, nyquist)
+                && let Some(seed_value) = source.scaled_value(row, seed)
+            {
+                row_values[seed] = seed_value;
+                walk_dealias_radial(source, row, nyquist, None, &mut row_values, seed, 1);
+                walk_dealias_radial(source, row, nyquist, None, &mut row_values, seed, -1);
+            }
+        } else {
+            copy_scaled_velocity_row(source, row, &mut row_values);
+        }
+
+        encode_dealiased_velocity_row(
+            &row_values,
+            &mut corrected[row_start..row_start + gate_count],
+        );
+    }
+
+    MomentGrid {
+        moment: MomentType::Velocity,
+        gate_range: source.gate_range.clone(),
+        scale: DEALIASED_VELOCITY_SCALE,
+        offset: DEALIASED_VELOCITY_OFFSET,
+        nodata: Some(DEALIASED_VELOCITY_NODATA),
+        range_folded: None,
+        radial_indices: source.radial_indices.clone(),
+        storage: MomentStorage::U16(corrected),
+    }
+}
+
+const DEALIASED_VELOCITY_SCALE: f32 = 10.0;
+const DEALIASED_VELOCITY_OFFSET: f32 = 32_768.0;
+const DEALIASED_VELOCITY_NODATA: u16 = 0;
+
+fn encode_dealiased_velocity_row(values: &[f32], output: &mut [u16]) {
+    debug_assert_eq!(values.len(), output.len());
+    for (value, raw) in values.iter().zip(output.iter_mut()) {
+        *raw = encode_dealiased_velocity(*value);
+    }
+}
+
+fn encode_dealiased_velocity(value: f32) -> u16 {
+    if !value.is_finite() {
+        return DEALIASED_VELOCITY_NODATA;
+    }
+    (value * DEALIASED_VELOCITY_SCALE + DEALIASED_VELOCITY_OFFSET)
+        .round()
+        .clamp(1.0, u16::MAX as f32) as u16
+}
+
+fn copy_scaled_velocity_row(source: &MomentGrid, row: usize, row_values: &mut [f32]) {
+    for (gate, value) in row_values.iter_mut().enumerate() {
+        *value = source.scaled_value(row, gate).unwrap_or(f32::NAN);
+    }
+}
+
+fn median_nyquist_mps(cut: &ElevationCut, grid: &MomentGrid) -> Option<f32> {
+    let mut values = grid
+        .radial_indices
+        .iter()
+        .filter_map(|radial_index| cut.radials.get(*radial_index)?.nyquist_velocity_mps)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    Some(values[values.len() / 2])
+}
+
+fn row_nyquist_mps(cut: &ElevationCut, grid: &MomentGrid, row: usize) -> Option<f32> {
+    let radial_index = *grid.radial_indices.get(row)?;
+    cut.radials.get(radial_index)?.nyquist_velocity_mps
+}
+
+fn pick_dealias_seed(grid: &MomentGrid, row: usize, nyquist: f32) -> Option<usize> {
+    let mut fallback = None;
+    let gate_count = grid.gate_range.gate_count;
+    let gate_midpoint = gate_count / 2;
+    for offset in 0..gate_count {
+        let left = gate_midpoint.checked_sub(offset);
+        let right = gate_midpoint + offset;
+        for gate in [left, (right < gate_count).then_some(right)]
+            .into_iter()
+            .flatten()
+        {
+            let Some(value) = grid.scaled_value(row, gate) else {
+                continue;
+            };
+            fallback.get_or_insert(gate);
+            if value.abs() <= 0.85 * nyquist {
+                return Some(gate);
+            }
+        }
+    }
+    fallback
+}
+
+fn walk_dealias_radial(
+    source: &MomentGrid,
+    row: usize,
+    nyquist: f32,
+    previous_row: Option<&[f32]>,
+    row_values: &mut [f32],
+    seed: usize,
+    direction: isize,
+) {
+    let gate_count = source.gate_range.gate_count;
+    let mut gate = seed as isize + direction;
+    let mut last_gate = Some(seed);
+    let mut last_two_gate: Option<usize> = None;
+    while (0..gate_count as isize).contains(&gate) {
+        let current_gate = gate as usize;
+        let Some(observed) = source.scaled_value(row, current_gate) else {
+            gate += direction;
+            continue;
+        };
+        let mut references = [0.0; 3];
+        let mut reference_count = 0usize;
+        if let Some(last) = last_gate
+            && current_gate.abs_diff(last) <= 3
+            && row_values[last].is_finite()
+        {
+            references[reference_count] = row_values[last];
+            reference_count += 1;
+            if let Some(last_two) = last_two_gate
+                && row_values[last_two].is_finite()
+            {
+                let slope = row_values[last] - row_values[last_two];
+                references[reference_count] = row_values[last] + slope;
+                reference_count += 1;
+            }
+        }
+        if let Some(previous) = previous_row
+            && let Some(previous_value) = previous.get(current_gate).copied()
+            && previous_value.is_finite()
+        {
+            references[reference_count] = previous_value;
+            reference_count += 1;
+        }
+        row_values[current_gate] = if reference_count == 0 {
+            observed
+        } else {
+            let reference = median_small_f32(&mut references, reference_count);
+            unfold_velocity_to_reference(observed, reference, nyquist, reference_count, 8)
+        };
+        last_two_gate = last_gate;
+        last_gate = Some(current_gate);
+        gate += direction;
+    }
+}
+
+fn median_small_f32(values: &mut [f32; 3], count: usize) -> f32 {
+    debug_assert!(count > 0 && count <= values.len());
+    values[..count].sort_by(f32::total_cmp);
+    values[count / 2]
+}
+
+fn unfold_velocity_to_reference(
+    observed: f32,
+    reference: f32,
+    nyquist: f32,
+    reference_count: usize,
+    max_abs_fold: i32,
+) -> f32 {
+    let fold = ((reference - observed) / (2.0 * nyquist))
+        .round()
+        .clamp(-(max_abs_fold as f32), max_abs_fold as f32);
+    if fold == 0.0 {
+        return observed;
+    }
+    let unfolded = observed + 2.0 * nyquist * fold;
+    let continuity_error = (unfolded - reference).abs();
+    let close_enough = continuity_error <= (0.35 * nyquist).max(4.0);
+    let high_opposite_sides = observed.signum() != reference.signum()
+        && observed.abs() >= 0.60 * nyquist
+        && reference.abs() >= 0.60 * nyquist;
+    if close_enough && (high_opposite_sides || reference_count >= 2) {
+        unfolded
+    } else {
+        observed
+    }
 }
 
 fn max_range_m(grid: &MomentGrid) -> f32 {
@@ -2728,156 +3015,13 @@ fn motion_component_away_mps(storm_motion: StormMotion, beam_azimuth_deg: f32) -
     storm_motion.speed_mps * delta.cos()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MomentColorFamily {
-    Reflectivity,
-    Velocity,
-    SpectrumWidth,
-    Generic,
-}
-
-fn moment_color_family(moment: &MomentType) -> MomentColorFamily {
+pub fn color_family_for_moment(moment: &MomentType) -> ColorTableFamily {
     match moment {
-        MomentType::Reflectivity => MomentColorFamily::Reflectivity,
-        MomentType::Velocity => MomentColorFamily::Velocity,
-        MomentType::SpectrumWidth => MomentColorFamily::SpectrumWidth,
-        _ => MomentColorFamily::Generic,
+        MomentType::Reflectivity => ColorTableFamily::Reflectivity,
+        MomentType::Velocity => ColorTableFamily::Velocity,
+        MomentType::SpectrumWidth => ColorTableFamily::SpectrumWidth,
+        _ => ColorTableFamily::Generic,
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ColorTable {
-    family: MomentColorFamily,
-    velocity_limit_mps: f32,
-}
-
-impl ColorTable {
-    fn new(cut: &ElevationCut, grid: &MomentGrid, family: MomentColorFamily) -> Self {
-        Self {
-            family,
-            velocity_limit_mps: velocity_limit_mps(cut, grid).unwrap_or(32.0),
-        }
-    }
-
-    fn color_for_value(self, value: f32) -> [u8; 4] {
-        if !value.is_finite() {
-            return [0, 0, 0, 0];
-        }
-
-        match self.family {
-            MomentColorFamily::Reflectivity => reflectivity_color(value),
-            MomentColorFamily::Velocity => velocity_color(value, self.velocity_limit_mps),
-            MomentColorFamily::SpectrumWidth => spectrum_width_color(value),
-            MomentColorFamily::Generic => generic_color(value),
-        }
-        .0
-    }
-
-    fn range_folded_color(self) -> [u8; 4] {
-        match self.family {
-            MomentColorFamily::Velocity => [126, 80, 196, 245],
-            _ => [104, 82, 162, 220],
-        }
-    }
-}
-
-fn velocity_limit_mps(cut: &ElevationCut, grid: &MomentGrid) -> Option<f32> {
-    if grid.moment != MomentType::Velocity {
-        return None;
-    }
-
-    grid.radial_indices
-        .iter()
-        .filter_map(|radial_index| cut.radials.get(*radial_index)?.nyquist_velocity_mps)
-        .filter(|nyquist| nyquist.is_finite() && *nyquist >= 2.0)
-        .max_by(f32::total_cmp)
-}
-
-fn reflectivity_color(dbz: f32) -> Rgba<u8> {
-    const STEPS: &[(f32, [u8; 3])] = &[
-        (-10.0, [18, 24, 46]),
-        (0.0, [30, 65, 130]),
-        (5.0, [24, 100, 178]),
-        (10.0, [18, 146, 214]),
-        (15.0, [22, 170, 170]),
-        (20.0, [26, 154, 75]),
-        (25.0, [75, 184, 65]),
-        (30.0, [174, 190, 56]),
-        (35.0, [226, 202, 50]),
-        (40.0, [238, 145, 38]),
-        (45.0, [231, 85, 32]),
-        (50.0, [214, 36, 36]),
-        (55.0, [185, 24, 75]),
-        (60.0, [160, 36, 136]),
-        (65.0, [214, 72, 214]),
-        (70.0, [238, 238, 238]),
-        (75.0, [255, 255, 255]),
-    ];
-    step_color(dbz, STEPS)
-}
-
-fn velocity_color(velocity: f32, limit_mps: f32) -> Rgba<u8> {
-    const STEPS: &[(f32, [u8; 3])] = &[
-        (-0.92, [4, 88, 34]),
-        (-0.78, [0, 130, 45]),
-        (-0.64, [16, 178, 58]),
-        (-0.50, [55, 220, 82]),
-        (-0.36, [120, 248, 118]),
-        (-0.22, [190, 255, 176]),
-        (-0.10, [226, 255, 218]),
-        (-0.035, [23, 34, 28]),
-        (0.035, [30, 26, 28]),
-        (0.10, [255, 224, 214]),
-        (0.22, [255, 178, 142]),
-        (0.36, [255, 118, 82]),
-        (0.50, [244, 64, 58]),
-        (0.64, [210, 32, 52]),
-        (0.78, [166, 16, 56]),
-        (0.92, [126, 0, 62]),
-        (1.00, [255, 238, 72]),
-    ];
-    let normalized = velocity / limit_mps.clamp(2.0, 100.0);
-    step_color(normalized, STEPS)
-}
-
-fn spectrum_width_color(width_mps: f32) -> Rgba<u8> {
-    const STEPS: &[(f32, [u8; 3])] = &[
-        (0.5, [9, 20, 32]),
-        (1.0, [24, 52, 100]),
-        (2.0, [22, 102, 172]),
-        (3.0, [18, 152, 180]),
-        (4.0, [36, 174, 98]),
-        (5.5, [160, 188, 58]),
-        (7.0, [232, 190, 54]),
-        (9.0, [238, 112, 42]),
-        (12.0, [216, 44, 50]),
-        (16.0, [160, 36, 136]),
-        (24.0, [235, 235, 235]),
-    ];
-    step_color(width_mps, STEPS)
-}
-
-fn generic_color(value: f32) -> Rgba<u8> {
-    const STEPS: &[(f32, [u8; 3])] = &[
-        (0.0, [34, 40, 64]),
-        (10.0, [34, 82, 130]),
-        (25.0, [34, 132, 172]),
-        (40.0, [58, 166, 140]),
-        (55.0, [116, 180, 92]),
-        (70.0, [218, 188, 74]),
-        (85.0, [224, 114, 56]),
-        (100.0, [210, 64, 68]),
-    ];
-    step_color(value, STEPS)
-}
-
-fn step_color(value: f32, steps: &[(f32, [u8; 3])]) -> Rgba<u8> {
-    let color = steps
-        .iter()
-        .find(|(upper_bound, _)| value <= *upper_bound)
-        .map(|(_, color)| *color)
-        .unwrap_or_else(|| steps[steps.len() - 1].1);
-    Rgba([color[0], color[1], color[2], 255])
 }
 
 #[cfg(test)]
@@ -2900,22 +3044,85 @@ mod tests {
 
     #[test]
     fn velocity_table_has_a_hard_zero_boundary() {
-        let inbound = velocity_color(-0.4, 8.0);
-        let outbound = velocity_color(0.4, 8.0);
-        let weak_inbound = velocity_color(-0.45, 8.0);
+        let tables = ColorTableSet::default();
+        let table = tables.for_family(ColorTableFamily::Velocity);
+        let inbound = table.color_for_value(-2.0);
+        let outbound = table.color_for_value(2.0);
+        let neutral = table.color_for_value(0.0);
 
         assert_ne!(inbound, outbound);
-        assert_eq!(inbound, weak_inbound);
+        assert_ne!(neutral, inbound);
+        assert_ne!(neutral, outbound);
     }
 
     #[test]
     fn range_folded_gates_are_visible() {
-        let table = ColorTable {
-            family: MomentColorFamily::Velocity,
-            velocity_limit_mps: 32.0,
-        };
+        let tables = ColorTableSet::default();
+        let table = tables.for_family(ColorTableFamily::Velocity);
 
         assert_eq!(table.range_folded_color()[3], 245);
+    }
+
+    #[test]
+    fn velocity_range_folded_bins_render_transparent() {
+        let volume = test_volume();
+        let grid = volume.cuts[0]
+            .moments
+            .get(&MomentType::Velocity)
+            .expect("velocity grid");
+        let tables = ColorTableSet::default();
+        let table = tables.for_family(ColorTableFamily::Velocity);
+
+        assert_eq!(color_for_raw(grid, table, 1), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn reflectivity_range_folded_bins_render_transparent() {
+        let volume = test_volume();
+        let grid = volume.cuts[0]
+            .moments
+            .get(&MomentType::Reflectivity)
+            .expect("reflectivity grid");
+        let tables = ColorTableSet::default();
+        let table = tables.for_family(ColorTableFamily::Reflectivity);
+
+        assert_eq!(color_for_raw(grid, table, 1), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn lightweight_velocity_dealias_unfolds_radial_continuity() {
+        let gate_range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 1_000,
+            gate_count: 5,
+        };
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        cut.radials.push(Radial {
+            azimuth_deg: 0.0,
+            elevation_deg: 0.5,
+            time_offset_ms: 0,
+            gate_range: gate_range.clone(),
+            nyquist_velocity_mps: Some(10.0),
+            radial_status: None,
+        });
+        let grid = MomentGrid {
+            moment: MomentType::Velocity,
+            gate_range,
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: vec![0],
+            storage: MomentStorage::F32(vec![0.0, 5.0, 9.0, -9.0, -7.0]),
+        };
+
+        let corrected = dealias_velocity_grid(&cut, &grid);
+        assert!(matches!(corrected.storage, MomentStorage::U16(_)));
+
+        let values = (0..corrected.gate_range.gate_count)
+            .map(|gate| corrected.scaled_value(0, gate).expect("corrected gate"))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0.0, 5.0, 9.0, 11.0, 13.0]);
     }
 
     #[test]
@@ -2926,7 +3133,8 @@ mod tests {
             .moments
             .get(&MomentType::Velocity)
             .expect("velocity grid");
-        let color_table = ColorTable::new(cut, grid, MomentColorFamily::Velocity);
+        let tables = ColorTableSet::default();
+        let color_table = tables.for_family(ColorTableFamily::Velocity);
         let row_motion = [3.25];
         let palettes = build_storm_relative_u8_row_palettes(grid, &row_motion, color_table);
 
@@ -2936,6 +3144,25 @@ mod tests {
                 storm_relative_u8_color_for_raw(grid, color_table, raw, row_motion[0])
             );
         }
+    }
+
+    #[test]
+    fn custom_color_table_feeds_precomputed_u8_palette() {
+        let volume = test_volume();
+        let grid = volume.cuts[0]
+            .moments
+            .get(&MomentType::Velocity)
+            .expect("velocity grid");
+        let table = ColorTable::parse(
+            "unit test velocity",
+            "units: m/s\ncolor: -20 1 2 3\ncolor: 0 10 20 30\ncolor: 20 40 50 60",
+        )
+        .expect("custom color table");
+
+        let palette = build_u8_palette(grid, &table);
+
+        assert_eq!(palette[64], [10, 20, 30, 255]);
+        assert_eq!(palette[74], [25, 35, 45, 255]);
     }
 
     #[test]
@@ -2992,6 +3219,9 @@ mod tests {
         let cached = CachedSample::new(sample).expect("sample fits packed cache entry");
 
         assert_eq!(cached.sample(), Some(sample));
+        let skip = CachedSample::skip(37).expect("skip fits packed cache entry");
+        assert_eq!(skip.skip_len(), Some(37));
+        assert_eq!(skip.sample(), None);
         assert_eq!(
             CachedSample::new(ResolvedSample {
                 row: CachedSample::ROW_LIMIT,

@@ -9,6 +9,7 @@ const DEFAULT_DECODE_RUNS: usize = 5;
 const DEFAULT_KM_PER_PX: f32 = 0.16;
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const KNOT_TO_MPS: f32 = 0.514_444;
+const LOW_CORE_PREVIEW_THREADS: usize = 4;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args().map_err(|err| format!("{err}\n\n{}", usage()))?;
@@ -45,14 +46,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
         let mut first_preview = None;
         let decoded = if raw.starts_with(&[0x1f, 0x8b]) {
-            if let Some(preview) =
-                nexrad_io::decode_gzip_preview_from_bytes(&raw, MIN_DISPLAYABLE_RADIALS)?
-            {
-                std::hint::black_box(preview.metadata.decoded_radial_count);
-                first_preview = Some(start.elapsed());
-            }
-            nexrad_io::decode_volume_from_bytes(&raw)?
-        } else {
+            nexrad_io::decode_gzip_volume_from_bytes_with_preview(
+                &raw,
+                MIN_DISPLAYABLE_RADIALS,
+                |preview| {
+                    std::hint::black_box(preview.metadata.decoded_radial_count);
+                    first_preview.get_or_insert_with(|| start.elapsed());
+                },
+            )?
+        } else if should_preview_block_bzip_loads_for_threads(rayon::current_num_threads()) {
             nexrad_io::decode_volume_from_bytes_with_bzip_preview(
                 &raw,
                 MIN_DISPLAYABLE_RADIALS,
@@ -61,6 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     first_preview.get_or_insert_with(|| start.elapsed());
                 },
             )?
+        } else {
+            nexrad_io::decode_volume_from_bytes(&raw)?
         };
         std::hint::black_box(decoded.metadata.decoded_radial_count);
         if let Some(first_preview) = first_preview {
@@ -92,6 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for viewport in &config.viewports {
         probe_moment(&volume, MomentType::Velocity, *viewport, config.runs, "VEL")?;
+        probe_dealiased_velocity(&volume, *viewport, config.runs)?;
         probe_moment(
             &volume,
             MomentType::Reflectivity,
@@ -101,6 +106,160 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         probe_storm_relative_velocity(&volume, *viewport, config.runs)?;
     }
+
+    Ok(())
+}
+
+fn should_preview_block_bzip_loads_for_threads(threads: usize) -> bool {
+    threads <= LOW_CORE_PREVIEW_THREADS
+}
+
+fn probe_dealiased_velocity(
+    volume: &RadarVolume,
+    viewport: ViewportRasterOptions,
+    runs: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(cut) = first_cut_with_moment(volume, &MomentType::Velocity) else {
+        return Ok(());
+    };
+    let mut pixels = vec![0; viewport_rgba_buffer_len(viewport)];
+    let viewport_label = viewport_name(viewport);
+    let mut last_cache = None;
+
+    let build = time_runs(runs, || {
+        let cache = ViewportMomentCache::new_dealiased_velocity(volume, cut)?;
+        std::hint::black_box(cache.cut_index());
+        last_cache = Some(cache);
+        Ok(())
+    })?;
+    let cache = last_cache.expect("DVEL cache build run produced a cache");
+    print_stats(
+        "moment_cache_build",
+        &format!(" product=DVEL cut={cut} viewport={viewport_label}"),
+        runs,
+        TimingStats::from(build),
+    );
+
+    let direct = time_runs(runs, || {
+        cache.render_moment_rgba_into(volume, viewport, &mut pixels)?;
+        std::hint::black_box(&pixels);
+        Ok(())
+    })?;
+    print_stats(
+        "viewport_direct",
+        &format!(" product=DVEL cut={cut} viewport={viewport_label}"),
+        runs,
+        TimingStats::from(direct),
+    );
+
+    let mut last_sample_cache = None;
+    let sample_build = time_runs(runs, || {
+        let sample_cache = cache.build_sample_cache(volume, viewport)?;
+        std::hint::black_box(sample_cache.sample_count());
+        last_sample_cache = Some(sample_cache);
+        Ok(())
+    })?;
+    let sample_cache = last_sample_cache.expect("DVEL sample cache build produced a cache");
+    print_stats(
+        "sample_cache_build",
+        &format!(
+            " product=DVEL cut={cut} viewport={viewport_label} samples={} storage_bytes={}",
+            sample_cache.sample_count(),
+            sample_cache.storage_bytes()
+        ),
+        runs,
+        TimingStats::from(sample_build),
+    );
+
+    let cached = time_runs(runs, || {
+        cache.render_moment_rgba_with_sample_cache(volume, &sample_cache, &mut pixels)?;
+        std::hint::black_box(&pixels);
+        Ok(())
+    })?;
+    print_stats(
+        "sample_cache_render",
+        &format!(" product=DVEL cut={cut} viewport={viewport_label}"),
+        runs,
+        TimingStats::from(cached),
+    );
+
+    cache.render_moment_rgba_with_sample_cache(volume, &sample_cache, &mut pixels)?;
+    let reuse = time_runs(runs, || {
+        cache.render_moment_rgba_with_sample_cache_reusing_transparency(
+            volume,
+            &sample_cache,
+            &mut pixels,
+        )?;
+        std::hint::black_box(&pixels);
+        Ok(())
+    })?;
+    print_stats(
+        "sample_cache_reuse",
+        &format!(" product=DVEL cut={cut} viewport={viewport_label}"),
+        runs,
+        TimingStats::from(reuse),
+    );
+
+    let storm_motion = StormMotion {
+        direction_deg: 45.0,
+        speed_mps: 35.0 * KNOT_TO_MPS,
+    };
+    let direct = time_runs(runs, || {
+        cache.render_storm_relative_velocity_rgba_into(
+            volume,
+            storm_motion,
+            viewport,
+            &mut pixels,
+        )?;
+        std::hint::black_box(&pixels);
+        Ok(())
+    })?;
+    print_stats(
+        "viewport_direct",
+        &format!(" product=DSRV cut={cut} viewport={viewport_label}"),
+        runs,
+        TimingStats::from(direct),
+    );
+
+    let cached = time_runs(runs, || {
+        cache.render_storm_relative_velocity_rgba_with_sample_cache(
+            volume,
+            storm_motion,
+            &sample_cache,
+            &mut pixels,
+        )?;
+        std::hint::black_box(&pixels);
+        Ok(())
+    })?;
+    print_stats(
+        "sample_cache_render",
+        &format!(" product=DSRV cut={cut} viewport={viewport_label}"),
+        runs,
+        TimingStats::from(cached),
+    );
+
+    cache.render_storm_relative_velocity_rgba_with_sample_cache(
+        volume,
+        storm_motion,
+        &sample_cache,
+        &mut pixels,
+    )?;
+    let reuse = time_runs(runs, || {
+        cache.render_storm_relative_velocity_rgba_with_sample_cache_reusing_transparency(
+            volume,
+            storm_motion,
+            &sample_cache,
+            &mut pixels,
+        )?;
+        std::hint::black_box(&pixels);
+        Ok(())
+    })?;
+    print_stats(
+        "sample_cache_reuse",
+        &format!(" product=DSRV cut={cut} viewport={viewport_label}"),
+        runs,
+        TimingStats::from(reuse),
+    );
 
     Ok(())
 }

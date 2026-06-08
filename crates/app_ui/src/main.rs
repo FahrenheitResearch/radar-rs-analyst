@@ -1,16 +1,21 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, TimeZone, Utc};
+use color_tables::{ColorTable, ColorTableFamily, ColorTableSet, builtin_tables_for_family};
 use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
     StormMotion, StormRelativePaletteCache, ViewportMomentCache, ViewportRasterOptions,
-    ViewportSampleCache, storm_relative_velocity_mps, viewport_rgba_buffer_len,
+    ViewportSampleCache, color_family_for_moment, dealias_velocity_grid,
+    storm_relative_velocity_mps, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound,
 };
+use serde::Deserialize;
 
 mod basemap_data;
 
@@ -34,15 +39,47 @@ const HIGH_END_SAMPLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const LOW_CORE_PREVIEW_THREADS: usize = 4;
 const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 8;
+const LIVE_HAZARD_REFRESH_SECONDS: u64 = 10;
+const REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
 const PERF_SAMPLE_CAPACITY: usize = 96;
-const LATEST_OBJECT_CACHE_TTL: Duration = Duration::from_secs(20);
+const LATEST_OBJECT_CACHE_TTL: Duration = Duration::from_secs(10);
+const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
+const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
+const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
+const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
+const NWS_PRODUCT_API_BASE_URL: &str = "https://api.weather.gov/products/types";
+const HOT_TEXT_PRODUCT_TYPES: &[&str] = &["TOR", "SVR", "SVS", "FFW", "FFS", "SMW", "SQW"];
+const HOT_TEXT_PRODUCTS_MIN_PER_TYPE: usize = 4;
+const HOT_TEXT_PRODUCTS_MAX_PER_TYPE: usize = 16;
+const HOT_TEXT_PRODUCTS_RECENT_WINDOW_MINUTES: i64 = 60;
+const HOT_TEXT_DETAIL_CACHE_MAX: usize = 512;
+const HAZARD_CLICK_TOLERANCE_PX: f32 = 12.0;
+const HAZARD_LABEL_CLICK_RADIUS_PX: f32 = 18.0;
+const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
+const DEFAULT_HAZARD_FILL_ALPHA: u8 = 24;
+const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
+const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
+const HAZARD_DETAIL_SCROLL_HEIGHT: f32 = 150.0;
+const PERF_STATS_SCROLL_HEIGHT: f32 = 142.0;
+const TILT_LIST_SCROLL_HEIGHT: f32 = 168.0;
+const DEFAULT_HIDDEN_HAZARD_FAMILIES: &[&str] = &[];
+const HAZARD_FILTER_FAMILIES: &[(&str, &str)] = &[
+    ("tornado", "TOR"),
+    ("severe thunderstorm", "SVR"),
+    ("flash flood", "FFW"),
+    ("flood", "Flood"),
+    ("special marine", "SMW"),
+    ("snow squall", "SQW"),
+    ("watch", "Watch"),
+    ("mesoscale discussion", "MD"),
+    ("special weather", "SPS"),
+];
 const BASEMAP_US_DETAIL_BOUNDS: &[[f32; 4]] = &[
     [-125.5, 24.0, -66.0, 50.3],
     [-171.0, 51.0, -129.0, 72.0],
     [-161.5, 18.5, -154.5, 23.0],
     [-68.5, 17.0, -64.0, 19.0],
 ];
-const FORCE_PREVIEW_ENV: &str = "RADAR_RS_FORCE_PREVIEW";
 const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 
 fn main() -> eframe::Result {
@@ -86,14 +123,15 @@ fn cache_dir(name: &str) -> PathBuf {
 }
 
 fn should_preview_loads() -> bool {
-    should_preview_loads_for_threads(
-        std::env::var_os(FORCE_PREVIEW_ENV).is_some(),
-        effective_worker_threads(),
-    )
+    should_preview_loads_for_threads(effective_worker_threads())
 }
 
-fn should_preview_loads_for_threads(force_preview: bool, threads: usize) -> bool {
-    force_preview || threads <= LOW_CORE_PREVIEW_THREADS
+fn should_preview_loads_for_threads(_threads: usize) -> bool {
+    true
+}
+
+fn should_preview_block_bzip_loads_for_threads(threads: usize) -> bool {
+    threads <= LOW_CORE_PREVIEW_THREADS
 }
 
 fn effective_worker_threads() -> usize {
@@ -142,7 +180,8 @@ fn decode_load_path_with_optional_preview(
         });
     }
 
-    let preview_head_start = preview_render_head_start(effective_worker_threads());
+    let worker_threads = effective_worker_threads();
+    let preview_head_start = preview_render_head_start(worker_threads);
     let preview_path = path.clone();
     let preview_label = label.to_owned();
     let decode_start = Instant::now();
@@ -167,14 +206,15 @@ fn decode_load_path_with_optional_preview(
         }
     };
     let mut volume = if raw.starts_with(&[0x1f, 0x8b]) {
-        if let Some(preview) =
-            nexrad_io::decode_gzip_preview_from_bytes(&raw, MIN_DISPLAYABLE_RADIALS)
-                .map_err(|err| err.to_string())?
-        {
-            send_preview(preview);
-        }
-        nexrad_io::decode_volume_from_bytes(&raw).map_err(|err| err.to_string())?
-    } else {
+        nexrad_io::decode_gzip_volume_from_bytes_with_preview(
+            &raw,
+            MIN_DISPLAYABLE_RADIALS,
+            |preview| {
+                send_preview(preview);
+            },
+        )
+        .map_err(|err| err.to_string())?
+    } else if should_preview_block_bzip_loads_for_threads(worker_threads) {
         nexrad_io::decode_volume_from_bytes_with_bzip_preview(
             &raw,
             MIN_DISPLAYABLE_RADIALS,
@@ -183,6 +223,8 @@ fn decode_load_path_with_optional_preview(
             },
         )
         .map_err(|err| err.to_string())?
+    } else {
+        nexrad_io::decode_volume_from_bytes(&raw).map_err(|err| err.to_string())?
     };
     timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
     timings.preview_ms = first_preview_ms;
@@ -199,6 +241,10 @@ struct ViewerApp {
     volume: Option<Arc<RadarVolume>>,
     selected_cut: usize,
     selected_product: DisplayProduct,
+    color_tables: ColorTableSet,
+    color_table_target: ColorTableFamily,
+    color_table_path_text: String,
+    color_table_status: String,
     texture: Option<egui::TextureHandle>,
     texture_key: Option<TextureKey>,
     render_sender: mpsc::Sender<RenderRequest>,
@@ -221,10 +267,25 @@ struct ViewerApp {
     selected_site_index: usize,
     site_catalog_receiver: Option<mpsc::Receiver<AsyncSiteCatalogResult>>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
+    hazard_receiver: Option<mpsc::Receiver<AsyncHazardResult>>,
     pending_site_id: Option<String>,
     cursor_readout: Option<CursorReadout>,
+    hazard_overlay: Option<HazardOverlay>,
+    hazard_path_text: String,
+    hazard_status: String,
+    hazards_visible: bool,
+    hazards_active_only: bool,
+    hazard_fill_alpha: u8,
+    hidden_hazard_families: BTreeSet<String>,
+    realtime_level2_auto_refresh: bool,
+    last_realtime_level2_refresh: Option<Instant>,
+    live_hazard_auto_refresh: bool,
+    show_performance_stats: bool,
+    last_live_hazard_refresh: Option<Instant>,
+    selected_hazard_index: Option<usize>,
     storm_motion_direction_deg: f32,
     storm_motion_speed_kt: f32,
+    dealiased_readout_cache: Option<DealiasedReadoutCache>,
 }
 
 struct AsyncLoadResult {
@@ -234,7 +295,14 @@ struct AsyncLoadResult {
 
 enum AsyncLoadUpdate {
     Preview(DecodedLoad),
+    Unchanged,
     Final(Result<DecodedLoad, String>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LatestLoadMode {
+    User,
+    AutoRefresh,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -260,6 +328,15 @@ struct AsyncSiteCatalogResult {
     result: Result<Vec<RadarSite>, String>,
 }
 
+struct AsyncHazardResult {
+    update: AsyncHazardUpdate,
+}
+
+enum AsyncHazardUpdate {
+    Preview(Result<HazardOverlay, String>),
+    Final(Result<HazardOverlay, String>),
+}
+
 struct DecodedLoad {
     path: PathBuf,
     volume: RadarVolume,
@@ -276,6 +353,7 @@ struct RenderRequest {
     volume: Arc<RadarVolume>,
     cut: usize,
     product: DisplayProduct,
+    color_tables: ColorTableSet,
     storm_motion: StormMotion,
     viewport_options: ViewportRasterOptions,
     radar_range_km: f32,
@@ -296,6 +374,56 @@ struct RenderedTexture {
 struct RenderRecycleBuffer {
     rgba: Vec<u8>,
     signature: Option<RenderWorkerViewportSignature>,
+}
+
+struct DealiasedReadoutCache {
+    volume_ptr: usize,
+    cut_index: usize,
+    grid: Arc<MomentGrid>,
+}
+
+#[derive(Clone, Debug)]
+struct HazardOverlay {
+    source_label: String,
+    query_time_utc: Option<String>,
+    scanned_items: usize,
+    parsed_items: usize,
+    polygon_records: usize,
+    error_count: usize,
+    load_ms: f32,
+    records: Vec<HazardRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct HazardRecord {
+    event_id: String,
+    label: String,
+    event_family: String,
+    action: String,
+    lifecycle_status: Option<String>,
+    office: String,
+    headline: Option<String>,
+    source_url: Option<String>,
+    area: Option<String>,
+    motion: Option<String>,
+    details: Vec<String>,
+    valid_start: Option<String>,
+    valid_end: Option<String>,
+    severity: Option<String>,
+    certainty: Option<String>,
+    urgency: Option<String>,
+    tornado: Option<String>,
+    hail_inches: Option<f32>,
+    wind_mph: Option<u16>,
+    damage_threat: Option<String>,
+    points: Vec<HazardPoint>,
+    bbox: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HazardPoint {
+    lon: f32,
+    lat: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -425,6 +553,8 @@ struct RenderWorkerMomentCache {
     volume_ptr: usize,
     cut: usize,
     moment: MomentType,
+    dealiased_velocity: bool,
+    color_table_signature: u64,
     cache: ViewportMomentCache,
     storm_palette_cache: Option<RenderWorkerStormPaletteCache>,
 }
@@ -558,15 +688,23 @@ struct RenderWorkerViewportSignature {
     volume_ptr: usize,
     cut: usize,
     moment: MomentType,
+    color_table_signature: u64,
     viewport: ViewportKey,
 }
 
 impl RenderWorkerViewportSignature {
-    fn new(volume_ptr: usize, cut: usize, moment: MomentType, viewport: ViewportKey) -> Self {
+    fn new(
+        volume_ptr: usize,
+        cut: usize,
+        moment: MomentType,
+        color_table_signature: u64,
+        viewport: ViewportKey,
+    ) -> Self {
         Self {
             volume_ptr,
             cut,
             moment,
+            color_table_signature,
             viewport,
         }
     }
@@ -605,6 +743,7 @@ fn spawn_render_worker() -> (
                 Arc::as_ptr(&request.volume) as usize,
                 request.cut,
                 request.product.base_moment(),
+                request.key.color_table_signature,
                 request.key.viewport,
             );
             while let Ok(recycled) = recycle_receiver.try_recv() {
@@ -713,26 +852,51 @@ fn spawn_render_worker() -> (
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DisplayProduct {
     Moment(MomentType),
+    DealiasedVelocity,
     StormRelativeVelocity,
+    StormRelativeDealiasedVelocity,
 }
 
 impl DisplayProduct {
     fn label(&self) -> &str {
         match self {
             Self::Moment(moment) => moment.short_name(),
+            Self::DealiasedVelocity => "DVEL",
             Self::StormRelativeVelocity => "SRV",
+            Self::StormRelativeDealiasedVelocity => "DSRV",
         }
     }
 
     fn base_moment(&self) -> MomentType {
         match self {
             Self::Moment(moment) => moment.clone(),
-            Self::StormRelativeVelocity => MomentType::Velocity,
+            Self::DealiasedVelocity
+            | Self::StormRelativeVelocity
+            | Self::StormRelativeDealiasedVelocity => MomentType::Velocity,
         }
     }
 
     fn is_storm_relative_velocity(&self) -> bool {
-        matches!(self, Self::StormRelativeVelocity)
+        matches!(
+            self,
+            Self::StormRelativeVelocity | Self::StormRelativeDealiasedVelocity
+        )
+    }
+
+    fn uses_dealiased_velocity(&self) -> bool {
+        matches!(
+            self,
+            Self::DealiasedVelocity | Self::StormRelativeDealiasedVelocity
+        )
+    }
+
+    fn color_family(&self) -> ColorTableFamily {
+        match self {
+            Self::Moment(moment) => color_family_for_moment(moment),
+            Self::DealiasedVelocity
+            | Self::StormRelativeVelocity
+            | Self::StormRelativeDealiasedVelocity => ColorTableFamily::Velocity,
+        }
     }
 }
 
@@ -784,12 +948,18 @@ impl ViewerApp {
             .and_then(site_location)
             .unwrap_or((35.33305, -97.27775));
         let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
+        let hazard_path_text = String::new();
 
         let mut app = Self {
             source_path,
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
+            color_tables: ColorTableSet::default(),
+            color_table_target: ColorTableFamily::Velocity,
+            color_table_path_text: String::new(),
+            color_table_status: "Built-in Analyst Pro velocity and RadarScope reflectivity"
+                .to_owned(),
             texture: None,
             texture_key: None,
             render_sender,
@@ -812,18 +982,115 @@ impl ViewerApp {
             selected_site_index,
             site_catalog_receiver: None,
             load_receiver: None,
+            hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
+            hazard_overlay: None,
+            hazard_path_text,
+            hazard_status: "No hazard polygons loaded".to_owned(),
+            hazards_visible: true,
+            hazards_active_only: true,
+            hazard_fill_alpha: DEFAULT_HAZARD_FILL_ALPHA,
+            hidden_hazard_families: default_hidden_hazard_families(),
+            realtime_level2_auto_refresh: true,
+            last_realtime_level2_refresh: None,
+            live_hazard_auto_refresh: true,
+            show_performance_stats: false,
+            last_live_hazard_refresh: None,
+            selected_hazard_index: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
+            dealiased_readout_cache: None,
         };
         app.start_site_catalog_load(&cc.egui_ctx);
         app.load_volume(&cc.egui_ctx);
+        app.load_live_hazards(&cc.egui_ctx);
         app
     }
 
     fn load_volume(&mut self, ctx: &egui::Context) {
         self.start_local_volume_load(self.source_path.clone(), ctx);
+    }
+
+    fn load_live_hazards(&mut self, ctx: &egui::Context) {
+        if self.hazard_receiver.is_some() {
+            return;
+        }
+        let query_time_utc = Utc::now();
+        let (sender, receiver) = mpsc::channel();
+        self.hazard_receiver = Some(receiver);
+        self.last_live_hazard_refresh = Some(Instant::now());
+        self.hazard_status = "Loading live hazards".to_owned();
+        thread::spawn(move || {
+            let result = load_live_hazard_overlay_with_preview(query_time_utc, |preview| {
+                let _ = sender.send(AsyncHazardResult {
+                    update: AsyncHazardUpdate::Preview(Ok(preview)),
+                });
+            });
+            let _ = sender.send(AsyncHazardResult {
+                update: AsyncHazardUpdate::Final(result),
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(25));
+    }
+
+    fn load_local_hazards(&mut self, ctx: &egui::Context) {
+        if self.hazard_receiver.is_some() {
+            return;
+        }
+        let trimmed_path = self.hazard_path_text.trim();
+        if trimmed_path.is_empty() {
+            self.hazard_status = "No local hazard path entered".to_owned();
+            return;
+        }
+        let path = PathBuf::from(trimmed_path);
+        let query_time_utc = self
+            .volume
+            .as_ref()
+            .map(|volume| volume.volume_time.with_timezone(&Utc));
+        let (sender, receiver) = mpsc::channel();
+        self.hazard_receiver = Some(receiver);
+        self.hazard_status = format!("Loading local hazards from {}", path.display());
+        thread::spawn(move || {
+            let result = load_hazard_overlay_from_path(&path, query_time_utc);
+            let _ = sender.send(AsyncHazardResult {
+                update: AsyncHazardUpdate::Final(result),
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(25));
+    }
+
+    fn maybe_refresh_live_hazards(&mut self, ctx: &egui::Context) {
+        if !self.live_hazard_auto_refresh || self.hazard_receiver.is_some() {
+            return;
+        }
+        let should_refresh = self.last_live_hazard_refresh.is_none_or(|last_refresh| {
+            last_refresh.elapsed() >= Duration::from_secs(LIVE_HAZARD_REFRESH_SECONDS)
+        });
+        if should_refresh {
+            self.load_live_hazards(ctx);
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
+    fn maybe_refresh_realtime_level2(&mut self, ctx: &egui::Context) {
+        if !self.realtime_level2_auto_refresh || self.load_receiver.is_some() {
+            return;
+        }
+        let should_refresh = self
+            .last_realtime_level2_refresh
+            .is_none_or(|last_refresh| {
+                last_refresh.elapsed() >= Duration::from_secs(REALTIME_LEVEL2_REFRESH_SECONDS)
+            });
+        if !should_refresh {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            return;
+        }
+        let Some(site) = self.selected_site().cloned() else {
+            return;
+        };
+        self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::AutoRefresh);
     }
 
     fn clear_texture(&mut self) {
@@ -834,6 +1101,15 @@ impl ViewerApp {
         self.worker_ms = None;
         self.texture_ms = None;
         self.sample_cache_build_ms = None;
+    }
+
+    fn clear_displayed_volume_for_pending_load(&mut self, ctx: &egui::Context) {
+        self.volume = None;
+        self.load_timing = None;
+        self.dealiased_readout_cache = None;
+        self.selected_cut = 0;
+        self.clear_texture();
+        ctx.request_repaint();
     }
 
     fn install_volume(
@@ -861,12 +1137,121 @@ impl ViewerApp {
         }
         self.load_timing = load_timing;
         self.volume = Some(Arc::new(volume));
+        self.dealiased_readout_cache = None;
         self.selected_cut = selected_cut;
         self.selected_product = selected_product;
         self.sanitize_selection();
         self.clear_texture();
-        self.center_loaded_volume();
         ctx.request_repaint();
+    }
+
+    fn poll_async_hazards(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.hazard_receiver.take() else {
+            return;
+        };
+        let mut keep_receiver = true;
+        loop {
+            match receiver.try_recv() {
+                Ok(message) => {
+                    let changed = match message.update {
+                        AsyncHazardUpdate::Preview(result) => {
+                            self.install_hazard_result(result, true)
+                        }
+                        AsyncHazardUpdate::Final(result) => {
+                            keep_receiver = false;
+                            self.install_hazard_result(result, false)
+                        }
+                    };
+                    if changed {
+                        ctx.request_repaint();
+                    }
+                    if !keep_receiver {
+                        break;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    keep_receiver = false;
+                    self.hazard_status = "Hazard loader disconnected".to_owned();
+                    break;
+                }
+            }
+        }
+        if keep_receiver {
+            self.hazard_receiver = Some(receiver);
+        }
+    }
+
+    fn install_hazard_result(
+        &mut self,
+        result: Result<HazardOverlay, String>,
+        updating: bool,
+    ) -> bool {
+        match result {
+            Ok(overlay) => {
+                if updating {
+                    return false;
+                }
+                if let Some(existing) = &self.hazard_overlay
+                    && hazard_overlay_records_match(existing, &overlay)
+                {
+                    if !updating
+                        && (existing.source_label != overlay.source_label
+                            || self.hazard_status.starts_with("Preview "))
+                    {
+                        self.hazard_status = format!(
+                            "{} polygons from {} items in {:.1} ms",
+                            overlay.records.len(),
+                            overlay.parsed_items,
+                            overlay.load_ms
+                        );
+                        self.hazard_overlay = Some(overlay);
+                        return true;
+                    }
+                    return false;
+                }
+                let overlay_change = self
+                    .hazard_overlay
+                    .as_ref()
+                    .map(|existing| hazard_overlay_change(existing, &overlay));
+                let selected_event_id = self
+                    .selected_hazard_record()
+                    .map(|record| record.event_id.clone());
+                let phase = if updating { "Preview " } else { "" };
+                let change_suffix = overlay_change
+                    .filter(|change| !change.is_empty())
+                    .map(|change| format!("; {}", change.status_text()))
+                    .unwrap_or_default();
+                self.hazard_status = format!(
+                    "{}{} polygons from {} items in {:.1} ms{}",
+                    phase,
+                    overlay.records.len(),
+                    overlay.parsed_items,
+                    overlay.load_ms,
+                    change_suffix
+                );
+                self.selected_hazard_index = selected_hazard_index_for_event_id(
+                    &overlay.records,
+                    selected_event_id.as_deref(),
+                );
+                self.hazard_overlay = Some(overlay);
+                true
+            }
+            Err(err) => {
+                if self.hazard_overlay.is_some() {
+                    self.hazard_status =
+                        format!("Hazard refresh failed; keeping current polygons: {err}");
+                    return true;
+                }
+                self.hazard_status = err;
+                self.hazard_overlay = None;
+                self.selected_hazard_index = None;
+                true
+            }
+        }
     }
 
     fn start_site_catalog_load(&mut self, ctx: &egui::Context) {
@@ -946,6 +1331,13 @@ impl ViewerApp {
                             self.install_volume(decoded.volume, Some(decoded.timings), false, ctx);
                             self.status = format!("Preview {}", message.label);
                         }
+                        AsyncLoadUpdate::Unchanged => {
+                            self.load_receiver = None;
+                            self.pending_site_id = None;
+                            self.status = format!("Current {}", message.label);
+                            ctx.request_repaint_after(Duration::from_secs(1));
+                            return;
+                        }
                         AsyncLoadUpdate::Final(result) => {
                             self.load_receiver = None;
                             self.pending_site_id = None;
@@ -1003,7 +1395,9 @@ impl ViewerApp {
         let preferred = [
             DisplayProduct::Moment(MomentType::Reflectivity),
             DisplayProduct::Moment(MomentType::Velocity),
+            DisplayProduct::DealiasedVelocity,
             DisplayProduct::StormRelativeVelocity,
+            DisplayProduct::StormRelativeDealiasedVelocity,
             DisplayProduct::Moment(MomentType::SpectrumWidth),
             DisplayProduct::Moment(MomentType::DifferentialReflectivity),
             DisplayProduct::Moment(MomentType::CorrelationCoefficient),
@@ -1021,6 +1415,79 @@ impl ViewerApp {
         {
             self.selected_product = product;
         }
+    }
+
+    fn handle_keyboard_navigation(&mut self, ctx: &egui::Context) {
+        if ctx.text_edit_focused() {
+            return;
+        }
+
+        let product_delta = ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                1
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                -1
+            } else {
+                0
+            }
+        });
+        if product_delta != 0 {
+            if self.step_product(product_delta) {
+                ctx.request_repaint();
+            }
+            return;
+        }
+
+        let tilt_delta = ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                1
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                -1
+            } else {
+                0
+            }
+        });
+        if tilt_delta != 0 && self.step_tilt(tilt_delta) {
+            ctx.request_repaint();
+        }
+    }
+
+    fn step_product(&mut self, delta: isize) -> bool {
+        let Some(volume) = self.volume.as_ref() else {
+            return false;
+        };
+        let products = global_displayable_products(volume);
+        let Some(next_product) = stepped_product(&products, &self.selected_product, delta).cloned()
+        else {
+            return false;
+        };
+        let Some(next_cut) = best_cut_for_product(volume, self.selected_cut, &next_product) else {
+            return false;
+        };
+        if self.selected_product == next_product && self.selected_cut == next_cut {
+            return false;
+        }
+        self.selected_product = next_product;
+        self.selected_cut = next_cut;
+        self.clear_texture();
+        true
+    }
+
+    fn step_tilt(&mut self, delta: isize) -> bool {
+        let Some(volume) = self.volume.as_ref() else {
+            return false;
+        };
+        let cuts = displayable_cuts_for_product(volume, &self.selected_product);
+        let Some(next_cut) = stepped_cut(&cuts, self.selected_cut, delta) else {
+            return false;
+        };
+        if self.selected_cut == next_cut {
+            return false;
+        }
+        self.selected_cut = next_cut;
+        self.sanitize_selection();
+        self.clear_texture();
+        true
     }
 
     fn poll_async_render(&mut self, ctx: &egui::Context) {
@@ -1104,9 +1571,13 @@ impl ViewerApp {
         let Some((viewport_options, viewport_key)) = self.viewport_raster_options(ctx, rect) else {
             return;
         };
+        let color_table_signature = self
+            .color_tables
+            .signature_for_family(self.selected_product.color_family());
         let key = TextureKey {
             cut: self.selected_cut,
             product: self.selected_product.clone(),
+            color_table_signature,
             storm_motion_key: self.storm_motion_key(),
             viewport: viewport_key,
         };
@@ -1124,6 +1595,7 @@ impl ViewerApp {
                 volume,
                 cut: self.selected_cut,
                 product: self.selected_product.clone(),
+                color_tables: self.color_tables.clone(),
                 storm_motion: self.current_storm_motion(),
                 viewport_options,
                 radar_range_km: self
@@ -1168,14 +1640,39 @@ impl ViewerApp {
 
         let volume_ptr = Arc::as_ptr(&request.volume) as usize;
         let base_moment = request.product.base_moment();
+        let dealiased_velocity = request.product.uses_dealiased_velocity();
+        let color_table_signature = request.key.color_table_signature;
         let cached_volume_ptr = moment_caches.first().map(|cached| cached.volume_ptr);
         if cached_volume_ptr.is_some_and(|cached_volume_ptr| cached_volume_ptr != volume_ptr) {
             moment_caches.clear();
             sample_caches.clear();
             last_direct_viewports.clear();
         }
-        if Self::touch_moment_cache(moment_caches, volume_ptr, request.cut, &base_moment).is_none()
+        if Self::touch_moment_cache(
+            moment_caches,
+            volume_ptr,
+            request.cut,
+            &base_moment,
+            dealiased_velocity,
+            color_table_signature,
+        )
+        .is_none()
         {
+            let cache = if dealiased_velocity {
+                ViewportMomentCache::new_dealiased_velocity_with_color_tables(
+                    request.volume.as_ref(),
+                    request.cut,
+                    &request.color_tables,
+                )
+            } else {
+                ViewportMomentCache::new_with_color_tables(
+                    request.volume.as_ref(),
+                    request.cut,
+                    base_moment.clone(),
+                    &request.color_tables,
+                )
+            }
+            .map_err(|err| err.to_string())?;
             Self::insert_moment_cache(
                 moment_caches,
                 cache_policy,
@@ -1183,12 +1680,9 @@ impl ViewerApp {
                     volume_ptr,
                     cut: request.cut,
                     moment: base_moment.clone(),
-                    cache: ViewportMomentCache::new(
-                        request.volume.as_ref(),
-                        request.cut,
-                        base_moment.clone(),
-                    )
-                    .map_err(|err| err.to_string())?,
+                    dealiased_velocity,
+                    color_table_signature,
+                    cache,
                     storm_palette_cache: None,
                 },
             );
@@ -1201,6 +1695,7 @@ impl ViewerApp {
             volume_ptr,
             request.cut,
             base_moment.clone(),
+            color_table_signature,
             request.key.viewport,
         );
 
@@ -1394,6 +1889,7 @@ impl ViewerApp {
             Arc::as_ptr(&request.volume) as usize,
             request.cut,
             request.product.base_moment(),
+            request.key.color_table_signature,
             request.key.viewport,
         );
         if Self::touch_sample_cache(sample_caches, &signature) {
@@ -1404,6 +1900,8 @@ impl ViewerApp {
             signature.volume_ptr,
             signature.cut,
             &signature.moment,
+            request.product.uses_dealiased_velocity(),
+            signature.color_table_signature,
         ) else {
             return;
         };
@@ -1445,18 +1943,33 @@ impl ViewerApp {
         }
 
         let volume_ptr = Arc::as_ptr(&request.volume) as usize;
+        let velocity_color_table_signature = request
+            .color_tables
+            .signature_for_family(ColorTableFamily::Velocity);
         let signature = RenderWorkerViewportSignature::new(
             volume_ptr,
             cut,
             MomentType::Velocity,
+            velocity_color_table_signature,
             request.key.viewport,
         );
 
-        if Self::touch_moment_cache(moment_caches, volume_ptr, cut, &MomentType::Velocity).is_none()
+        if Self::touch_moment_cache(
+            moment_caches,
+            volume_ptr,
+            cut,
+            &MomentType::Velocity,
+            false,
+            velocity_color_table_signature,
+        )
+        .is_none()
         {
-            let Ok(cache) =
-                ViewportMomentCache::new(request.volume.as_ref(), cut, MomentType::Velocity)
-            else {
+            let Ok(cache) = ViewportMomentCache::new_with_color_tables(
+                request.volume.as_ref(),
+                cut,
+                MomentType::Velocity,
+                &request.color_tables,
+            ) else {
                 return;
             };
             Self::insert_moment_cache(
@@ -1466,6 +1979,8 @@ impl ViewerApp {
                     volume_ptr,
                     cut,
                     moment: MomentType::Velocity,
+                    dealiased_velocity: false,
+                    color_table_signature: velocity_color_table_signature,
                     cache,
                     storm_palette_cache: None,
                 },
@@ -1486,9 +2001,14 @@ impl ViewerApp {
             Self::insert_sample_cache(sample_caches, cache_policy, signature, cache);
         }
 
-        let Some(moment_index) =
-            Self::touch_moment_cache(moment_caches, volume_ptr, cut, &MomentType::Velocity)
-        else {
+        let Some(moment_index) = Self::touch_moment_cache(
+            moment_caches,
+            volume_ptr,
+            cut,
+            &MomentType::Velocity,
+            false,
+            velocity_color_table_signature,
+        ) else {
             return;
         };
         let moment_cache = &mut moment_caches[moment_index];
@@ -1519,9 +2039,15 @@ impl ViewerApp {
         volume_ptr: usize,
         cut: usize,
         moment: &MomentType,
+        dealiased_velocity: bool,
+        color_table_signature: u64,
     ) -> Option<usize> {
         let index = moment_caches.iter().position(|cached| {
-            cached.volume_ptr == volume_ptr && cached.cut == cut && cached.moment == *moment
+            cached.volume_ptr == volume_ptr
+                && cached.cut == cut
+                && cached.moment == *moment
+                && cached.dealiased_velocity == dealiased_velocity
+                && cached.color_table_signature == color_table_signature
         })?;
         let cached = moment_caches.remove(index);
         moment_caches.push(cached);
@@ -1537,6 +2063,7 @@ impl ViewerApp {
             cached.volume_ptr != cache.volume_ptr
                 || cached.cut != cache.cut
                 || cached.moment != cache.moment
+                || cached.dealiased_velocity != cache.dealiased_velocity
         });
         moment_caches.push(cache);
         while moment_caches.len() > cache_policy.moment_cache_capacity() {
@@ -1646,7 +2173,7 @@ impl ViewerApp {
             .as_ref()
             .is_some_and(|old_key| old_key.viewport.dimensions() == key.viewport.dimensions());
         if can_update_texture && let Some(texture) = &mut self.texture {
-            texture.set(color_image, egui::TextureOptions::NEAREST);
+            texture.set(color_image, radar_texture_options());
         } else {
             self.texture = Some(ctx.load_texture(
                 format!(
@@ -1657,7 +2184,7 @@ impl ViewerApp {
                     key.viewport.height
                 ),
                 color_image,
-                egui::TextureOptions::NEAREST,
+                radar_texture_options(),
             ));
         }
         let texture_ms = texture_start.elapsed().as_secs_f32() * 1000.0;
@@ -1694,7 +2221,7 @@ impl ViewerApp {
         let radar_y_px = (radar_position.y - rect.top()) * pixels_per_point;
         let km_per_px_y = 111.32 / (self.map_scale * pixels_per_point);
         let km_per_px_x = 111.32 * radar_lat.to_radians().cos().abs().max(0.02)
-            / (self.map_scale * pixels_per_point);
+            / (self.map_scale * self.lon_screen_scale() * pixels_per_point);
         let options = ViewportRasterOptions {
             width,
             height,
@@ -1738,14 +2265,6 @@ impl ViewerApp {
         }
     }
 
-    fn center_loaded_volume(&mut self) {
-        if let Some((latitude_deg, longitude_deg)) = self.loaded_volume_location() {
-            self.center_map_on(latitude_deg, longitude_deg);
-        } else {
-            self.center_selected_site();
-        }
-    }
-
     fn center_map_on(&mut self, latitude_deg: f32, longitude_deg: f32) {
         if latitude_deg.is_finite() && longitude_deg.is_finite() {
             self.map_center_lat = latitude_deg.clamp(-85.0, 85.0);
@@ -1770,6 +2289,32 @@ impl ViewerApp {
             direction_deg: self.storm_motion_direction_deg.rem_euclid(360.0),
             speed_mps: self.storm_motion_speed_kt.max(0.0) * KNOT_TO_MPS,
         }
+    }
+
+    fn dealiased_velocity_readout_grid(
+        &mut self,
+        volume: &RadarVolume,
+        cut_index: usize,
+    ) -> Option<Arc<MomentGrid>> {
+        let volume_ptr = volume as *const RadarVolume as usize;
+        if let Some(cache) = &self.dealiased_readout_cache
+            && cache.volume_ptr == volume_ptr
+            && cache.cut_index == cut_index
+        {
+            return Some(Arc::clone(&cache.grid));
+        }
+
+        let cut = volume.cuts.get(cut_index)?;
+        let source_grid = cut.moments.get(&MomentType::Velocity)?;
+        let grid = Arc::new(dealias_velocity_grid(cut, source_grid));
+        self.dealiased_readout_cache = Some(DealiasedReadoutCache {
+            volume_ptr,
+            cut_index,
+            grid,
+        });
+        self.dealiased_readout_cache
+            .as_ref()
+            .map(|cache| Arc::clone(&cache.grid))
     }
 
     fn storm_motion_key(&self) -> (i16, i16) {
@@ -1808,26 +2353,89 @@ impl ViewerApp {
         ctx.request_repaint_after(Duration::from_millis(8));
     }
 
-    fn load_latest_level2_for_selected_site(&mut self) {
+    fn load_latest_level2_for_selected_site(&mut self, ctx: &egui::Context) {
         let Some(site) = self.selected_site().cloned() else {
             self.status = "No site selected".to_owned();
             return;
         };
 
-        self.start_latest_level2_load(site);
+        self.start_latest_level2_load(site, ctx);
     }
 
-    fn start_latest_level2_load(&mut self, site: RadarSite) {
+    fn start_latest_level2_load(&mut self, site: RadarSite, ctx: &egui::Context) {
+        self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::User);
+    }
+
+    fn start_latest_level2_load_with_mode(
+        &mut self,
+        site: RadarSite,
+        ctx: &egui::Context,
+        mode: LatestLoadMode,
+    ) {
         let site_id = site.level2_id.clone();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(site_id.clone());
-        self.status = format!("Loading latest L2 {site_id}");
+        self.last_realtime_level2_refresh = Some(Instant::now());
+        self.status = if mode == LatestLoadMode::AutoRefresh {
+            format!("Refreshing realtime L2 {site_id}")
+        } else {
+            format!("Loading latest L2 {site_id}")
+        };
+        let current_source_path =
+            (mode == LatestLoadMode::AutoRefresh).then(|| self.source_path.clone());
+        if should_clear_display_for_latest_load(self.volume.as_deref(), &site_id, Utc::now()) {
+            self.clear_displayed_volume_for_pending_load(ctx);
+        }
 
         thread::spawn(move || {
             let total_start = Instant::now();
-            let mut timings = LoadTimings::default();
-            let result = (|| {
+            let site_cache_dir = cache_dir(&site.level2_id);
+
+            let final_update = (|| -> Result<AsyncLoadUpdate, String> {
+                let realtime_result = (|| -> Result<DecodedLoad, String> {
+                    let mut realtime_timings = LoadTimings::default();
+                    let lookup_start = Instant::now();
+                    let realtime = data_source::latest_realtime_level2_volume(&site.level2_id)
+                        .map_err(|err| err.to_string())?;
+                    realtime_timings.lookup_ms =
+                        Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
+                    realtime_timings.lookup_cache_hit = Some(false);
+
+                    let fetch_start = Instant::now();
+                    let downloaded =
+                        data_source::download_realtime_volume(&realtime, &site_cache_dir)
+                            .map_err(|err| err.to_string())?;
+                    realtime_timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
+                    realtime_timings.fetch_cache_hit = Some(downloaded.cache_hit);
+                    if is_unchanged_realtime_refresh(
+                        downloaded.cache_hit,
+                        &downloaded.path,
+                        current_source_path.as_deref(),
+                    ) {
+                        return Err("realtime chunks unchanged".to_owned());
+                    }
+
+                    let decoded = decode_load_path_with_optional_preview(
+                        downloaded.path,
+                        &format!("realtime L2 {site_id}"),
+                        total_start,
+                        realtime_timings,
+                        &sender,
+                        should_preview_loads(),
+                    )?;
+                    if global_displayable_products(&decoded.volume).is_empty() {
+                        return Err("realtime chunks are not displayable yet".to_owned());
+                    }
+                    Ok(decoded)
+                })();
+                if let Ok(decoded) = realtime_result {
+                    return Ok(AsyncLoadUpdate::Final(Ok(decoded)));
+                } else if mode == LatestLoadMode::AutoRefresh {
+                    return Ok(AsyncLoadUpdate::Unchanged);
+                }
+
+                let mut timings = LoadTimings::default();
                 let lookup_start = Instant::now();
                 let latest = data_source::latest_level2_object_cached(
                     &site.level2_id,
@@ -1842,26 +2450,29 @@ impl ViewerApp {
                 let downloaded = data_source::download_object(
                     LEVEL2_ARCHIVE_BUCKET,
                     latest.object,
-                    &cache_dir(&site.level2_id),
+                    &site_cache_dir,
                 )
                 .map_err(|err| err.to_string())?;
                 timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
                 timings.fetch_cache_hit = Some(downloaded.cache_hit);
 
-                decode_load_path_with_optional_preview(
+                let decoded = decode_load_path_with_optional_preview(
                     downloaded.path,
                     &format!("L2 {site_id}"),
                     total_start,
                     timings,
                     &sender,
                     should_preview_loads(),
-                )
+                )?;
+                Ok(AsyncLoadUpdate::Final(Ok(decoded)))
             })();
+            let update = final_update.unwrap_or_else(|err| AsyncLoadUpdate::Final(Err(err)));
             let _ = sender.send(AsyncLoadResult {
                 label: format!("L2 {site_id}"),
-                update: AsyncLoadUpdate::Final(result),
+                update,
             });
         });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 }
 
@@ -1871,7 +2482,11 @@ impl eframe::App for ViewerApp {
         self.poll_async_site_catalog(&ctx);
         self.poll_async_load(&ctx);
         self.poll_async_render(&ctx);
+        self.poll_async_hazards(&ctx);
+        self.maybe_refresh_realtime_level2(&ctx);
+        self.maybe_refresh_live_hazards(&ctx);
         self.sanitize_selection();
+        self.handle_keyboard_navigation(&ctx);
 
         egui::Panel::top("top_bar")
             .exact_size(42.0)
@@ -1926,16 +2541,22 @@ impl ViewerApp {
             });
         if selected_site_index != self.selected_site_index {
             self.selected_site_index = selected_site_index;
-            self.center_selected_site();
         }
 
         ui.horizontal(|ui| {
-            if ui.button("Load Selected").clicked() {
-                self.load_latest_level2_for_selected_site();
+            if ui
+                .add_enabled(
+                    self.load_receiver.is_none(),
+                    egui::Button::new("Load Selected"),
+                )
+                .clicked()
+            {
+                self.load_latest_level2_for_selected_site(ui.ctx());
             }
             if ui.button("Center").clicked() {
                 self.center_selected_site();
             }
+            ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live");
         });
 
         ui.add_space(12.0);
@@ -2004,6 +2625,7 @@ impl ViewerApp {
                 }
             }
         });
+        self.active_product_color_picker(ui, ctx);
 
         if self.selected_product.is_storm_relative_velocity() {
             ui.add_space(8.0);
@@ -2032,14 +2654,13 @@ impl ViewerApp {
         }
 
         ui.add_space(12.0);
-        self.timing_readout(ui);
-
-        ui.add_space(12.0);
         ui.label("Tilt");
         egui::ScrollArea::vertical()
             .id_salt("tilt_list")
-            .max_height(390.0)
+            .auto_shrink([false, false])
+            .max_height(TILT_LIST_SCROLL_HEIGHT)
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 for (index, elevation_deg, radial_count, is_selected, has_selected_product) in
                     &cut_rows
                 {
@@ -2059,6 +2680,418 @@ impl ViewerApp {
                     }
                 }
             });
+
+        ui.add_space(12.0);
+        egui::ScrollArea::vertical()
+            .id_salt("side_panel_tools")
+            .auto_shrink([false, false])
+            .max_height(ui.available_height())
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.hazard_panel(ui);
+
+                ui.add_space(12.0);
+                self.color_table_panel(ui, ctx);
+
+                ui.add_space(12.0);
+                ui.checkbox(&mut self.show_performance_stats, "Stats");
+                if self.show_performance_stats {
+                    fixed_height_scroll(
+                        ui,
+                        "performance_stats_text",
+                        PERF_STATS_SCROLL_HEIGHT,
+                        |ui| {
+                            self.timing_readout(ui);
+                        },
+                    );
+                }
+            });
+    }
+
+    fn active_product_color_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let family = self.selected_product.color_family();
+        let current_name = self.color_tables.for_family(family).name().to_owned();
+        ui.add_space(6.0);
+        ui.label("Color");
+        egui::ComboBox::from_id_salt("active_product_color_preset")
+            .selected_text(&current_name)
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                for table in builtin_tables_for_family(family) {
+                    let table_name = table.name().to_owned();
+                    if ui
+                        .selectable_label(table_name == current_name, &table_name)
+                        .clicked()
+                    {
+                        self.color_table_target = family;
+                        self.color_tables.set_family(family, table);
+                        self.clear_texture();
+                        self.color_table_status =
+                            format!("Loaded {table_name} into {}", family.label());
+                        ctx.request_repaint();
+                    }
+                }
+            });
+    }
+
+    fn color_table_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label("Colors");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("color_table_target")
+                .selected_text(self.color_table_target.label())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for family in [
+                        ColorTableFamily::Velocity,
+                        ColorTableFamily::Reflectivity,
+                        ColorTableFamily::SpectrumWidth,
+                        ColorTableFamily::Generic,
+                    ] {
+                        ui.selectable_value(&mut self.color_table_target, family, family.label());
+                    }
+                });
+            if ui.button("Current").clicked() {
+                self.color_table_target = self.selected_product.color_family();
+            }
+        });
+
+        let table_name = self.color_tables.for_family(self.color_table_target).name();
+        ui.label(format!("{}: {table_name}", self.color_table_target.label()));
+        egui::ComboBox::from_id_salt("color_table_builtin_preset")
+            .selected_text("Built-ins")
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                for table in builtin_tables_for_family(self.color_table_target) {
+                    if ui.selectable_label(false, table.name()).clicked() {
+                        let table_name = table.name().to_owned();
+                        self.color_tables.set_family(self.color_table_target, table);
+                        self.clear_texture();
+                        self.color_table_status = format!(
+                            "Loaded {table_name} into {}",
+                            self.color_table_target.label()
+                        );
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        ui.add(
+            egui::TextEdit::singleline(&mut self.color_table_path_text)
+                .desired_width(220.0)
+                .hint_text("Color table path"),
+        );
+        ui.horizontal(|ui| {
+            let has_path = !self.color_table_path_text.trim().is_empty();
+            if ui
+                .add_enabled(has_path, egui::Button::new("Load Table"))
+                .clicked()
+            {
+                self.load_color_table_path(ctx);
+            }
+            if ui.button("Reset Slot").clicked() {
+                self.reset_color_table_slot(ctx);
+            }
+        });
+        fixed_height_scroll(ui, "color_table_status", COLOR_STATUS_SCROLL_HEIGHT, |ui| {
+            wrapped_label(ui, &self.color_table_status);
+        });
+    }
+
+    fn load_color_table_path(&mut self, ctx: &egui::Context) {
+        let path_text = self.color_table_path_text.trim().trim_matches('"');
+        if path_text.is_empty() {
+            self.color_table_status = "Choose a color table path".to_owned();
+            return;
+        }
+        let path = PathBuf::from(path_text);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.color_table_status = format!("Color table read failed: {err}");
+                return;
+            }
+        };
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("Custom color table");
+        let table = match ColorTable::parse(name, &text) {
+            Ok(table) => table,
+            Err(err) => {
+                self.color_table_status = format!("Color table parse failed: {err}");
+                return;
+            }
+        };
+        let table_name = table.name().to_owned();
+        let stop_count = table.stops().len();
+        self.color_tables.set_family(self.color_table_target, table);
+        self.clear_texture();
+        self.color_table_status = format!(
+            "Loaded {table_name} into {} ({stop_count} stops)",
+            self.color_table_target.label()
+        );
+        ctx.request_repaint();
+    }
+
+    fn reset_color_table_slot(&mut self, ctx: &egui::Context) {
+        let defaults = ColorTableSet::default();
+        let table = defaults.for_family(self.color_table_target).clone();
+        let table_name = table.name().to_owned();
+        self.color_tables.set_family(self.color_table_target, table);
+        self.clear_texture();
+        self.color_table_status =
+            format!("Reset {} to {table_name}", self.color_table_target.label());
+        ctx.request_repaint();
+    }
+
+    fn hazard_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label("Hazards");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.hazards_visible, "Show");
+            ui.checkbox(&mut self.hazards_active_only, "Active");
+            ui.checkbox(&mut self.live_hazard_auto_refresh, "Auto");
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (family, label) in HAZARD_FILTER_FAMILIES {
+                let mut visible = !self.hidden_hazard_families.contains(*family);
+                if ui.checkbox(&mut visible, *label).changed() {
+                    if visible {
+                        self.hidden_hazard_families.remove(*family);
+                    } else {
+                        self.hidden_hazard_families.insert((*family).to_owned());
+                    }
+                    if self
+                        .selected_hazard_record()
+                        .is_some_and(|record| !self.hazard_record_visible(record))
+                    {
+                        self.selected_hazard_index = None;
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
+        });
+        let mut fill_alpha = self.hazard_fill_alpha as f32;
+        if ui
+            .add(egui::Slider::new(&mut fill_alpha, 0.0..=80.0).text("Fill"))
+            .changed()
+        {
+            self.hazard_fill_alpha = fill_alpha.round() as u8;
+            ui.ctx().request_repaint();
+        }
+        ui.horizontal(|ui| {
+            let loading = self.hazard_receiver.is_some();
+            if ui
+                .add_enabled(!loading, egui::Button::new("Refresh Live"))
+                .clicked()
+            {
+                self.load_live_hazards(ui.ctx());
+            }
+            if ui.button("Clear").clicked() {
+                self.hazard_overlay = None;
+                self.selected_hazard_index = None;
+                self.hazard_status = "No hazard polygons loaded".to_owned();
+            }
+        });
+
+        if let Some(record) = self.selected_hazard_record() {
+            ui.add_space(6.0);
+            let detail_lines = hazard_record_detail_lines(record);
+            fixed_height_scroll(
+                ui,
+                "hazard_detail_text",
+                HAZARD_DETAIL_SCROLL_HEIGHT,
+                |ui| {
+                    for line in &detail_lines {
+                        wrapped_label(ui, line);
+                    }
+                },
+            );
+        }
+
+        let summary_lines = self.hazard_summary_lines();
+        fixed_height_scroll(
+            ui,
+            "hazard_summary_text",
+            HAZARD_SUMMARY_SCROLL_HEIGHT,
+            |ui| {
+                for line in &summary_lines {
+                    wrapped_label(ui, line);
+                }
+            },
+        );
+
+        egui::CollapsingHeader::new("Local file")
+            .id_salt("hazard_local_path_loader")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.hazard_path_text)
+                        .desired_width(220.0)
+                        .hint_text("Path"),
+                );
+                let loading = self.hazard_receiver.is_some();
+                if ui
+                    .add_enabled(!loading, egui::Button::new("Load Path"))
+                    .clicked()
+                {
+                    self.load_local_hazards(ui.ctx());
+                }
+            });
+    }
+
+    fn hazard_summary_lines(&self) -> Vec<String> {
+        let mut lines = vec![self.hazard_status.clone()];
+        if let Some(overlay) = &self.hazard_overlay {
+            lines.push(format!(
+                "{} scanned, {} parsed, {} polygons",
+                overlay.scanned_items, overlay.parsed_items, overlay.polygon_records
+            ));
+            lines.push(overlay.source_label.clone());
+            if overlay.error_count > 0 {
+                let issue_label = if overlay.error_count == 1 {
+                    "source issue"
+                } else {
+                    "source issues"
+                };
+                lines.push(format!("{} {issue_label}", overlay.error_count));
+            }
+            if let Some(query_time_utc) = &overlay.query_time_utc {
+                lines.push(format!("At {query_time_utc}"));
+            }
+        }
+        lines
+    }
+
+    fn selected_hazard_record(&self) -> Option<&HazardRecord> {
+        let overlay = self.hazard_overlay.as_ref()?;
+        let index = self.selected_hazard_index?;
+        overlay.records.get(index)
+    }
+
+    fn hazard_record_visible(&self, record: &HazardRecord) -> bool {
+        !self.hidden_hazard_families.contains(&record.event_family)
+            && (!self.hazards_active_only || hazard_record_is_active_or_pending(record))
+    }
+
+    fn hazard_at_position(&self, rect: egui::Rect, position: egui::Pos2) -> Option<usize> {
+        if !self.hazards_visible {
+            return None;
+        }
+        let overlay = self.hazard_overlay.as_ref()?;
+        let (lon, lat) = self.screen_to_lon_lat(rect, position);
+        let point = HazardPoint { lon, lat };
+        let mut best_containing = None::<(usize, f32, u8)>;
+        let mut best_near = None::<(usize, f32, f32, u8)>;
+        let mut best_label = None::<(usize, f32, f32, u8)>;
+        for (index, record) in overlay.records.iter().enumerate() {
+            if !self.hazard_record_visible(record) {
+                continue;
+            }
+            let screen_area = self.hazard_screen_area(rect, &record.points);
+            let family_order = hazard_family_order(&record.event_family);
+            if bbox_contains(record.bbox, point.lon, point.lat)
+                && hazard_polygon_contains_point(&record.points, point)
+            {
+                let candidate = (index, screen_area, family_order);
+                if best_containing.is_none_or(|best| {
+                    candidate
+                        .1
+                        .total_cmp(&best.1)
+                        .then_with(|| candidate.2.cmp(&best.2))
+                        .is_lt()
+                }) {
+                    best_containing = Some(candidate);
+                }
+                continue;
+            }
+
+            let edge_distance = self.hazard_screen_edge_distance(rect, &record.points, position);
+            if edge_distance <= HAZARD_CLICK_TOLERANCE_PX {
+                let candidate = (index, edge_distance, screen_area, family_order);
+                if best_near.is_none_or(|best| {
+                    candidate
+                        .1
+                        .total_cmp(&best.1)
+                        .then_with(|| candidate.2.total_cmp(&best.2))
+                        .then_with(|| candidate.3.cmp(&best.3))
+                        .is_lt()
+                }) {
+                    best_near = Some(candidate);
+                }
+            }
+
+            if self.map_scale >= 62.0 {
+                let label_center = self.hazard_screen_centroid(rect, &record.points);
+                let label_distance = label_center.distance(position);
+                if label_distance <= HAZARD_LABEL_CLICK_RADIUS_PX {
+                    let candidate = (index, label_distance, screen_area, family_order);
+                    if best_label.is_none_or(|best| {
+                        candidate
+                            .1
+                            .total_cmp(&best.1)
+                            .then_with(|| candidate.2.total_cmp(&best.2))
+                            .then_with(|| candidate.3.cmp(&best.3))
+                            .is_lt()
+                    }) {
+                        best_label = Some(candidate);
+                    }
+                }
+            }
+        }
+        best_containing
+            .map(|(index, _, _)| index)
+            .or_else(|| best_near.map(|(index, _, _, _)| index))
+            .or_else(|| best_label.map(|(index, _, _, _)| index))
+    }
+
+    fn hazard_screen_area(&self, rect: egui::Rect, points: &[HazardPoint]) -> f32 {
+        if points.len() < 3 {
+            return 0.0;
+        }
+        let mut area = 0.0f32;
+        let mut previous = self.lon_lat_to_screen(
+            rect,
+            points[points.len() - 1].lon,
+            points[points.len() - 1].lat,
+        );
+        for point in points {
+            let current = self.lon_lat_to_screen(rect, point.lon, point.lat);
+            area += previous.x * current.y - current.x * previous.y;
+            previous = current;
+        }
+        area.abs() * 0.5
+    }
+
+    fn hazard_screen_centroid(&self, rect: egui::Rect, points: &[HazardPoint]) -> egui::Pos2 {
+        let screen_points = points
+            .iter()
+            .map(|point| self.lon_lat_to_screen(rect, point.lon, point.lat))
+            .collect::<Vec<_>>();
+        polygon_screen_centroid(&screen_points)
+    }
+
+    fn hazard_screen_edge_distance(
+        &self,
+        rect: egui::Rect,
+        points: &[HazardPoint],
+        position: egui::Pos2,
+    ) -> f32 {
+        if points.len() < 2 {
+            return f32::INFINITY;
+        }
+        let mut previous = self.lon_lat_to_screen(
+            rect,
+            points[points.len() - 1].lon,
+            points[points.len() - 1].lat,
+        );
+        let mut best_distance_sq = f32::INFINITY;
+        for point in points {
+            let current = self.lon_lat_to_screen(rect, point.lon, point.lat);
+            best_distance_sq =
+                best_distance_sq.min(point_segment_distance_sq(position, previous, current));
+            previous = current;
+        }
+        best_distance_sq.sqrt()
     }
 
     fn timing_readout(&self, ui: &mut egui::Ui) {
@@ -2152,9 +3185,11 @@ impl ViewerApp {
 
         if response.dragged() {
             let delta = response.drag_delta();
-            self.map_center_lon -= delta.x / self.map_scale;
-            self.map_center_lat += delta.y / self.map_scale;
-            self.clamp_map_center();
+            if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
+                self.map_center_lon -= delta.x / self.lon_pixels_per_degree();
+                self.map_center_lat += delta.y / self.map_scale;
+                self.clamp_map_center();
+            }
         }
 
         if response.hovered() {
@@ -2172,11 +3207,12 @@ impl ViewerApp {
                 self.clamp_map_center();
             }
         }
-        self.cursor_readout = response
+        let cursor_readout = response
             .hovered()
             .then(|| ui.input(|input| input.pointer.hover_pos()))
             .flatten()
             .and_then(|position| self.cursor_readout_at(rect, position));
+        self.cursor_readout = cursor_readout;
 
         let basemap_start = Instant::now();
         self.draw_basemap(&painter, rect);
@@ -2186,6 +3222,7 @@ impl ViewerApp {
         self.draw_radar_layer(&painter, rect);
         let overlay_start = Instant::now();
         self.draw_basemap_overlay(&painter, rect);
+        self.draw_hazard_overlays(&painter, rect);
         self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
 
         let site_points = self
@@ -2212,7 +3249,6 @@ impl ViewerApp {
                 .min_by(|left, right| left.1.total_cmp(&right.1))
         {
             self.selected_site_index = index;
-            self.center_selected_site();
         }
 
         if response.secondary_clicked()
@@ -2221,8 +3257,14 @@ impl ViewerApp {
             && let Some(site) = self.sites.get(index).cloned()
         {
             self.selected_site_index = index;
-            self.center_selected_site();
-            self.start_latest_level2_load(site);
+            self.start_latest_level2_load(site, ui.ctx());
+        }
+
+        if response.clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+            && let Some(index) = self.hazard_at_position(rect, pointer)
+        {
+            self.selected_hazard_index = Some(index);
         }
 
         self.draw_site_markers(&painter, &site_points);
@@ -2254,6 +3296,67 @@ impl ViewerApp {
             egui::Color32::WHITE,
         );
         self.draw_range_ring(painter, rect, latitude_deg, longitude_deg);
+    }
+
+    fn draw_hazard_overlays(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.hazards_visible {
+            return;
+        }
+        let Some(overlay) = &self.hazard_overlay else {
+            return;
+        };
+        let bounds = self.visible_geo_bounds(rect).expand(0.05);
+        for (index, record) in overlay.records.iter().enumerate() {
+            if !self.hazard_record_visible(record) || !bounds.intersects_bbox(record.bbox) {
+                continue;
+            }
+            let points = record
+                .points
+                .iter()
+                .map(|point| self.lon_lat_to_screen(rect, point.lon, point.lat))
+                .collect::<Vec<_>>();
+            if points.len() < 3 {
+                continue;
+            }
+            let selected = self.selected_hazard_index == Some(index);
+            let color = hazard_color(record);
+            let fill_alpha = if selected {
+                self.hazard_fill_alpha.saturating_add(20).min(100)
+            } else {
+                self.hazard_fill_alpha
+            };
+            let fill =
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), fill_alpha);
+            let stroke = egui::Stroke::new(
+                if selected { 2.4 } else { 1.5 },
+                egui::Color32::from_rgba_unmultiplied(
+                    color.r(),
+                    color.g(),
+                    color.b(),
+                    if selected { 245 } else { 205 },
+                ),
+            );
+            if is_convex_screen_polygon(&points) {
+                painter.add(egui::Shape::convex_polygon(points.clone(), fill, stroke));
+            } else {
+                if let Some(mesh) = filled_polygon_mesh(&points, fill) {
+                    painter.add(egui::Shape::mesh(mesh));
+                }
+                painter.add(egui::Shape::closed_line(points.clone(), stroke));
+            }
+            let center = polygon_screen_centroid(&points);
+            if rect.expand(24.0).contains(center) && self.map_scale >= 62.0 {
+                draw_halo_text(
+                    painter,
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    &record.label,
+                    egui::FontId::proportional(if selected { 12.0 } else { 11.0 }),
+                    egui::Color32::from_rgb(245, 248, 250),
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+                );
+            }
+        }
     }
 
     fn draw_basemap(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -2593,7 +3696,7 @@ impl ViewerApp {
         let lon_max = west.max(east);
         let lat_min = south.min(north).clamp(-85.0, 85.0);
         let lat_max = south.max(north).clamp(-85.0, 85.0);
-        let step = graticule_step(rect.width() / self.map_scale);
+        let step = graticule_step(rect.width() / self.lon_pixels_per_degree());
         let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(28, 38, 50));
         let label_color = egui::Color32::from_rgb(92, 108, 124);
 
@@ -2710,11 +3813,22 @@ impl ViewerApp {
         nearest_site_index(&self.sites, target_lat, target_lon)
     }
 
-    fn cursor_readout_at(&self, rect: egui::Rect, position: egui::Pos2) -> Option<CursorReadout> {
-        let volume = self.volume.as_ref()?;
-        let cut = volume.cuts.get(self.selected_cut)?;
-        let base_moment = self.selected_product.base_moment();
-        let grid = cut.moments.get(&base_moment)?;
+    fn cursor_readout_at(
+        &mut self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> Option<CursorReadout> {
+        let volume = self.volume.clone()?;
+        let selected_cut = self.selected_cut;
+        let selected_product = self.selected_product.clone();
+        let cut = volume.cuts.get(selected_cut)?;
+        let base_moment = selected_product.base_moment();
+        let source_grid = cut.moments.get(&base_moment)?;
+        let dealiased_grid = selected_product
+            .uses_dealiased_velocity()
+            .then(|| self.dealiased_velocity_readout_grid(volume.as_ref(), selected_cut))
+            .flatten();
+        let grid = dealiased_grid.as_deref().unwrap_or(source_grid);
         let (radar_lat, radar_lon) = self.loaded_volume_location()?;
         let (target_lon, target_lat) = self.screen_to_lon_lat(rect, position);
         let lat_km = (target_lat - radar_lat) * 111.32;
@@ -2732,21 +3846,22 @@ impl ViewerApp {
         let (row, radial_index) = nearest_grid_row(cut, grid, azimuth_deg)?;
         let gate = gate_for_range(grid, range_km)?;
         let base_value = grid.scaled_value(row, gate)?;
-        let raw = grid_raw_value(grid, row, gate);
+        let raw = (!selected_product.uses_dealiased_velocity())
+            .then(|| grid_raw_value(grid, row, gate))
+            .flatten();
         let radial = cut.radials.get(radial_index)?;
-        let value = if self.selected_product.is_storm_relative_velocity() {
+        let value = if selected_product.is_storm_relative_velocity() {
             storm_relative_velocity_mps(base_value, radial.azimuth_deg, self.current_storm_motion())
         } else {
             base_value
         };
         let storm_motion = self.current_storm_motion();
-        let vrot = velocity_vrot_probe(cut, grid, row, gate, &self.selected_product, storm_motion);
+        let vrot = velocity_vrot_probe(cut, grid, row, gate, &selected_product, storm_motion);
         Some(CursorReadout {
-            product: self.selected_product.clone(),
-            cut: self.selected_cut,
+            product: selected_product.clone(),
+            cut: selected_cut,
             value,
-            base_value: self
-                .selected_product
+            base_value: selected_product
                 .is_storm_relative_velocity()
                 .then_some(base_value),
             vrot,
@@ -2769,14 +3884,18 @@ impl ViewerApp {
         latitude_deg: f32,
     ) -> egui::Pos2 {
         egui::pos2(
-            rect.center().x + (longitude_deg - self.map_center_lon) * self.map_scale,
+            rect.center().x
+                + longitude_delta_deg(longitude_deg, self.map_center_lon)
+                    * self.lon_pixels_per_degree(),
             rect.center().y - (latitude_deg - self.map_center_lat) * self.map_scale,
         )
     }
 
     fn screen_to_lon_lat(&self, rect: egui::Rect, position: egui::Pos2) -> (f32, f32) {
         (
-            self.map_center_lon + (position.x - rect.center().x) / self.map_scale,
+            normalize_lon(
+                self.map_center_lon + (position.x - rect.center().x) / self.lon_pixels_per_degree(),
+            ),
             self.map_center_lat - (position.y - rect.center().y) / self.map_scale,
         )
     }
@@ -2795,6 +3914,14 @@ impl ViewerApp {
     fn clamp_map_center(&mut self) {
         self.map_center_lon = normalize_lon(self.map_center_lon);
         self.map_center_lat = self.map_center_lat.clamp(-85.0, 85.0);
+    }
+
+    fn lon_screen_scale(&self) -> f32 {
+        self.map_center_lat.to_radians().cos().abs().max(0.02)
+    }
+
+    fn lon_pixels_per_degree(&self) -> f32 {
+        self.map_scale * self.lon_screen_scale()
     }
 }
 
@@ -2880,6 +4007,7 @@ impl GeoBounds {
 struct TextureKey {
     cut: usize,
     product: DisplayProduct,
+    color_table_signature: u64,
     storm_motion_key: (i16, i16),
     viewport: ViewportKey,
 }
@@ -2974,10 +4102,7 @@ fn velocity_vrot_probe(
     product: &DisplayProduct,
     storm_motion: StormMotion,
 ) -> Option<VrotProbe> {
-    if !matches!(
-        product,
-        DisplayProduct::Moment(MomentType::Velocity) | DisplayProduct::StormRelativeVelocity
-    ) {
+    if product.base_moment() != MomentType::Velocity {
         return None;
     }
     if grid.gate_range.gate_count == 0 || grid.radial_indices.is_empty() {
@@ -3082,6 +4207,97 @@ fn gate_center_range_km(grid: &MomentGrid, gate: usize) -> f32 {
     (first_gate_m + spacing_m * gate as f32) / 1000.0
 }
 
+fn default_hidden_hazard_families() -> BTreeSet<String> {
+    DEFAULT_HIDDEN_HAZARD_FAMILIES
+        .iter()
+        .map(|family| (*family).to_owned())
+        .collect()
+}
+
+fn hazard_record_is_active_or_pending(record: &HazardRecord) -> bool {
+    matches!(
+        record.lifecycle_status.as_deref(),
+        Some("Active") | Some("Pending") | None
+    )
+}
+
+fn fixed_height_scroll(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, height));
+            egui::ScrollArea::vertical()
+                .id_salt(id)
+                .auto_shrink([false, false])
+                .max_height(height)
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    add_contents(ui);
+                });
+        },
+    );
+}
+
+fn wrapped_label(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(text).wrap());
+}
+
+fn hazard_record_detail_lines(record: &HazardRecord) -> Vec<String> {
+    let mut lines = vec![
+        record.label.clone(),
+        record.event_id.clone(),
+        format!("{} {}", record.office, record.action),
+    ];
+    if let Some(status) = &record.lifecycle_status {
+        lines.push(status.clone());
+    }
+    if let Some(headline) = &record.headline {
+        lines.push(headline.clone());
+    }
+    if let Some(area) = &record.area {
+        lines.push(format!("Area {area}"));
+    }
+    if let Some(motion) = &record.motion {
+        lines.push(format!("Motion {motion}"));
+    }
+    lines.extend(record.details.iter().cloned());
+    if record.severity.is_some() || record.certainty.is_some() || record.urgency.is_some() {
+        let severity = record.severity.as_deref().unwrap_or("-");
+        let certainty = record.certainty.as_deref().unwrap_or("-");
+        let urgency = record.urgency.as_deref().unwrap_or("-");
+        lines.push(format!("{severity} / {certainty} / {urgency}"));
+    }
+    if let Some(source_url) = &record.source_url {
+        lines.push(source_url.clone());
+    }
+    if let Some(tornado) = &record.tornado {
+        lines.push(format!("Tornado {tornado}"));
+    }
+    if let Some(hail_inches) = record.hail_inches {
+        lines.push(format!("Hail {:.2} in", hail_inches));
+    }
+    if let Some(wind_mph) = record.wind_mph {
+        lines.push(format!("Wind {wind_mph} mph"));
+    }
+    if let Some(damage_threat) = &record.damage_threat {
+        lines.push(format!("Damage {damage_threat}"));
+    }
+    if let Some(valid_start) = &record.valid_start {
+        lines.push(format!("From {valid_start}"));
+    }
+    if let Some(valid_end) = &record.valid_end {
+        lines.push(format!("Until {valid_end}"));
+    }
+    lines
+}
+
 fn angle_delta_deg(left: f32, right: f32) -> f32 {
     let delta = (left - right).abs().rem_euclid(360.0);
     delta.min(360.0 - delta)
@@ -3102,7 +4318,9 @@ fn moment_units(moment: &MomentType) -> &'static str {
 fn product_units(product: &DisplayProduct) -> &'static str {
     match product {
         DisplayProduct::Moment(moment) => moment_units(moment),
-        DisplayProduct::StormRelativeVelocity => "m/s",
+        DisplayProduct::DealiasedVelocity
+        | DisplayProduct::StormRelativeVelocity
+        | DisplayProduct::StormRelativeDealiasedVelocity => "m/s",
     }
 }
 
@@ -3281,6 +4499,10 @@ fn normalize_lon(longitude_deg: f32) -> f32 {
     longitude_deg
 }
 
+fn longitude_delta_deg(longitude_deg: f32, reference_longitude_deg: f32) -> f32 {
+    normalize_lon(longitude_deg - reference_longitude_deg)
+}
+
 fn haversine_km(lat_a: f32, lon_a: f32, lat_b: f32, lon_b: f32) -> f32 {
     let earth_radius_km = 6371.0_f32;
     let d_lat = (lat_b - lat_a).to_radians();
@@ -3318,7 +4540,9 @@ fn product_order(available: &std::collections::BTreeSet<MomentType>) -> Vec<Disp
         if available.contains(&moment) {
             if moment == MomentType::Velocity {
                 ordered.push(DisplayProduct::Moment(MomentType::Velocity));
+                ordered.push(DisplayProduct::DealiasedVelocity);
                 ordered.push(DisplayProduct::StormRelativeVelocity);
+                ordered.push(DisplayProduct::StormRelativeDealiasedVelocity);
             } else {
                 ordered.push(DisplayProduct::Moment(moment));
             }
@@ -3345,6 +4569,1713 @@ fn global_displayable_products(volume: &RadarVolume) -> Vec<DisplayProduct> {
     product_order(&available)
 }
 
+struct LiveHazardSourceMessage {
+    source_label: String,
+    result: Result<SpcMdLoad, String>,
+}
+
+fn load_live_hazard_overlay_with_preview<F>(
+    query_time_utc: DateTime<Utc>,
+    mut on_preview: F,
+) -> Result<HazardOverlay, String>
+where
+    F: FnMut(HazardOverlay),
+{
+    let start = Instant::now();
+    let mut records = Vec::new();
+    let mut scanned_items = 0usize;
+    let mut parsed_items = 0usize;
+    let mut error_count = 0usize;
+    let mut source_labels = Vec::<String>::new();
+    let mut first_error = None::<String>;
+
+    thread::scope(|scope| {
+        let (source_sender, source_receiver) = mpsc::channel::<LiveHazardSourceMessage>();
+
+        let active_sender = source_sender.clone();
+        scope.spawn(move || {
+            send_live_hazard_source_load(
+                active_sender,
+                "NWS active alerts".to_owned(),
+                "NWS active alert worker panicked",
+                || load_weather_gov_active_alerts(query_time_utc),
+            );
+        });
+
+        for &product_type in HOT_TEXT_PRODUCT_TYPES {
+            let hot_text_sender = source_sender.clone();
+            scope.spawn(move || {
+                send_live_hazard_source_load(
+                    hot_text_sender,
+                    format!("NWS {product_type} text"),
+                    "Hot NWS product type worker panicked",
+                    || fetch_hot_text_product_type(product_type, query_time_utc),
+                );
+            });
+        }
+
+        let spc_md_sender = source_sender.clone();
+        scope.spawn(move || {
+            send_live_hazard_source_load(
+                spc_md_sender,
+                "SPC current MDs".to_owned(),
+                "SPC MD fetch worker panicked",
+                || load_spc_mesoscale_discussions(query_time_utc),
+            );
+        });
+
+        drop(source_sender);
+
+        for message in source_receiver {
+            match message.result {
+                Ok(mut load) => {
+                    scanned_items += load.scanned_items;
+                    parsed_items += load.parsed_items;
+                    error_count += load.error_count;
+                    if !load.records.is_empty() {
+                        if !source_labels
+                            .iter()
+                            .any(|label| label == &message.source_label)
+                        {
+                            source_labels.push(message.source_label);
+                        }
+                        records.append(&mut load.records);
+                        on_preview(build_live_hazard_overlay(
+                            source_labels.join(" + "),
+                            query_time_utc,
+                            scanned_items,
+                            parsed_items,
+                            error_count,
+                            start,
+                            records.clone(),
+                        ));
+                    }
+                }
+                Err(err) => {
+                    error_count += 1;
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+    });
+
+    if records.is_empty()
+        && let Some(err) = first_error
+    {
+        return Err(err);
+    }
+
+    Ok(build_live_hazard_overlay(
+        "NWS active alerts + hot NWS text + SPC current MDs".to_owned(),
+        query_time_utc,
+        scanned_items,
+        parsed_items,
+        error_count,
+        start,
+        records,
+    ))
+}
+
+fn send_live_hazard_source_load<F>(
+    sender: mpsc::Sender<LiveHazardSourceMessage>,
+    source_label: String,
+    panic_message: &'static str,
+    loader: F,
+) where
+    F: FnOnce() -> Result<SpcMdLoad, String>,
+{
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(loader))
+        .unwrap_or_else(|_| Err(panic_message.to_owned()));
+    let _ = sender.send(LiveHazardSourceMessage {
+        source_label,
+        result,
+    });
+}
+
+fn load_weather_gov_active_alerts(query_time_utc: DateTime<Utc>) -> Result<SpcMdLoad, String> {
+    let text = data_source::fetch_text(ACTIVE_ALERTS_URL)
+        .map_err(|err| format!("Live hazard fetch failed: {err}"))?;
+    let collection: WeatherAlertFeatureCollection = serde_json::from_str(&text)
+        .map_err(|err| format!("Live hazard JSON parse failed: {err}"))?;
+    let mut records = Vec::new();
+    let mut parsed_items = 0usize;
+    let mut error_count = 0usize;
+
+    for feature in &collection.features {
+        match parse_weather_alert_feature(feature, query_time_utc) {
+            Ok(mut feature_records) => {
+                if !feature_records.is_empty() {
+                    parsed_items += 1;
+                    records.append(&mut feature_records);
+                }
+            }
+            Err(_) => {
+                error_count += 1;
+            }
+        }
+    }
+
+    Ok(SpcMdLoad {
+        scanned_items: collection.features.len(),
+        parsed_items,
+        error_count,
+        records,
+    })
+}
+
+fn build_live_hazard_overlay(
+    source_label: String,
+    query_time_utc: DateTime<Utc>,
+    scanned_items: usize,
+    parsed_items: usize,
+    error_count: usize,
+    start: Instant,
+    mut records: Vec<HazardRecord>,
+) -> HazardOverlay {
+    records.retain(hazard_record_is_active_or_pending);
+    dedupe_hazard_records(&mut records);
+    sort_hazard_records(&mut records);
+
+    HazardOverlay {
+        source_label,
+        query_time_utc: Some(format_utc_seconds(query_time_utc)),
+        scanned_items,
+        parsed_items,
+        polygon_records: records.len(),
+        error_count,
+        load_ms: start.elapsed().as_secs_f32() * 1000.0,
+        records,
+    }
+}
+
+fn load_hazard_overlay_from_path(
+    path: &Path,
+    query_time_utc: Option<DateTime<Utc>>,
+) -> Result<HazardOverlay, String> {
+    let start = Instant::now();
+    let files = collect_hazard_files(path)?;
+    let mut records = Vec::new();
+    let mut parsed_files = 0usize;
+    let mut errors = 0usize;
+
+    for file in &files {
+        match std::fs::read(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let before = records.len();
+                records.extend(parse_hazard_records_from_text(file, &text, query_time_utc));
+                if records.len() > before {
+                    parsed_files += 1;
+                }
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+    }
+
+    sort_hazard_records(&mut records);
+
+    Ok(HazardOverlay {
+        source_label: path.display().to_string(),
+        query_time_utc: query_time_utc.map(format_utc_seconds),
+        scanned_items: files.len(),
+        parsed_items: parsed_files,
+        polygon_records: records.len(),
+        error_count: errors,
+        load_ms: start.elapsed().as_secs_f32() * 1000.0,
+        records,
+    })
+}
+
+fn sort_hazard_records(records: &mut [HazardRecord]) {
+    records.sort_by(|left, right| {
+        hazard_family_order(&left.event_family)
+            .cmp(&hazard_family_order(&right.event_family))
+            .then_with(|| left.valid_end.cmp(&right.valid_end))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+}
+
+fn selected_hazard_index_for_event_id(
+    records: &[HazardRecord],
+    selected_event_id: Option<&str>,
+) -> Option<usize> {
+    let selected_event_id = selected_event_id?;
+    records
+        .iter()
+        .position(|record| record.event_id == selected_event_id)
+}
+
+fn hazard_overlay_records_match(left: &HazardOverlay, right: &HazardOverlay) -> bool {
+    left.records == right.records
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HazardOverlayChange {
+    added: usize,
+    removed: usize,
+    geometry_changed: usize,
+}
+
+impl HazardOverlayChange {
+    fn is_empty(self) -> bool {
+        self.added == 0 && self.removed == 0 && self.geometry_changed == 0
+    }
+
+    fn status_text(self) -> String {
+        format!(
+            "+{} -{} {} moved",
+            self.added, self.removed, self.geometry_changed
+        )
+    }
+}
+
+fn hazard_overlay_change(left: &HazardOverlay, right: &HazardOverlay) -> HazardOverlayChange {
+    let left_records = left
+        .records
+        .iter()
+        .map(|record| (record.event_id.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
+    let right_records = right
+        .records
+        .iter()
+        .map(|record| (record.event_id.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut change = HazardOverlayChange::default();
+
+    for (event_id, right_record) in &right_records {
+        match left_records.get(event_id) {
+            Some(left_record) if hazard_record_geometry_matches(left_record, right_record) => {}
+            Some(_) => change.geometry_changed += 1,
+            None => change.added += 1,
+        }
+    }
+    for event_id in left_records.keys() {
+        if !right_records.contains_key(event_id) {
+            change.removed += 1;
+        }
+    }
+
+    change
+}
+
+fn hazard_record_geometry_matches(left: &HazardRecord, right: &HazardRecord) -> bool {
+    left.bbox == right.bbox && left.points == right.points
+}
+
+fn dedupe_hazard_records(records: &mut Vec<HazardRecord>) {
+    let mut unique = Vec::<HazardRecord>::with_capacity(records.len());
+    for record in records.drain(..) {
+        if let Some(existing) = unique
+            .iter_mut()
+            .find(|existing| existing.event_id == record.event_id)
+        {
+            *existing = merge_duplicate_hazard_record(existing, &record);
+        } else {
+            unique.push(record);
+        }
+    }
+    *records = unique;
+}
+
+fn merge_duplicate_hazard_record(
+    existing: &HazardRecord,
+    candidate: &HazardRecord,
+) -> HazardRecord {
+    let detail_source =
+        if hazard_record_detail_score(candidate) >= hazard_record_detail_score(existing) {
+            candidate
+        } else {
+            existing
+        };
+    let geometry_source = if existing.action == "ALERT" {
+        existing
+    } else if candidate.action == "ALERT" {
+        candidate
+    } else {
+        detail_source
+    };
+    let fallback_source = if std::ptr::eq(detail_source, existing) {
+        candidate
+    } else {
+        existing
+    };
+
+    let mut merged = detail_source.clone();
+    merged.points = geometry_source.points.clone();
+    merged.bbox = geometry_source.bbox;
+    if merged.source_url.is_none() {
+        merged.source_url = fallback_source.source_url.clone();
+    }
+    if merged.headline.is_none() {
+        merged.headline = fallback_source.headline.clone();
+    }
+    if merged.area.is_none() {
+        merged.area = fallback_source.area.clone();
+    }
+    if merged.motion.is_none() {
+        merged.motion = fallback_source.motion.clone();
+    }
+    if merged.valid_start.is_none() {
+        merged.valid_start = fallback_source.valid_start.clone();
+    }
+    if merged.valid_end.is_none() {
+        merged.valid_end = fallback_source.valid_end.clone();
+    }
+    if merged.lifecycle_status.is_none() {
+        merged.lifecycle_status = fallback_source.lifecycle_status.clone();
+    }
+    if merged.severity.is_none() {
+        merged.severity = fallback_source.severity.clone();
+    }
+    if merged.certainty.is_none() {
+        merged.certainty = fallback_source.certainty.clone();
+    }
+    if merged.urgency.is_none() {
+        merged.urgency = fallback_source.urgency.clone();
+    }
+    if merged.tornado.is_none() {
+        merged.tornado = fallback_source.tornado.clone();
+    }
+    if merged.hail_inches.is_none() {
+        merged.hail_inches = fallback_source.hail_inches;
+    }
+    if merged.wind_mph.is_none() {
+        merged.wind_mph = fallback_source.wind_mph;
+    }
+    if merged.damage_threat.is_none() {
+        merged.damage_threat = fallback_source.damage_threat.clone();
+    }
+    merged
+}
+
+fn hazard_record_detail_score(record: &HazardRecord) -> usize {
+    usize::from(record.source_url.is_some())
+        + usize::from(record.area.is_some())
+        + usize::from(record.motion.is_some())
+        + record.details.len()
+        + usize::from(record.headline.is_some())
+        + usize::from(record.tornado.is_some())
+        + usize::from(record.hail_inches.is_some())
+        + usize::from(record.wind_mph.is_some())
+        + usize::from(record.damage_threat.is_some())
+}
+
+struct SpcMdLoad {
+    scanned_items: usize,
+    parsed_items: usize,
+    error_count: usize,
+    records: Vec<HazardRecord>,
+}
+
+fn fetch_hot_text_product_type(
+    product_type: &str,
+    query_time_utc: DateTime<Utc>,
+) -> Result<SpcMdLoad, String> {
+    let url = format!("{NWS_PRODUCT_API_BASE_URL}/{product_type}");
+    let text = data_source::fetch_text(&url)
+        .map_err(|err| format!("NWS {product_type} product list fetch failed: {err}"))?;
+    let collection: NwsProductCollection = serde_json::from_str(&text)
+        .map_err(|err| format!("NWS {product_type} product list parse failed: {err}"))?;
+    let summaries = select_hot_text_summaries(collection.products, query_time_utc);
+    let mut records = Vec::new();
+    let mut parsed_items = 0usize;
+    let mut error_count = 0usize;
+
+    let detail_results = thread::scope(|scope| {
+        let workers = summaries
+            .iter()
+            .map(|summary| scope.spawn(move || fetch_nws_product_detail(summary)))
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| Err("NWS product detail worker panicked".to_owned()))
+            })
+            .collect::<Vec<_>>()
+    });
+
+    for (summary, detail_result) in summaries.iter().zip(detail_results) {
+        match detail_result {
+            Ok(detail) => {
+                let before = records.len();
+                let mut parsed = parse_hazard_records_from_text(
+                    Path::new(product_type),
+                    &detail.product_text,
+                    Some(query_time_utc),
+                );
+                for record in &mut parsed {
+                    record.source_url = Some(summary.url.clone());
+                    if record.headline.is_none() {
+                        record.headline = Some(detail.product_name.clone());
+                    }
+                    record.details.push(format!(
+                        "Issued {}",
+                        format_utc_seconds(detail.issuance_time)
+                    ));
+                }
+                records.append(&mut parsed);
+                if records.len() > before {
+                    parsed_items += 1;
+                }
+            }
+            Err(_) => {
+                error_count += 1;
+            }
+        }
+    }
+
+    Ok(SpcMdLoad {
+        scanned_items: summaries.len(),
+        parsed_items,
+        error_count,
+        records,
+    })
+}
+
+fn select_hot_text_summaries(
+    mut products: Vec<NwsProductSummary>,
+    query_time_utc: DateTime<Utc>,
+) -> Vec<NwsProductSummary> {
+    products.sort_by(|left, right| right.issuance_time.cmp(&left.issuance_time));
+    let recent_start =
+        query_time_utc - chrono::Duration::minutes(HOT_TEXT_PRODUCTS_RECENT_WINDOW_MINUTES);
+    let near_future = query_time_utc + chrono::Duration::minutes(5);
+    let mut selected = Vec::with_capacity(HOT_TEXT_PRODUCTS_MIN_PER_TYPE);
+
+    for (index, summary) in products.into_iter().enumerate() {
+        let is_recent =
+            summary.issuance_time >= recent_start && summary.issuance_time <= near_future;
+        if index < HOT_TEXT_PRODUCTS_MIN_PER_TYPE || is_recent {
+            selected.push(summary);
+            if selected.len() >= HOT_TEXT_PRODUCTS_MAX_PER_TYPE {
+                break;
+            }
+        } else if summary.issuance_time < recent_start {
+            break;
+        }
+    }
+
+    selected
+}
+
+fn fetch_nws_product_detail(summary: &NwsProductSummary) -> Result<NwsProductDetail, String> {
+    if let Ok(cache) = nws_product_detail_cache().lock()
+        && let Some(detail) = cache.get(&summary.url).cloned()
+    {
+        return Ok(detail);
+    }
+
+    let text = data_source::fetch_text(&summary.url)
+        .map_err(|err| format!("NWS product detail fetch failed: {err}"))?;
+    let detail: NwsProductDetail = serde_json::from_str(&text)
+        .map_err(|err| format!("NWS product detail parse failed: {err}"))?;
+    if let Ok(mut cache) = nws_product_detail_cache().lock() {
+        if cache.len() >= HOT_TEXT_DETAIL_CACHE_MAX
+            && let Some(first_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&first_key);
+        }
+        cache.insert(summary.url.clone(), detail.clone());
+    }
+    Ok(detail)
+}
+
+fn nws_product_detail_cache() -> &'static Mutex<BTreeMap<String, NwsProductDetail>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, NwsProductDetail>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn load_spc_mesoscale_discussions(query_time_utc: DateTime<Utc>) -> Result<SpcMdLoad, String> {
+    let index_html = data_source::fetch_text(SPC_MD_INDEX_URL)
+        .map_err(|err| format!("SPC MD index fetch failed: {err}"))?;
+    let links = spc_md_product_links(&index_html);
+    let mut records = Vec::new();
+    let mut parsed_items = 0usize;
+    let mut error_count = 0usize;
+
+    for url in &links {
+        match data_source::fetch_text(url) {
+            Ok(html) => {
+                if let Some(record) = parse_spc_md_product_page(url, &html, query_time_utc) {
+                    parsed_items += 1;
+                    records.push(record);
+                }
+            }
+            Err(_) => {
+                error_count += 1;
+            }
+        }
+    }
+
+    Ok(SpcMdLoad {
+        scanned_items: links.len(),
+        parsed_items,
+        error_count,
+        records,
+    })
+}
+
+fn spc_md_product_links(index_html: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    for part in index_html.split("href=\"").skip(1) {
+        let Some(end) = part.find('"') else {
+            continue;
+        };
+        let href = &part[..end];
+        let url = if href.starts_with("/products/md/md") && href.ends_with(".html") {
+            Some(format!("{SPC_PRODUCT_BASE_URL}{href}"))
+        } else if href.starts_with("md") && href.ends_with(".html") {
+            Some(format!("{SPC_MD_INDEX_URL}{href}"))
+        } else {
+            None
+        };
+        if let Some(url) = url
+            && !links.contains(&url)
+        {
+            links.push(url);
+        }
+    }
+    links
+}
+
+fn parse_spc_md_product_page(
+    source_url: &str,
+    html: &str,
+    _query_time_utc: DateTime<Utc>,
+) -> Option<HazardRecord> {
+    let text = extract_preformatted_text(html).unwrap_or(html);
+    let lines = text.lines().map(str::trim_end).collect::<Vec<_>>();
+    let points = parse_lat_lon_points(&lines);
+    if points.len() < 3 {
+        return None;
+    }
+    let upper = text.to_ascii_uppercase();
+    let number = first_number_after(&upper, "MESOSCALE DISCUSSION")?;
+    let label = format!("MD {number}");
+    let area = strip_prefixed_line(&lines, "Areas affected...");
+    let concerning = strip_prefixed_line(&lines, "Concerning...");
+    let valid = find_prefixed_line(&lines, "Valid ");
+    let watch_probability = strip_prefixed_line(&lines, "Probability of Watch Issuance...");
+    let peak_wind = find_prefixed_line(&lines, "MOST PROBABLE PEAK WIND GUST...");
+    let peak_hail = find_prefixed_line(&lines, "MOST PROBABLE PEAK HAIL SIZE...");
+    let mut details = Vec::new();
+    if let Some(valid) = valid {
+        details.push(valid);
+    }
+    if let Some(watch_probability) = watch_probability {
+        details.push(format!("Watch issuance {watch_probability}"));
+    }
+    if let Some(peak_wind) = peak_wind {
+        details.push(peak_wind);
+    }
+    if let Some(peak_hail) = peak_hail {
+        details.push(peak_hail);
+    }
+
+    Some(HazardRecord {
+        event_id: format!("spc-md-{number}"),
+        label,
+        event_family: "mesoscale discussion".to_owned(),
+        action: "SPC".to_owned(),
+        lifecycle_status: Some("Active".to_owned()),
+        office: "SPC".to_owned(),
+        headline: concerning,
+        source_url: Some(source_url.to_owned()),
+        area,
+        motion: None,
+        details,
+        valid_start: None,
+        valid_end: None,
+        severity: None,
+        certainty: None,
+        urgency: None,
+        tornado: None,
+        hail_inches: None,
+        wind_mph: None,
+        damage_threat: None,
+        bbox: hazard_bbox(&points),
+        points,
+    })
+}
+
+fn extract_preformatted_text(html: &str) -> Option<&str> {
+    let start = html.find("<pre>")? + "<pre>".len();
+    let end = html[start..].find("</pre>")? + start;
+    Some(html[start..end].trim())
+}
+
+fn strip_prefixed_line(lines: &[&str], prefix: &str) -> Option<String> {
+    lines.iter().find_map(|line| {
+        line.trim()
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsProductCollection {
+    #[serde(rename = "@graph", default)]
+    products: Vec<NwsProductSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct NwsProductSummary {
+    #[serde(rename = "@id")]
+    url: String,
+    #[serde(rename = "issuanceTime")]
+    issuance_time: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct NwsProductDetail {
+    #[serde(rename = "issuanceTime")]
+    issuance_time: DateTime<Utc>,
+    #[serde(rename = "productName")]
+    product_name: String,
+    #[serde(rename = "productText")]
+    product_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeatherAlertFeatureCollection {
+    #[serde(default)]
+    features: Vec<WeatherAlertFeature>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeatherAlertFeature {
+    id: Option<String>,
+    #[serde(rename = "@id")]
+    at_id: Option<String>,
+    geometry: Option<WeatherAlertGeometry>,
+    #[serde(default)]
+    properties: WeatherAlertProperties,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeatherAlertGeometry {
+    #[serde(rename = "type")]
+    geometry_type: String,
+    coordinates: serde_json::Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WeatherAlertProperties {
+    id: Option<String>,
+    #[serde(rename = "@id")]
+    at_id: Option<String>,
+    event: Option<String>,
+    headline: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "areaDesc")]
+    area_desc: Option<String>,
+    #[serde(rename = "senderName")]
+    sender_name: Option<String>,
+    severity: Option<String>,
+    certainty: Option<String>,
+    urgency: Option<String>,
+    effective: Option<String>,
+    onset: Option<String>,
+    expires: Option<String>,
+    ends: Option<String>,
+    #[serde(default)]
+    parameters: BTreeMap<String, Vec<String>>,
+}
+
+fn parse_weather_alert_feature(
+    feature: &WeatherAlertFeature,
+    query_time_utc: DateTime<Utc>,
+) -> Result<Vec<HazardRecord>, String> {
+    let Some(geometry) = &feature.geometry else {
+        return Ok(Vec::new());
+    };
+    let rings = weather_alert_geometry_rings(geometry)?;
+    let event = feature
+        .properties
+        .event
+        .as_deref()
+        .unwrap_or("Weather Alert");
+    let event_family = weather_alert_family(event);
+    let tags = parse_weather_alert_tags(&feature.properties.parameters);
+    let valid_start = parse_alert_time(
+        feature
+            .properties
+            .onset
+            .as_deref()
+            .or(feature.properties.effective.as_deref()),
+    );
+    let valid_end = parse_alert_time(
+        feature
+            .properties
+            .ends
+            .as_deref()
+            .or(feature.properties.expires.as_deref()),
+    );
+    let lifecycle_status =
+        hazard_lifecycle_status("ALERT", valid_start, valid_end, Some(query_time_utc));
+    let valid_start_text = valid_start.map(format_utc_seconds);
+    let valid_end_text = valid_end.map(format_utc_seconds);
+    let label = weather_alert_label(event, &event_family, &feature.properties.parameters, &tags);
+    let event_id = feature
+        .properties
+        .parameters
+        .get("VTEC")
+        .and_then(|values| values.first())
+        .and_then(|vtec| parse_vtec_alert_event_id(vtec))
+        .or_else(|| {
+            feature
+                .properties
+                .id
+                .as_deref()
+                .or(feature.id.as_deref())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| event.to_owned());
+    let office = feature
+        .properties
+        .sender_name
+        .clone()
+        .or_else(|| weather_alert_parameter(&feature.properties.parameters, "AWIPSidentifier"))
+        .unwrap_or_else(|| "NWS".to_owned());
+    let headline = feature
+        .properties
+        .headline
+        .clone()
+        .or_else(|| weather_alert_parameter(&feature.properties.parameters, "NWSheadline"))
+        .or_else(|| feature.properties.area_desc.clone())
+        .or_else(|| feature.properties.description.clone());
+    let source_url = weather_alert_source_url(feature);
+    let area = feature.properties.area_desc.clone();
+    let motion = weather_alert_parameter(&feature.properties.parameters, "eventMotionDescription");
+    let label_count = rings.len();
+
+    Ok(rings
+        .into_iter()
+        .enumerate()
+        .filter(|(_, points)| points.len() >= 3)
+        .map(|(index, points)| HazardRecord {
+            event_id: if label_count > 1 {
+                format!("{event_id}#{index}")
+            } else {
+                event_id.clone()
+            },
+            label: if label_count > 1 {
+                format!("{} {}", label, index + 1)
+            } else {
+                label.clone()
+            },
+            event_family: event_family.clone(),
+            action: "ALERT".to_owned(),
+            lifecycle_status: lifecycle_status.clone(),
+            office: office.clone(),
+            headline: headline.clone(),
+            source_url: source_url.clone(),
+            area: area.clone(),
+            motion: motion.clone(),
+            details: Vec::new(),
+            valid_start: valid_start_text.clone(),
+            valid_end: valid_end_text.clone(),
+            severity: feature.properties.severity.clone(),
+            certainty: feature.properties.certainty.clone(),
+            urgency: feature.properties.urgency.clone(),
+            tornado: tags.tornado.clone(),
+            hail_inches: tags.hail_inches,
+            wind_mph: tags.wind_mph,
+            damage_threat: tags.damage_threat.clone(),
+            bbox: hazard_bbox(&points),
+            points,
+        })
+        .collect())
+}
+
+fn weather_alert_geometry_rings(
+    geometry: &WeatherAlertGeometry,
+) -> Result<Vec<Vec<HazardPoint>>, String> {
+    match geometry.geometry_type.as_str() {
+        "Polygon" => Ok(parse_polygon_coordinate_value(&geometry.coordinates)
+            .into_iter()
+            .take(1)
+            .collect()),
+        "MultiPolygon" => {
+            let mut polygons = Vec::new();
+            let Some(multi_polygon) = geometry.coordinates.as_array() else {
+                return Err("multipolygon coordinates are not an array".to_owned());
+            };
+            for polygon in multi_polygon {
+                if let Some(outer_ring) = parse_polygon_coordinate_value(polygon).into_iter().next()
+                {
+                    polygons.push(outer_ring);
+                }
+            }
+            Ok(polygons)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn parse_polygon_coordinate_value(value: &serde_json::Value) -> Vec<Vec<HazardPoint>> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|ring| {
+            let mut points = ring
+                .as_array()?
+                .iter()
+                .filter_map(|coordinate| {
+                    let pair = coordinate.as_array()?;
+                    let lon = pair.first()?.as_f64()? as f32;
+                    let lat = pair.get(1)?.as_f64()? as f32;
+                    Some(HazardPoint { lon, lat })
+                })
+                .collect::<Vec<_>>();
+            if points.len() > 1
+                && let (Some(first), Some(last)) = (points.first(), points.last())
+                && (first.lon - last.lon).abs() <= f32::EPSILON
+                && (first.lat - last.lat).abs() <= f32::EPSILON
+            {
+                points.pop();
+            }
+            (points.len() >= 3).then_some(points)
+        })
+        .collect()
+}
+
+fn weather_alert_family(event: &str) -> String {
+    let upper = event.to_ascii_uppercase();
+    if upper.contains("TORNADO") {
+        "tornado".to_owned()
+    } else if upper.contains("SEVERE THUNDERSTORM") {
+        "severe thunderstorm".to_owned()
+    } else if upper.contains("FLASH FLOOD") {
+        "flash flood".to_owned()
+    } else if upper.contains("FLOOD") {
+        "flood".to_owned()
+    } else if upper.contains("SPECIAL MARINE") {
+        "special marine".to_owned()
+    } else if upper.contains("SNOW SQUALL") {
+        "snow squall".to_owned()
+    } else if upper.contains("WATCH") {
+        "watch".to_owned()
+    } else if upper.contains("SPECIAL WEATHER") {
+        "special weather".to_owned()
+    } else {
+        "alert".to_owned()
+    }
+}
+
+fn parse_weather_alert_tags(parameters: &BTreeMap<String, Vec<String>>) -> ParsedWarningTags {
+    ParsedWarningTags {
+        tornado: weather_alert_parameter(parameters, "tornadoDetection"),
+        hail_inches: weather_alert_parameter(parameters, "maxHailSize")
+            .as_deref()
+            .and_then(parse_leading_float),
+        wind_mph: weather_alert_parameter(parameters, "maxWindGust")
+            .as_deref()
+            .and_then(parse_leading_u16),
+        damage_threat: weather_alert_parameter(parameters, "tornadoDamageThreat")
+            .or_else(|| weather_alert_parameter(parameters, "thunderstormDamageThreat")),
+    }
+}
+
+fn weather_alert_parameter(
+    parameters: &BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> Option<String> {
+    parameters
+        .get(key)
+        .and_then(|values| values.first())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn weather_alert_source_url(feature: &WeatherAlertFeature) -> Option<String> {
+    [
+        feature.properties.at_id.as_deref(),
+        feature.at_id.as_deref(),
+        feature.id.as_deref(),
+        feature.properties.id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| value.starts_with("http://") || value.starts_with("https://"))
+    .map(str::to_owned)
+}
+
+fn parse_alert_time(value: Option<&str>) -> Option<DateTime<Utc>> {
+    value
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn format_utc_seconds(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn weather_alert_label(
+    _event: &str,
+    event_family: &str,
+    parameters: &BTreeMap<String, Vec<String>>,
+    tags: &ParsedWarningTags,
+) -> String {
+    if let Some(vtec) = weather_alert_parameter(parameters, "VTEC")
+        && let Some((phenomenon, event_tracking_number)) = parse_vtec_alert_identity(&vtec)
+    {
+        return hazard_label(
+            hazard_family_from_phenomenon(&phenomenon),
+            &event_tracking_number,
+            tags,
+        );
+    }
+    let prefix = match event_family {
+        "tornado" => "TOR",
+        "severe thunderstorm" => "SVR",
+        "flash flood" => "FFW",
+        "flood" => "FLW",
+        "special marine" => "SMW",
+        "snow squall" => "SQW",
+        "watch" => "WATCH",
+        "special weather" => "SPS",
+        _ => "ALERT",
+    };
+    if let Some(tornado) = &tags.tornado {
+        format!("{prefix} {tornado}")
+    } else {
+        prefix.to_owned()
+    }
+}
+
+fn parse_vtec_alert_identity(vtec: &str) -> Option<(String, String)> {
+    let parts = vtec.trim_matches('/').split('.').collect::<Vec<_>>();
+    if parts.len() < 6 || parts.first().copied() != Some("O") {
+        return None;
+    }
+    Some((parts.get(3)?.to_string(), parts.get(5)?.to_string()))
+}
+
+fn parse_vtec_alert_event_id(vtec: &str) -> Option<String> {
+    let parts = vtec.trim_matches('/').split('.').collect::<Vec<_>>();
+    if parts.len() < 6 || parts.first().copied() != Some("O") {
+        return None;
+    }
+    Some(format!(
+        "{}.{}.{}.{}",
+        parts.get(2)?,
+        parts.get(3)?,
+        parts.get(4)?,
+        parts.get(5)?
+    ))
+}
+
+fn collect_hazard_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    if !path.is_dir() {
+        return Err(format!("Hazard path not found: {}", path.display()));
+    }
+
+    let mut files = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|err| format!("Cannot read hazard dir {}: {err}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn parse_hazard_records_from_text(
+    path: &Path,
+    text: &str,
+    query_time_utc: Option<DateTime<Utc>>,
+) -> Vec<HazardRecord> {
+    let lines = text.lines().map(str::trim_end).collect::<Vec<_>>();
+    let heading = lines
+        .iter()
+        .find(|line| looks_like_wmo_heading(line.trim()))
+        .map(|line| line.trim().to_owned());
+    let awips_id = heading
+        .as_deref()
+        .and_then(|heading| lines.iter().position(|line| line.trim() == heading))
+        .and_then(|index| lines.get(index + 1))
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty());
+
+    let mut records = Vec::new();
+    for (line_index, line) in lines.iter().enumerate() {
+        let Some(vtec) = parse_warning_vtec_line(line) else {
+            continue;
+        };
+        let segment_end = lines
+            .iter()
+            .enumerate()
+            .skip(line_index + 1)
+            .find_map(|(index, candidate)| (candidate.trim() == "$$").then_some(index))
+            .unwrap_or(lines.len());
+        let segment = &lines[line_index..segment_end];
+        let points = parse_lat_lon_points(segment);
+        if points.len() < 3 {
+            continue;
+        }
+        let bbox = hazard_bbox(&points);
+        let tags = parse_warning_tags(segment);
+        let event_family = hazard_family_from_phenomenon(&vtec.phenomenon).to_owned();
+        let lifecycle_status =
+            hazard_lifecycle_status(&vtec.action, vtec.start_time, vtec.end_time, query_time_utc);
+        let label = hazard_label(&event_family, &vtec.event_tracking_number, &tags);
+        records.push(HazardRecord {
+            event_id: format!(
+                "{}.{}.{}.{}",
+                vtec.office, vtec.phenomenon, vtec.significance, vtec.event_tracking_number
+            ),
+            label,
+            event_family,
+            action: vtec.action,
+            lifecycle_status,
+            office: vtec.office,
+            headline: find_warning_headline(segment)
+                .or(awips_id.clone())
+                .or(heading.clone()),
+            source_url: None,
+            area: None,
+            motion: find_prefixed_line(segment, "TIME...MOT...LOC"),
+            details: Vec::new(),
+            valid_start: vtec.start_time.map(format_utc_seconds),
+            valid_end: vtec.end_time.map(format_utc_seconds),
+            severity: None,
+            certainty: None,
+            urgency: None,
+            tornado: tags.tornado,
+            hail_inches: tags.hail_inches,
+            wind_mph: tags.wind_mph,
+            damage_threat: tags.damage_threat,
+            points,
+            bbox,
+        });
+    }
+    if records.is_empty()
+        && let Some(record) = parse_generic_lat_lon_hazard(path, &lines, heading, awips_id)
+    {
+        records.push(record);
+    }
+    records
+}
+
+fn parse_generic_lat_lon_hazard(
+    path: &Path,
+    lines: &[&str],
+    heading: Option<String>,
+    awips_id: Option<String>,
+) -> Option<HazardRecord> {
+    let points = parse_lat_lon_points(lines);
+    if points.len() < 3 {
+        return None;
+    }
+    let text = lines.join("\n").to_ascii_uppercase();
+    let event_family = classify_generic_hazard_family(&text, awips_id.as_deref());
+    let label = generic_hazard_label(&event_family, &text, awips_id.as_deref(), path);
+    let headline = find_generic_headline(lines, &event_family)
+        .or(awips_id)
+        .or(heading);
+    Some(HazardRecord {
+        event_id: format!(
+            "{}:{}",
+            event_family.replace(' ', "-"),
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("text-polygon")
+        ),
+        label,
+        event_family,
+        action: "TEXT".to_owned(),
+        lifecycle_status: None,
+        office: generic_office_from_heading(lines).unwrap_or_else(|| "NWS".to_owned()),
+        headline,
+        source_url: None,
+        area: None,
+        motion: find_prefixed_line(lines, "TIME...MOT...LOC"),
+        details: Vec::new(),
+        valid_start: None,
+        valid_end: None,
+        severity: None,
+        certainty: None,
+        urgency: None,
+        tornado: None,
+        hail_inches: None,
+        wind_mph: None,
+        damage_threat: None,
+        bbox: hazard_bbox(&points),
+        points,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ParsedWarningVtec {
+    action: String,
+    office: String,
+    phenomenon: String,
+    significance: String,
+    event_tracking_number: String,
+    start_time: Option<DateTime<Utc>>,
+    end_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ParsedWarningTags {
+    tornado: Option<String>,
+    hail_inches: Option<f32>,
+    wind_mph: Option<u16>,
+    damage_threat: Option<String>,
+}
+
+fn parse_warning_vtec_line(line: &str) -> Option<ParsedWarningVtec> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("/O.") || !trimmed.ends_with('/') {
+        return None;
+    }
+    let content = trimmed.trim_matches('/');
+    let parts = content.split('.').collect::<Vec<_>>();
+    if parts.len() < 7 || parts.first().copied() != Some("O") || parts.get(4) != Some(&"W") {
+        return None;
+    }
+    let times = parts[6].split('-').collect::<Vec<_>>();
+    Some(ParsedWarningVtec {
+        action: parts[1].to_owned(),
+        office: parts[2].to_owned(),
+        phenomenon: parts[3].to_owned(),
+        significance: parts[4].to_owned(),
+        event_tracking_number: parts[5].to_owned(),
+        start_time: times.first().and_then(|value| parse_vtec_time(value)),
+        end_time: times.get(1).and_then(|value| parse_vtec_time(value)),
+    })
+}
+
+fn parse_vtec_time(value: &str) -> Option<DateTime<Utc>> {
+    let datetime = NaiveDateTime::parse_from_str(value, "%y%m%dT%H%MZ").ok()?;
+    Some(Utc.from_utc_datetime(&datetime))
+}
+
+fn parse_lat_lon_points(lines: &[&str]) -> Vec<HazardPoint> {
+    let Some(start_index) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("LAT...LON"))
+    else {
+        return Vec::new();
+    };
+    let mut tokens = Vec::new();
+    for line in &lines[start_index..] {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "$$" {
+            break;
+        }
+        if trimmed.contains("...") && !trimmed.starts_with("LAT...LON") {
+            break;
+        }
+        let body = trimmed.strip_prefix("LAT...LON").unwrap_or(trimmed);
+        for token in body.split_whitespace() {
+            if token.as_bytes().iter().all(u8::is_ascii_digit) {
+                tokens.push(token);
+            }
+        }
+    }
+    if tokens.iter().all(|token| token.len() >= 8) {
+        tokens
+            .iter()
+            .filter_map(|token| parse_compact_lat_lon_token(token))
+            .collect()
+    } else {
+        tokens
+            .chunks_exact(2)
+            .filter_map(|pair| {
+                let lat = parse_coordinate_hundredths(pair[0], false)?;
+                let lon = parse_coordinate_hundredths(pair[1], true)?;
+                Some(HazardPoint { lon, lat })
+            })
+            .collect()
+    }
+}
+
+fn parse_coordinate_hundredths(value: &str, west_longitude: bool) -> Option<f32> {
+    let number = value.parse::<i32>().ok()?;
+    let coordinate = number as f32 / 100.0;
+    Some(if west_longitude {
+        -coordinate
+    } else {
+        coordinate
+    })
+}
+
+fn parse_compact_lat_lon_token(value: &str) -> Option<HazardPoint> {
+    if value.len() < 8 || !value.as_bytes().iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let lat = parse_coordinate_hundredths(&value[..4], false)?;
+    let lon = parse_coordinate_hundredths(&value[4..], true)?;
+    Some(HazardPoint { lon, lat })
+}
+
+fn parse_warning_tags(lines: &[&str]) -> ParsedWarningTags {
+    let mut tags = ParsedWarningTags::default();
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("TORNADO...") {
+            tags.tornado = Some(value.trim().to_owned());
+        } else if let Some(value) = trimmed.strip_prefix("MAX HAIL SIZE...") {
+            tags.hail_inches = parse_leading_float(value);
+        } else if let Some(value) = trimmed.strip_prefix("MAX WIND GUST...") {
+            tags.wind_mph = parse_leading_u16(value);
+        } else if let Some(value) = trimmed
+            .strip_prefix("TORNADO DAMAGE THREAT...")
+            .or_else(|| trimmed.strip_prefix("THUNDERSTORM DAMAGE THREAT..."))
+            .or_else(|| trimmed.strip_prefix("TSTM DAMAGE THREAT..."))
+        {
+            tags.damage_threat = Some(value.trim().to_owned());
+        }
+    }
+    tags
+}
+
+fn parse_leading_float(value: &str) -> Option<f32> {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.parse::<f32>().ok())
+}
+
+fn parse_leading_u16(value: &str) -> Option<u16> {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.parse::<u16>().ok())
+}
+
+fn find_warning_headline(lines: &[&str]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let trimmed = line.trim();
+        ((trimmed.ends_with("Warning") || trimmed.ends_with("Statement"))
+            && !trimmed.starts_with('*'))
+        .then(|| trimmed.to_owned())
+    })
+}
+
+fn find_generic_headline(lines: &[&str], event_family: &str) -> Option<String> {
+    let needle = event_family.to_ascii_uppercase();
+    lines.iter().find_map(|line| {
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        (!trimmed.is_empty() && upper.contains(&needle)).then(|| trimmed.to_owned())
+    })
+}
+
+fn find_prefixed_line(lines: &[&str], prefix: &str) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .starts_with(prefix)
+            .then(|| trimmed.split_whitespace().collect::<Vec<_>>().join(" "))
+    })
+}
+
+fn generic_office_from_heading(lines: &[&str]) -> Option<String> {
+    lines
+        .iter()
+        .find(|line| looks_like_wmo_heading(line.trim()))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(str::to_owned)
+}
+
+fn looks_like_wmo_heading(line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    let Some(ttaaii) = parts.next() else {
+        return false;
+    };
+    let Some(cccc) = parts.next() else {
+        return false;
+    };
+    let Some(time) = parts.next() else {
+        return false;
+    };
+    ttaaii.len() == 6
+        && cccc.len() == 4
+        && time.len() == 6
+        && ttaaii.as_bytes().iter().all(u8::is_ascii_alphanumeric)
+        && cccc.as_bytes().iter().all(u8::is_ascii_alphabetic)
+        && time.as_bytes().iter().all(u8::is_ascii_digit)
+}
+
+fn classify_generic_hazard_family(text: &str, awips_id: Option<&str>) -> String {
+    let awips_id = awips_id.unwrap_or_default().to_ascii_uppercase();
+    if text.contains("MESOSCALE DISCUSSION") || awips_id.contains("MCD") {
+        "mesoscale discussion".to_owned()
+    } else if text.contains("TORNADO WATCH")
+        || text.contains("SEVERE THUNDERSTORM WATCH")
+        || text.contains("WATCH OUTLINE UPDATE")
+        || awips_id.starts_with("SEL")
+        || awips_id.starts_with("SAW")
+    {
+        "watch".to_owned()
+    } else if text.contains("LOCAL STORM REPORT") || awips_id.starts_with("LSR") {
+        "local storm report".to_owned()
+    } else {
+        "text polygon".to_owned()
+    }
+}
+
+fn generic_hazard_label(
+    event_family: &str,
+    text: &str,
+    awips_id: Option<&str>,
+    path: &Path,
+) -> String {
+    match event_family {
+        "mesoscale discussion" => first_number_after(text, "MESOSCALE DISCUSSION")
+            .map(|number| format!("MD {number}"))
+            .unwrap_or_else(|| "MD".to_owned()),
+        "watch" => first_number_after(text, "WATCH NUMBER")
+            .or_else(|| first_number_after(text, "WATCH OUTLINE UPDATE FOR WS"))
+            .map(|number| format!("WATCH {number}"))
+            .unwrap_or_else(|| "WATCH".to_owned()),
+        "local storm report" => "LSR".to_owned(),
+        _ => awips_id
+            .map(str::to_owned)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "POLYGON".to_owned()),
+    }
+}
+
+fn first_number_after(text: &str, marker: &str) -> Option<String> {
+    let offset = text.find(marker)? + marker.len();
+    text[offset..]
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|token| !token.is_empty())
+        .map(|token| {
+            let trimmed = token.trim_start_matches('0');
+            if trimmed.is_empty() { "0" } else { trimmed }.to_owned()
+        })
+}
+
+fn hazard_lifecycle_status(
+    action: &str,
+    start_time: Option<DateTime<Utc>>,
+    end_time: Option<DateTime<Utc>>,
+    query_time_utc: Option<DateTime<Utc>>,
+) -> Option<String> {
+    if matches!(action, "CAN" | "EXP") {
+        return Some(
+            if action == "CAN" {
+                "Canceled"
+            } else {
+                "Expired"
+            }
+            .to_owned(),
+        );
+    }
+    let query_time_utc = query_time_utc?;
+    if let Some(start_time) = start_time
+        && query_time_utc < start_time
+    {
+        return Some("Pending".to_owned());
+    }
+    if let Some(end_time) = end_time
+        && query_time_utc >= end_time
+    {
+        return Some("Expired".to_owned());
+    }
+    Some("Active".to_owned())
+}
+
+fn hazard_family_from_phenomenon(phenomenon: &str) -> &'static str {
+    match phenomenon {
+        "TO" => "tornado",
+        "SV" => "severe thunderstorm",
+        "FF" => "flash flood",
+        "MA" => "special marine",
+        "SQ" => "snow squall",
+        "FL" | "FA" => "flood",
+        _ => "warning",
+    }
+}
+
+fn hazard_family_order(family: &str) -> u8 {
+    match family {
+        "tornado" => 0,
+        "severe thunderstorm" => 1,
+        "flash flood" => 2,
+        "special marine" => 3,
+        "snow squall" => 4,
+        "flood" => 5,
+        "watch" => 6,
+        "mesoscale discussion" => 7,
+        "local storm report" => 8,
+        "special weather" => 9,
+        _ => 9,
+    }
+}
+
+fn hazard_label(
+    event_family: &str,
+    event_tracking_number: &str,
+    tags: &ParsedWarningTags,
+) -> String {
+    let prefix = match event_family {
+        "tornado" => "TOR",
+        "severe thunderstorm" => "SVR",
+        "flash flood" => "FFW",
+        "flood" => "FLW",
+        "special marine" => "SMW",
+        "snow squall" => "SQW",
+        _ => "WRN",
+    };
+    if let Some(tornado) = &tags.tornado {
+        format!("{prefix} {event_tracking_number} {tornado}")
+    } else {
+        format!("{prefix} {event_tracking_number}")
+    }
+}
+
+fn hazard_color(record: &HazardRecord) -> egui::Color32 {
+    match record.event_family.as_str() {
+        "tornado" => egui::Color32::from_rgb(248, 62, 82),
+        "severe thunderstorm" => egui::Color32::from_rgb(246, 183, 57),
+        "flash flood" => egui::Color32::from_rgb(78, 218, 108),
+        "flood" => egui::Color32::from_rgb(76, 190, 124),
+        "special marine" => egui::Color32::from_rgb(70, 190, 238),
+        "snow squall" => egui::Color32::from_rgb(170, 210, 255),
+        "watch" => egui::Color32::from_rgb(235, 92, 245),
+        "mesoscale discussion" => egui::Color32::from_rgb(95, 174, 255),
+        "local storm report" => egui::Color32::from_rgb(245, 245, 245),
+        "special weather" => egui::Color32::from_rgb(245, 220, 72),
+        "text polygon" => egui::Color32::from_rgb(190, 178, 255),
+        _ => egui::Color32::from_rgb(232, 232, 96),
+    }
+}
+
+fn hazard_bbox(points: &[HazardPoint]) -> [f32; 4] {
+    let mut west = f32::INFINITY;
+    let mut south = f32::INFINITY;
+    let mut east = f32::NEG_INFINITY;
+    let mut north = f32::NEG_INFINITY;
+    for point in points {
+        west = west.min(point.lon);
+        east = east.max(point.lon);
+        south = south.min(point.lat);
+        north = north.max(point.lat);
+    }
+    [west, south, east, north]
+}
+
+fn bbox_contains(bbox: [f32; 4], lon: f32, lat: f32) -> bool {
+    lon >= bbox[0] && lon <= bbox[2] && lat >= bbox[1] && lat <= bbox[3]
+}
+
+fn hazard_polygon_contains_point(points: &[HazardPoint], point: HazardPoint) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = points[points.len() - 1];
+    for current in points {
+        let crosses = (current.lat > point.lat) != (previous.lat > point.lat);
+        if crosses {
+            let lon_at_lat = (previous.lon - current.lon) * (point.lat - current.lat)
+                / (previous.lat - current.lat)
+                + current.lon;
+            if point.lon < lon_at_lat {
+                inside = !inside;
+            }
+        }
+        previous = *current;
+    }
+    inside
+}
+
+fn is_convex_screen_polygon(points: &[egui::Pos2]) -> bool {
+    if points.len() < 4 {
+        return true;
+    }
+    let mut sign = 0.0f32;
+    for index in 0..points.len() {
+        let a = points[index];
+        let b = points[(index + 1) % points.len()];
+        let c = points[(index + 2) % points.len()];
+        let cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        if cross.abs() <= f32::EPSILON {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if sign != cross.signum() {
+            return false;
+        }
+    }
+    true
+}
+
+fn filled_polygon_mesh(points: &[egui::Pos2], fill: egui::Color32) -> Option<egui::epaint::Mesh> {
+    if fill == egui::Color32::TRANSPARENT {
+        return None;
+    }
+    let points = cleaned_screen_polygon(points);
+    let triangles = triangulate_screen_polygon(&points)?;
+    let mut mesh = egui::epaint::Mesh::default();
+    for point in &points {
+        mesh.colored_vertex(*point, fill);
+    }
+    for [a, b, c] in triangles {
+        mesh.add_triangle(a as u32, b as u32, c as u32);
+    }
+    Some(mesh)
+}
+
+fn cleaned_screen_polygon(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
+    let mut cleaned = Vec::<egui::Pos2>::with_capacity(points.len());
+    for point in points {
+        if cleaned
+            .last()
+            .is_none_or(|previous| previous.distance_sq(*point) > 0.01)
+        {
+            cleaned.push(*point);
+        }
+    }
+    if cleaned.len() > 1
+        && cleaned
+            .first()
+            .zip(cleaned.last())
+            .is_some_and(|(first, last)| first.distance_sq(*last) <= 0.01)
+    {
+        cleaned.pop();
+    }
+    cleaned
+}
+
+fn triangulate_screen_polygon(points: &[egui::Pos2]) -> Option<Vec<[usize; 3]>> {
+    if points.len() < 3 || points.len() > u32::MAX as usize {
+        return None;
+    }
+    let winding = polygon_signed_area(points).signum();
+    if winding == 0.0 {
+        return None;
+    }
+
+    let mut indices = (0..points.len()).collect::<Vec<_>>();
+    let mut triangles = Vec::<[usize; 3]>::with_capacity(points.len().saturating_sub(2));
+    let max_iterations = points.len() * points.len();
+    let mut iterations = 0usize;
+
+    while indices.len() > 3 && iterations < max_iterations {
+        iterations += 1;
+        let mut clipped = false;
+        for current in 0..indices.len() {
+            let previous = indices[(current + indices.len() - 1) % indices.len()];
+            let index = indices[current];
+            let next = indices[(current + 1) % indices.len()];
+            if !is_ear_candidate(points, &indices, previous, index, next, winding) {
+                continue;
+            }
+            triangles.push([previous, index, next]);
+            indices.remove(current);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            return None;
+        }
+    }
+
+    if indices.len() == 3 {
+        triangles.push([indices[0], indices[1], indices[2]]);
+    }
+    (!triangles.is_empty()).then_some(triangles)
+}
+
+fn is_ear_candidate(
+    points: &[egui::Pos2],
+    indices: &[usize],
+    previous: usize,
+    index: usize,
+    next: usize,
+    winding: f32,
+) -> bool {
+    let a = points[previous];
+    let b = points[index];
+    let c = points[next];
+    let cross = cross_points(a, b, c);
+    if cross.abs() <= f32::EPSILON || cross.signum() != winding {
+        return false;
+    }
+    !indices.iter().any(|candidate| {
+        let candidate = *candidate;
+        candidate != previous
+            && candidate != index
+            && candidate != next
+            && point_in_triangle(points[candidate], a, b, c)
+    })
+}
+
+fn polygon_signed_area(points: &[egui::Pos2]) -> f32 {
+    let mut area = 0.0f32;
+    for index in 0..points.len() {
+        let current = points[index];
+        let next = points[(index + 1) % points.len()];
+        area += current.x * next.y - next.x * current.y;
+    }
+    area * 0.5
+}
+
+fn cross_points(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+fn point_in_triangle(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> bool {
+    let ab = cross_points(a, b, point);
+    let bc = cross_points(b, c, point);
+    let ca = cross_points(c, a, point);
+    let has_negative = ab < -f32::EPSILON || bc < -f32::EPSILON || ca < -f32::EPSILON;
+    let has_positive = ab > f32::EPSILON || bc > f32::EPSILON || ca > f32::EPSILON;
+    !(has_negative && has_positive)
+}
+
+fn polygon_screen_centroid(points: &[egui::Pos2]) -> egui::Pos2 {
+    let mut sum = egui::Vec2::ZERO;
+    for point in points {
+        sum += point.to_vec2();
+    }
+    let scale = 1.0 / points.len().max(1) as f32;
+    egui::pos2(sum.x * scale, sum.y * scale)
+}
+
+fn point_segment_distance_sq(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) -> f32 {
+    let segment = end - start;
+    let length_sq = segment.length_sq();
+    if length_sq <= f32::EPSILON {
+        return point.distance_sq(start);
+    }
+    let t = ((point - start).dot(segment) / length_sq).clamp(0.0, 1.0);
+    point.distance_sq(start + segment * t)
+}
+
 fn displayable_products(volume: &RadarVolume, cut_index: usize) -> Vec<DisplayProduct> {
     let Some(cut) = volume.cuts.get(cut_index) else {
         return Vec::new();
@@ -3356,6 +6287,40 @@ fn displayable_products(volume: &RadarVolume, cut_index: usize) -> Vec<DisplayPr
         .map(|grid| grid.moment.clone())
         .collect::<std::collections::BTreeSet<_>>();
     product_order(&available)
+}
+
+fn displayable_cuts_for_product(volume: &RadarVolume, product: &DisplayProduct) -> Vec<usize> {
+    (0..volume.cuts.len())
+        .filter(|index| is_displayable_on_cut(volume, *index, product))
+        .collect()
+}
+
+fn stepped_product<'a>(
+    products: &'a [DisplayProduct],
+    current: &DisplayProduct,
+    delta: isize,
+) -> Option<&'a DisplayProduct> {
+    stepped_slice_value(products, current, delta)
+}
+
+fn stepped_cut(cuts: &[usize], current: usize, delta: isize) -> Option<usize> {
+    stepped_slice_value(cuts, &current, delta).copied()
+}
+
+fn stepped_slice_value<'a, T: PartialEq>(
+    values: &'a [T],
+    current: &T,
+    delta: isize,
+) -> Option<&'a T> {
+    if values.is_empty() {
+        return None;
+    }
+    let current_index = values
+        .iter()
+        .position(|value| value == current)
+        .unwrap_or(0);
+    let next_index = (current_index as isize + delta).rem_euclid(values.len() as isize) as usize;
+    values.get(next_index)
 }
 
 fn is_displayable_on_cut(volume: &RadarVolume, cut_index: usize, product: &DisplayProduct) -> bool {
@@ -3402,6 +6367,32 @@ fn default_selection_for_volume(volume: &RadarVolume) -> (usize, DisplayProduct)
     (0, reflectivity)
 }
 
+fn should_clear_display_for_latest_load(
+    volume: Option<&RadarVolume>,
+    site_id: &str,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    let Some(volume) = volume else {
+        return false;
+    };
+    if volume.site.id != site_id {
+        return true;
+    }
+
+    now_utc
+        .signed_duration_since(volume.volume_time.with_timezone(&Utc))
+        .num_seconds()
+        > STALE_LATEST_DISPLAY_CLEAR_SECONDS
+}
+
+fn is_unchanged_realtime_refresh(
+    cache_hit: bool,
+    downloaded_path: &Path,
+    current_source_path: Option<&Path>,
+) -> bool {
+    cache_hit && current_source_path.is_some_and(|current| current == downloaded_path)
+}
+
 fn best_cut_for_product(
     volume: &RadarVolume,
     current_cut: usize,
@@ -3434,6 +6425,10 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(46, 58, 72);
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
     ctx.set_global_style(style);
+}
+
+fn radar_texture_options() -> egui::TextureOptions {
+    egui::TextureOptions::NEAREST
 }
 
 fn radar_color_image_from_rgba(size: [usize; 2], rgba: &[u8]) -> egui::ColorImage {
@@ -3565,6 +6560,28 @@ mod tests {
     }
 
     #[test]
+    fn cursor_readout_uses_dealiased_velocity_grid_for_dvel() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_aliased_velocity_volume()));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::DealiasedVelocity;
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        app.map_scale = 1000.0;
+
+        let rect = test_map_rect();
+        let target_lat = 35.0 + 20.0 / 111.32;
+        let position = app.lon_lat_to_screen(rect, -97.0, target_lat);
+        let readout = app.cursor_readout_at(rect, position).expect("DVEL readout");
+
+        assert_eq!(readout.product, DisplayProduct::DealiasedVelocity);
+        assert_eq!(readout.gate, 2);
+        assert!((readout.value - 11.0).abs() < 0.01, "{readout:?}");
+        assert_eq!(readout.raw, None);
+        assert!(app.dealiased_readout_cache.is_some());
+    }
+
+    #[test]
     fn cursor_readout_format_reports_source_gate_provenance() {
         let readout = CursorReadout {
             product: DisplayProduct::Moment(MomentType::Velocity),
@@ -3659,17 +6676,25 @@ mod tests {
     }
 
     #[test]
-    fn preview_policy_follows_effective_worker_budget() {
-        assert!(should_preview_loads_for_threads(false, 2));
+    fn preview_policy_enables_fast_first_pixels_for_all_cpu_budgets() {
+        assert!(should_preview_loads_for_threads(1));
+        assert!(should_preview_loads_for_threads(LOW_CORE_PREVIEW_THREADS));
         assert!(should_preview_loads_for_threads(
-            false,
-            LOW_CORE_PREVIEW_THREADS
-        ));
-        assert!(!should_preview_loads_for_threads(
-            false,
             LOW_CORE_PREVIEW_THREADS + 1
         ));
-        assert!(should_preview_loads_for_threads(true, 64));
+        assert!(should_preview_loads_for_threads(64));
+    }
+
+    #[test]
+    fn block_bzip_preview_policy_only_uses_low_core_path() {
+        assert!(should_preview_block_bzip_loads_for_threads(1));
+        assert!(should_preview_block_bzip_loads_for_threads(
+            LOW_CORE_PREVIEW_THREADS
+        ));
+        assert!(!should_preview_block_bzip_loads_for_threads(
+            LOW_CORE_PREVIEW_THREADS + 1
+        ));
+        assert!(!should_preview_block_bzip_loads_for_threads(64));
     }
 
     #[test]
@@ -3746,16 +6771,21 @@ mod tests {
     #[test]
     fn velocity_prefetch_targets_nearest_displayable_velocity_cut() {
         let volume = Arc::new(test_ref_then_velocity_volume());
+        let color_tables = ColorTableSet::default();
+        let color_table_signature =
+            color_tables.signature_for_family(ColorTableFamily::Reflectivity);
         let request = RenderRequest {
             key: TextureKey {
                 cut: 0,
                 product: DisplayProduct::Moment(MomentType::Reflectivity),
+                color_table_signature,
                 storm_motion_key: (450, 350),
                 viewport: test_viewport_key(1320, 820),
             },
             volume,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
+            color_tables,
             storm_motion: StormMotion {
                 direction_deg: 45.0,
                 speed_mps: 35.0 * KNOT_TO_MPS,
@@ -3777,6 +6807,56 @@ mod tests {
             &test_rendered_texture_with_size(1.0, false, 1320, 820),
             RenderWorkerCachePolicy { threads: 8 },
         ));
+    }
+
+    #[test]
+    fn product_keyboard_step_wraps_display_products() {
+        let products = vec![
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            DisplayProduct::Moment(MomentType::Velocity),
+            DisplayProduct::StormRelativeVelocity,
+        ];
+
+        assert_eq!(
+            stepped_product(
+                &products,
+                &DisplayProduct::Moment(MomentType::Reflectivity),
+                1
+            ),
+            Some(&DisplayProduct::Moment(MomentType::Velocity))
+        );
+        assert_eq!(
+            stepped_product(&products, &DisplayProduct::StormRelativeVelocity, 1),
+            Some(&DisplayProduct::Moment(MomentType::Reflectivity))
+        );
+        assert_eq!(
+            stepped_product(
+                &products,
+                &DisplayProduct::Moment(MomentType::Reflectivity),
+                -1
+            ),
+            Some(&DisplayProduct::StormRelativeVelocity)
+        );
+    }
+
+    #[test]
+    fn velocity_cut_exposes_dealiased_products() {
+        let volume = test_ref_then_velocity_volume();
+        let products = displayable_products(&volume, 1);
+
+        assert!(products.contains(&DisplayProduct::Moment(MomentType::Velocity)));
+        assert!(products.contains(&DisplayProduct::DealiasedVelocity));
+        assert!(products.contains(&DisplayProduct::StormRelativeVelocity));
+        assert!(products.contains(&DisplayProduct::StormRelativeDealiasedVelocity));
+    }
+
+    #[test]
+    fn tilt_keyboard_step_wraps_displayable_cuts() {
+        let cuts = vec![0, 2, 4];
+
+        assert_eq!(stepped_cut(&cuts, 0, 1), Some(2));
+        assert_eq!(stepped_cut(&cuts, 4, 1), Some(0));
+        assert_eq!(stepped_cut(&cuts, 0, -1), Some(4));
     }
 
     #[test]
@@ -3822,6 +6902,69 @@ mod tests {
     }
 
     #[test]
+    fn installing_volume_preserves_user_map_view() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let selected_site =
+            RadarSite::new("TEST").with_location(Some("Test".to_owned()), Some(35.0), Some(-97.0));
+        app.sites = vec![RadarSite::new("OTHER"), selected_site];
+        app.selected_site_index = 0;
+        app.map_center_lat = 41.25;
+        app.map_center_lon = -101.75;
+        app.map_scale = 432.1;
+
+        let ctx = egui::Context::default();
+        app.install_volume(test_aliased_velocity_volume(), None, false, &ctx);
+
+        assert_eq!(app.selected_site_index, 1);
+        assert_eq!(app.map_center_lat, 41.25);
+        assert_eq!(app.map_center_lon, -101.75);
+        assert_eq!(app.map_scale, 432.1);
+    }
+
+    #[test]
+    fn latest_load_clears_different_or_stale_display() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
+        let mut fresh = RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            now - chrono::Duration::minutes(5),
+        );
+
+        assert!(!should_clear_display_for_latest_load(
+            Some(&fresh),
+            "KTLX",
+            now
+        ));
+        assert!(should_clear_display_for_latest_load(
+            Some(&fresh),
+            "KGGW",
+            now
+        ));
+
+        fresh.volume_time = now - chrono::Duration::minutes(16);
+        assert!(should_clear_display_for_latest_load(
+            Some(&fresh),
+            "KTLX",
+            now
+        ));
+        assert!(!should_clear_display_for_latest_load(None, "KTLX", now));
+    }
+
+    #[test]
+    fn unchanged_realtime_refresh_requires_cache_hit_and_same_path() {
+        let current = Path::new("KTLX20260608_003703_RT081_V06");
+        let other = Path::new("KTLX20260608_003718_RT081_V06");
+
+        assert!(is_unchanged_realtime_refresh(true, current, Some(current)));
+        assert!(!is_unchanged_realtime_refresh(
+            false,
+            current,
+            Some(current)
+        ));
+        assert!(!is_unchanged_realtime_refresh(true, other, Some(current)));
+        assert!(!is_unchanged_realtime_refresh(true, current, None));
+    }
+
+    #[test]
     fn direct_viewport_lru_keeps_newest_signatures() {
         let policy = RenderWorkerCachePolicy { threads: 4 };
         let mut signatures = Vec::new();
@@ -3852,6 +6995,16 @@ mod tests {
         assert_eq!(image.pixels[1].to_array(), [255, 32, 16, 255]);
         assert_eq!(image.pixels[2].to_array(), [4, 128, 255, 255]);
         assert_eq!(image.pixels[3].to_array(), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn radar_texture_options_preserve_gate_pixels() {
+        let options = radar_texture_options();
+
+        assert_eq!(options.magnification, egui::TextureFilter::Nearest);
+        assert_eq!(options.minification, egui::TextureFilter::Nearest);
+        assert_eq!(options.wrap_mode, egui::TextureWrapMode::ClampToEdge);
+        assert_eq!(options.mipmap_mode, None);
     }
 
     #[test]
@@ -4004,6 +7157,556 @@ mod tests {
         assert!(!us_detail_visible(japan_kanto));
     }
 
+    #[test]
+    fn hot_text_summary_selection_keeps_recent_bursts_bounded() {
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 7, 21, 10, 0)
+            .single()
+            .expect("valid query time");
+        let recent_burst = (0..(HOT_TEXT_PRODUCTS_MAX_PER_TYPE + 4))
+            .map(|index| {
+                test_nws_product_summary(
+                    index,
+                    query_time - chrono::Duration::minutes(index as i64),
+                )
+            })
+            .collect::<Vec<_>>();
+        let selected = select_hot_text_summaries(recent_burst, query_time);
+
+        assert_eq!(selected.len(), HOT_TEXT_PRODUCTS_MAX_PER_TYPE);
+        assert_eq!(selected.first().unwrap().url, "https://example.test/0");
+        assert_eq!(
+            selected.last().unwrap().url,
+            format!(
+                "https://example.test/{}",
+                HOT_TEXT_PRODUCTS_MAX_PER_TYPE - 1
+            )
+        );
+    }
+
+    #[test]
+    fn hot_text_summary_selection_keeps_minimum_for_quiet_types() {
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 7, 21, 10, 0)
+            .single()
+            .expect("valid query time");
+        let quiet_type = (0..12)
+            .map(|index| {
+                test_nws_product_summary(
+                    index,
+                    query_time - chrono::Duration::minutes(180 + index as i64),
+                )
+            })
+            .collect::<Vec<_>>();
+        let selected = select_hot_text_summaries(quiet_type, query_time);
+
+        assert_eq!(selected.len(), HOT_TEXT_PRODUCTS_MIN_PER_TYPE);
+    }
+
+    #[test]
+    fn hazard_parser_extracts_warning_polygon_and_tags() {
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 4, 21, 16, 25, 0)
+            .single()
+            .expect("valid query time");
+        let records = parse_hazard_records_from_text(
+            Path::new("tor.txt"),
+            SAMPLE_TORNADO_WARNING,
+            Some(query_time),
+        );
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.event_family, "tornado");
+        assert_eq!(record.lifecycle_status.as_deref(), Some("Active"));
+        assert_eq!(record.tornado.as_deref(), Some("RADAR INDICATED"));
+        assert_eq!(record.hail_inches, Some(1.0));
+        assert_eq!(record.points.len(), 6);
+        assert_eq!(record.points[0].lat, 42.15);
+        assert_eq!(record.points[0].lon, -88.50);
+        assert!(hazard_polygon_contains_point(
+            &record.points,
+            HazardPoint {
+                lon: -88.20,
+                lat: 42.03
+            }
+        ));
+    }
+
+    #[test]
+    fn weather_gov_alert_parser_extracts_live_polygon_shape() {
+        let collection: WeatherAlertFeatureCollection =
+            serde_json::from_str(SAMPLE_ACTIVE_ALERT_GEOJSON).expect("active alert sample");
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 7, 19, 30, 0)
+            .single()
+            .expect("valid query time");
+        let records = parse_weather_alert_feature(&collection.features[0], query_time)
+            .expect("weather alert feature parse");
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.event_family, "tornado");
+        assert_eq!(record.label, "TOR 0045 RADAR INDICATED");
+        assert_eq!(record.event_id, "KSGF.TO.W.0045");
+        assert_eq!(record.lifecycle_status.as_deref(), Some("Active"));
+        assert_eq!(record.severity.as_deref(), Some("Extreme"));
+        assert_eq!(record.certainty.as_deref(), Some("Observed"));
+        assert_eq!(record.urgency.as_deref(), Some("Immediate"));
+        assert_eq!(record.points.len(), 4);
+        assert_eq!(record.points[0].lon, -94.10);
+        assert_eq!(record.points[0].lat, 37.40);
+        assert!(hazard_polygon_contains_point(
+            &record.points,
+            HazardPoint {
+                lon: -94.00,
+                lat: 37.33
+            }
+        ));
+    }
+
+    #[test]
+    fn hazard_click_prefers_smaller_warning_inside_broad_discussion() {
+        let rect = test_map_rect();
+        let warning = test_hazard_record(
+            "KSHV.SV.W.0200",
+            "SVR 0200",
+            "severe thunderstorm",
+            square_hazard_points(-0.4, -0.4, 0.4, 0.4),
+        );
+        let discussion = test_hazard_record(
+            "spc-md-1014",
+            "MD 1014",
+            "mesoscale discussion",
+            square_hazard_points(-5.0, -5.0, 5.0, 5.0),
+        );
+        let app = test_viewer_app_with_hazards(vec![warning, discussion]);
+
+        assert_eq!(app.hazard_at_position(rect, rect.center()), Some(0));
+    }
+
+    #[test]
+    fn hazard_click_tolerance_selects_visible_thin_polygon_edge() {
+        let rect = test_map_rect();
+        let warning = test_hazard_record(
+            "KSGF.TO.W.0045",
+            "TOR 0045",
+            "tornado",
+            square_hazard_points(-0.1, -0.1, 0.1, 0.1),
+        );
+        let app = test_viewer_app_with_hazards(vec![warning]);
+        let right_edge = app.lon_lat_to_screen(rect, 0.1, 0.0);
+        let near_edge = right_edge + egui::vec2(HAZARD_CLICK_TOLERANCE_PX - 1.0, 0.0);
+        let far_edge = right_edge + egui::vec2(HAZARD_CLICK_TOLERANCE_PX + 2.0, 0.0);
+
+        assert_eq!(app.hazard_at_position(rect, near_edge), Some(0));
+        assert_eq!(app.hazard_at_position(rect, far_edge), None);
+    }
+
+    #[test]
+    fn hazard_click_selects_visible_label_target_for_skinny_polygon() {
+        let rect = test_map_rect();
+        let warning = test_hazard_record(
+            "KFWD.FF.W.0009",
+            "FLW 0009",
+            "flash flood",
+            square_hazard_points(-0.001, -0.1, 0.001, 0.1),
+        );
+        let app = test_viewer_app_with_hazards(vec![warning]);
+        let label_center = app.hazard_screen_centroid(
+            rect,
+            &app.hazard_overlay.as_ref().unwrap().records[0].points,
+        );
+        let label_hit = label_center + egui::vec2(HAZARD_CLICK_TOLERANCE_PX + 2.0, 0.0);
+        let label_miss = label_center + egui::vec2(HAZARD_LABEL_CLICK_RADIUS_PX + 2.0, 0.0);
+
+        assert_eq!(app.hazard_at_position(rect, label_hit), Some(0));
+        assert_eq!(app.hazard_at_position(rect, label_miss), None);
+    }
+
+    #[test]
+    fn hazard_refresh_ignores_unchanged_overlay_records() {
+        let warning = test_hazard_record(
+            "KSGF.TO.W.0045",
+            "TOR 0045",
+            "tornado",
+            square_hazard_points(-0.1, -0.1, 0.1, 0.1),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![warning.clone()]);
+
+        assert!(!app.install_hazard_result(Ok(test_hazard_overlay(vec![warning])), false));
+    }
+
+    #[test]
+    fn hazard_refresh_preview_does_not_mutate_existing_overlay() {
+        let existing = test_hazard_record(
+            "KSGF.TO.W.0045",
+            "TOR 0045",
+            "tornado",
+            square_hazard_points(-0.1, -0.1, 0.1, 0.1),
+        );
+        let incoming = test_hazard_record(
+            "KSGF.SV.W.0324",
+            "SVR 0324",
+            "severe thunderstorm",
+            square_hazard_points(0.3, 0.3, 0.5, 0.5),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![existing]);
+
+        assert!(!app.install_hazard_result(Ok(test_hazard_overlay(vec![incoming])), true));
+        assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn hazard_preview_does_not_seed_empty_overlay() {
+        let incoming = test_hazard_record(
+            "KSGF.SV.W.0324",
+            "SVR 0324",
+            "severe thunderstorm",
+            square_hazard_points(0.3, 0.3, 0.5, 0.5),
+        );
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.hazard_overlay = None;
+
+        assert!(!app.install_hazard_result(Ok(test_hazard_overlay(vec![incoming])), true));
+        assert!(app.hazard_overlay.is_none());
+    }
+
+    #[test]
+    fn live_overlay_drops_expired_records() {
+        let start = Instant::now();
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 7, 22, 20, 0)
+            .single()
+            .expect("valid query time");
+        let active = test_hazard_record(
+            "active",
+            "SVR 0001",
+            "severe thunderstorm",
+            square_hazard_points(0.0, 0.0, 1.0, 1.0),
+        );
+        let mut expired = test_hazard_record(
+            "expired",
+            "SVR 0002",
+            "severe thunderstorm",
+            square_hazard_points(2.0, 2.0, 3.0, 3.0),
+        );
+        expired.lifecycle_status = Some("Expired".to_owned());
+
+        let overlay = build_live_hazard_overlay(
+            "test".to_owned(),
+            query_time,
+            2,
+            2,
+            0,
+            start,
+            vec![expired, active],
+        );
+
+        assert_eq!(overlay.records.len(), 1);
+        assert_eq!(overlay.records[0].event_id, "active");
+    }
+
+    #[test]
+    fn active_alert_geometry_wins_duplicate_text_record() {
+        let mut alert = test_hazard_record(
+            "KBYZ.SV.W.0027",
+            "SVR 0027",
+            "severe thunderstorm",
+            square_hazard_points(-1.0, -1.0, 1.0, 1.0),
+        );
+        alert.action = "ALERT".to_owned();
+        alert.source_url = Some("https://api.weather.gov/alerts/1".to_owned());
+        let mut text = test_hazard_record(
+            "KBYZ.SV.W.0027",
+            "SVR 0027",
+            "severe thunderstorm",
+            square_hazard_points(-20.0, -20.0, 20.0, 20.0),
+        );
+        text.action = "NEW".to_owned();
+        text.details.push("Richer text detail".to_owned());
+        let mut records = vec![alert.clone(), text];
+
+        dedupe_hazard_records(&mut records);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].bbox, alert.bbox);
+        assert_eq!(records[0].details, ["Richer text detail"]);
+    }
+
+    #[test]
+    fn nonconvex_warning_polygon_can_be_filled() {
+        let points = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(4.0, 0.0),
+            egui::pos2(4.0, 4.0),
+            egui::pos2(2.0, 2.0),
+            egui::pos2(0.0, 4.0),
+        ];
+
+        let mesh = filled_polygon_mesh(&points, egui::Color32::from_rgb(255, 200, 0))
+            .expect("nonconvex polygon triangulates");
+
+        assert_eq!(mesh.indices.len(), 9);
+        assert_eq!(mesh.vertices.len(), 5);
+    }
+
+    #[test]
+    fn map_projection_equalizes_local_lat_lon_kilometers() {
+        let rect = test_map_rect();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        app.map_scale = 100.0;
+
+        let center = app.lon_lat_to_screen(rect, -97.0, 35.0);
+        let north = app.lon_lat_to_screen(rect, -97.0, 36.0);
+        let east = app.lon_lat_to_screen(rect, -97.0 + 1.0 / app.lon_screen_scale(), 35.0);
+
+        assert!((center.distance(north) - center.distance(east)).abs() < 0.01);
+    }
+
+    #[test]
+    fn hazard_refresh_selection_matches_event_id_in_new_overlay() {
+        let records = vec![
+            test_hazard_record(
+                "first",
+                "TOR 0001",
+                "tornado",
+                square_hazard_points(-1.0, -1.0, -0.5, -0.5),
+            ),
+            test_hazard_record(
+                "second",
+                "SVR 0002",
+                "severe thunderstorm",
+                square_hazard_points(0.5, 0.5, 1.0, 1.0),
+            ),
+        ];
+
+        assert_eq!(
+            selected_hazard_index_for_event_id(&records, Some("second")),
+            Some(1)
+        );
+        assert_eq!(
+            selected_hazard_index_for_event_id(&records, Some("missing")),
+            None
+        );
+        assert_eq!(selected_hazard_index_for_event_id(&records, None), None);
+    }
+
+    #[test]
+    fn spc_md_product_parser_extracts_compact_polygon_and_click_details() {
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 7, 19, 30, 0)
+            .single()
+            .expect("valid query time");
+        let record = parse_spc_md_product_page(
+            "https://www.spc.noaa.gov/products/md/md1015.html",
+            SAMPLE_SPC_MD_HTML,
+            query_time,
+        )
+        .expect("spc md record");
+
+        assert_eq!(record.event_family, "mesoscale discussion");
+        assert_eq!(record.label, "MD 1015");
+        assert_eq!(
+            record.headline.as_deref(),
+            Some("Severe potential...Watch unlikely")
+        );
+        assert_eq!(record.area.as_deref(), Some("portions of the Mid-Atlantic"));
+        assert_eq!(
+            record.source_url.as_deref(),
+            Some("https://www.spc.noaa.gov/products/md/md1015.html")
+        );
+        assert!(
+            record
+                .details
+                .iter()
+                .any(|line| line.contains("Watch issuance 5 percent"))
+        );
+        assert_eq!(record.points[0].lat, 36.37);
+        assert_eq!(record.points[0].lon, -75.80);
+        assert!(hazard_polygon_contains_point(
+            &record.points,
+            HazardPoint {
+                lon: -77.2,
+                lat: 37.0
+            }
+        ));
+    }
+
+    #[test]
+    fn hazard_parser_marks_expired_against_query_time() {
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 4, 21, 17, 0, 0)
+            .single()
+            .expect("valid query time");
+        let records = parse_hazard_records_from_text(
+            Path::new("tor.txt"),
+            SAMPLE_TORNADO_WARNING,
+            Some(query_time),
+        );
+
+        assert_eq!(records[0].lifecycle_status.as_deref(), Some("Expired"));
+    }
+
+    #[test]
+    fn hazard_parser_extracts_mesoscale_discussion_polygon() {
+        let records =
+            parse_hazard_records_from_text(Path::new("mcd.txt"), SAMPLE_MESOSCALE_DISCUSSION, None);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_family, "mesoscale discussion");
+        assert_eq!(records[0].label, "MD 123");
+        assert_eq!(records[0].office, "KWNS");
+        assert_eq!(records[0].points.len(), 4);
+    }
+
+    #[test]
+    fn hazard_parser_extracts_watch_polygon() {
+        let records = parse_hazard_records_from_text(Path::new("watch.txt"), SAMPLE_WATCH, None);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_family, "watch");
+        assert_eq!(records[0].label, "WATCH 44");
+        assert_eq!(records[0].points[0].lon, -97.50);
+    }
+
+    fn test_viewer_app_with_hazards(records: Vec<HazardRecord>) -> ViewerApp {
+        let (render_sender, _render_request_receiver) = mpsc::channel::<RenderRequest>();
+        let (_render_result_sender, render_receiver) = mpsc::channel::<AsyncRenderResult>();
+        let (render_recycle_sender, _render_recycle_receiver) =
+            mpsc::channel::<RenderRecycleBuffer>();
+        ViewerApp {
+            source_path: PathBuf::new(),
+            volume: None,
+            selected_cut: 0,
+            selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
+            color_tables: ColorTableSet::default(),
+            color_table_target: ColorTableFamily::Velocity,
+            color_table_path_text: String::new(),
+            color_table_status: String::new(),
+            texture: None,
+            texture_key: None,
+            render_sender,
+            render_receiver,
+            render_recycle_sender,
+            pending_render_key: None,
+            map_center_lon: 0.0,
+            map_center_lat: 0.0,
+            map_scale: 100.0,
+            radar_range_km: DEFAULT_RADAR_RANGE_KM,
+            load_timing: None,
+            render_ms: None,
+            worker_ms: None,
+            texture_ms: None,
+            sample_cache_build_ms: None,
+            basemap_ms: None,
+            perf: PerfTelemetry::new(),
+            status: String::new(),
+            sites: Vec::new(),
+            selected_site_index: 0,
+            site_catalog_receiver: None,
+            load_receiver: None,
+            hazard_receiver: None,
+            pending_site_id: None,
+            cursor_readout: None,
+            hazard_overlay: Some(test_hazard_overlay(records)),
+            hazard_path_text: String::new(),
+            hazard_status: String::new(),
+            hazards_visible: true,
+            hazards_active_only: true,
+            hazard_fill_alpha: DEFAULT_HAZARD_FILL_ALPHA,
+            hidden_hazard_families: default_hidden_hazard_families(),
+            realtime_level2_auto_refresh: false,
+            last_realtime_level2_refresh: None,
+            live_hazard_auto_refresh: false,
+            show_performance_stats: false,
+            last_live_hazard_refresh: None,
+            selected_hazard_index: None,
+            storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
+            storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
+            dealiased_readout_cache: None,
+        }
+    }
+
+    fn test_hazard_overlay(records: Vec<HazardRecord>) -> HazardOverlay {
+        HazardOverlay {
+            source_label: "test".to_owned(),
+            query_time_utc: None,
+            scanned_items: records.len(),
+            parsed_items: records.len(),
+            polygon_records: records.len(),
+            error_count: 0,
+            load_ms: 0.0,
+            records,
+        }
+    }
+
+    fn test_hazard_record(
+        event_id: &str,
+        label: &str,
+        event_family: &str,
+        points: Vec<HazardPoint>,
+    ) -> HazardRecord {
+        HazardRecord {
+            event_id: event_id.to_owned(),
+            label: label.to_owned(),
+            event_family: event_family.to_owned(),
+            action: "NEW".to_owned(),
+            lifecycle_status: Some("Active".to_owned()),
+            office: "KOUN".to_owned(),
+            headline: None,
+            source_url: None,
+            area: None,
+            motion: None,
+            details: Vec::new(),
+            valid_start: None,
+            valid_end: None,
+            severity: None,
+            certainty: None,
+            urgency: None,
+            tornado: None,
+            hail_inches: None,
+            wind_mph: None,
+            damage_threat: None,
+            bbox: hazard_bbox(&points),
+            points,
+        }
+    }
+
+    fn square_hazard_points(west: f32, south: f32, east: f32, north: f32) -> Vec<HazardPoint> {
+        vec![
+            HazardPoint {
+                lon: west,
+                lat: south,
+            },
+            HazardPoint {
+                lon: east,
+                lat: south,
+            },
+            HazardPoint {
+                lon: east,
+                lat: north,
+            },
+            HazardPoint {
+                lon: west,
+                lat: north,
+            },
+        ]
+    }
+
+    fn test_map_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0))
+    }
+
+    fn test_nws_product_summary(index: usize, issuance_time: DateTime<Utc>) -> NwsProductSummary {
+        NwsProductSummary {
+            url: format!("https://example.test/{index}"),
+            issuance_time,
+        }
+    }
+
     fn test_ref_then_velocity_volume() -> RadarVolume {
         let gate_range = radar_core::GateRange {
             first_gate_m: 500,
@@ -4058,6 +7761,37 @@ mod tests {
         volume
     }
 
+    fn test_aliased_velocity_volume() -> RadarVolume {
+        let gate_range = radar_core::GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 10_000,
+            gate_count: 3,
+        };
+        let mut site = radar_core::RadarSite::new("TEST");
+        site.latitude_deg = Some(35.0);
+        site.longitude_deg = Some(-97.0);
+        let mut volume = RadarVolume::new(site, chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        let mut radial = test_radial(0.0, gate_range.clone());
+        radial.nyquist_velocity_mps = Some(10.0);
+        cut.radials.push(radial);
+
+        let mut velocity_grid = MomentGrid::new_u8(
+            MomentType::Velocity,
+            gate_range,
+            1.0,
+            64.0,
+            Some(0),
+            Some(1),
+        );
+        velocity_grid
+            .push_u8_row_slice(0, &[64, 72, 55])
+            .expect("velocity row");
+        cut.moments.insert(MomentType::Velocity, velocity_grid);
+        volume.cuts.push(cut);
+        volume
+    }
+
     fn test_radial(azimuth_deg: f32, gate_range: radar_core::GateRange) -> radar_core::Radial {
         radar_core::Radial {
             azimuth_deg,
@@ -4074,6 +7808,7 @@ mod tests {
             1,
             width as usize,
             MomentType::Velocity,
+            0,
             test_viewport_key(width, 100),
         )
     }
@@ -4107,6 +7842,7 @@ mod tests {
                 1,
                 1,
                 MomentType::Velocity,
+                0,
                 test_viewport_key(width, height),
             ),
             render_ms,
@@ -4146,4 +7882,112 @@ mod tests {
             .filter(|layer| bounds.intersects_bbox(layer.bounds))
             .count()
     }
+
+    const SAMPLE_TORNADO_WARNING: &str = r#"401
+WUUS53 KLOT 211600
+TORLOT
+ILC031-043-197-211630-
+/O.NEW.KLOT.TO.W.0001.260421T1600Z-260421T1630Z/
+
+BULLETIN - EAS ACTIVATION REQUESTED
+Tornado Warning
+National Weather Service Chicago IL
+1100 AM CDT Tue Apr 21 2026
+
+LAT...LON 4215 8850 4203 8820 4194 8810 4198 8786 4213 8784 4222 8839
+TIME...MOT...LOC 1600Z 265DEG 31KT 4208 8837
+TORNADO...RADAR INDICATED
+MAX HAIL SIZE...1.00 IN
+
+$$
+"#;
+
+    const SAMPLE_MESOSCALE_DISCUSSION: &str = r#"ACUS11 KWNS 211600
+SWOMCD
+SPC MCD 211600
+
+Mesoscale Discussion 0123
+NWS Storm Prediction Center Norman OK
+1100 AM CDT Tue Apr 21 2026
+
+Areas affected...northern Illinois
+
+LAT...LON 4215 8850 4194 8810 4198 8786 4222 8839
+
+$$
+"#;
+
+    const SAMPLE_WATCH: &str = r#"WWUS20 KWNS 211600
+SEL4
+SPC WW 211600
+
+URGENT - IMMEDIATE BROADCAST REQUESTED
+Tornado Watch Number 44
+NWS Storm Prediction Center Norman OK
+1100 AM CDT Tue Apr 21 2026
+
+WATCH OUTLINE UPDATE FOR WS 44
+LAT...LON 3500 9750 3520 9500 3350 9440 3320 9700
+
+$$
+"#;
+
+    const SAMPLE_ACTIVE_ALERT_GEOJSON: &str = r#"{
+  "features": [
+    {
+      "id": "urn:test:tor",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-94.10, 37.40],
+          [-93.90, 37.38],
+          [-93.92, 37.25],
+          [-94.12, 37.26],
+          [-94.10, 37.40]
+        ]]
+      },
+      "properties": {
+        "id": "urn:test:tor",
+        "event": "Tornado Warning",
+        "senderName": "NWS Springfield MO",
+        "headline": "Tornado Warning issued June 7 at 2:09PM CDT until June 7 at 3:00PM CDT by NWS Springfield MO",
+        "effective": "2026-06-07T14:09:00-05:00",
+        "expires": "2026-06-07T15:00:00-05:00",
+        "ends": "2026-06-07T15:00:00-05:00",
+        "severity": "Extreme",
+        "certainty": "Observed",
+        "urgency": "Immediate",
+        "parameters": {
+          "VTEC": ["/O.NEW.KSGF.TO.W.0045.260607T1909Z-260607T2000Z/"],
+          "tornadoDetection": ["RADAR INDICATED"],
+          "maxHailSize": ["0.00"]
+        }
+      }
+    }
+  ]
+}"#;
+
+    const SAMPLE_SPC_MD_HTML: &str = r#"<html><body><pre>
+   Mesoscale Discussion 1015
+   NWS Storm Prediction Center Norman OK
+   0159 PM CDT Sun Jun 07 2026
+
+   Areas affected...portions of the Mid-Atlantic
+
+   Concerning...Severe potential...Watch unlikely
+
+   Valid 071859Z - 072100Z
+   Probability of Watch Issuance...5 percent
+
+   SUMMARY...Widely scattered thunderstorms may pose a localized risk
+   for strong/damaging wind gusts and perhaps small hail this
+   afternoon. Watch issuance is not expected.
+
+   LAT...LON   36377580 36277612 36247691 36287734 36357769 36547819
+               36707854 36887880 37087908 37467941 37857947 38347939
+               38487907 38427845 38227760 38097690 37967599 37867534
+               37727542 37317567 36987586 36747583 36497571 36377580
+
+   MOST PROBABLE PEAK WIND GUST...UP TO 60 MPH
+</pre></body></html>"#;
 }

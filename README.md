@@ -1,8 +1,8 @@
 # Radar RS Analyst
 
-Radar RS Analyst is a native Rust Level II radar viewer focused on fast, high-fidelity CPU rendering. It loads public NEXRAD Level II data, shows a lightweight map-style radar canvas, and keeps the native super-resolution pixel pattern visible for analyst workflows.
+Radar RS Analyst is a native Rust Level II radar viewer focused on fast, high-fidelity CPU rendering. It loads public NEXRAD Level II data, shows a lightweight map-style radar canvas, overlays live NWS/SPC hazards, and keeps the native super-resolution pixel pattern visible for analyst workflows.
 
-This is an early base release. The priority is a small, fast desktop app that preserves radar detail rather than a broad feature clone.
+This is early analyst software. The priority is a small, fast desktop app that preserves radar detail and keeps interaction fluid while the feature surface grows.
 
 ## Download
 
@@ -11,17 +11,23 @@ Windows users can download the latest `radar-rs-analyst-windows-x64.zip` from th
 ## Features
 
 - Native Level II Archive II decode for public NEXRAD data.
+- Public realtime Level II chunk loading for faster access to in-progress scans when available.
 - Full-resolution CPU viewport rendering, with no quality downgrade at zoom.
-- Reflectivity, velocity, storm-relative velocity, spectrum width, ZDR, RHO, PHI, and CFP product selection when present in the scan.
+- Reflectivity, velocity, dealiased velocity, storm-relative velocity, spectrum width, ZDR, RHO, PHI, and CFP product selection when present in the scan.
+- Built-in reflectivity and velocity color tables plus user-imported `.pal`/`.pal3` color tables.
 - Lightweight vector basemap with state/county boundaries and zoom-aware town/county labels.
-- Radar-site selection and right-click nearest-site loading.
+- Live NWS warnings/advisories, SPC mesoscale discussions, and watch-style hazard polygons with click details.
+- Radar-site selection and right-click nearest-site loading without forcing the map to recenter.
 - VROT/source-gate readout for velocity interrogation.
+- Arrow-key product and tilt stepping for fast analyst workflows.
 - Honest timing readout split into lookup, fetch, read, decode, render, worker, texture, and cache stages.
 - Cache-aware latest-scan loading so repeated loads are fast while still allowing new scans to download.
 
 ## Notes
 
 - First-time latest-scan loads depend on public NOAA/AWS network latency and file size. Repeated loads use the local cache when possible.
+- Live hazard and realtime Level II availability depends on upstream public endpoints.
+- Dealiasing is conservative and lightweight; it is designed to improve obvious wraps without hiding raw velocity access.
 - The app is experimental analyst software, not an official NWS tool, and should not be used as the only source for life-safety decisions.
 - Public Level II data availability and latency are controlled by upstream data providers.
 
