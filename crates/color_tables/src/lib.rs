@@ -459,8 +459,7 @@ impl fmt::Display for ColorTableError {
 impl std::error::Error for ColorTableError {}
 
 pub fn builtin_reflectivity_table() -> ColorTable {
-    ColorTable::parse_stepped("WxTools RadarScope BR", RADARSCOPE_REFLECTIVITY_TABLE)
-        .expect("built-in reflectivity color table is valid")
+    gr2_reflectivity_table()
 }
 
 pub fn builtin_velocity_table() -> ColorTable {
@@ -481,24 +480,15 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
     match family {
         ColorTableFamily::Reflectivity => vec![
             builtin_reflectivity_table(),
-            analyst_reflectivity_table(),
             nws_reflectivity_table(),
-            gr2_reflectivity_table(),
-            storm_detail_reflectivity_table(),
+            dark_scope_reflectivity_table(),
             hail_core_reflectivity_table(),
             low_precip_reflectivity_table(),
-            dark_scope_reflectivity_table(),
         ],
         ColorTableFamily::Velocity => vec![
             builtin_velocity_table(),
             analyst_velocity_table(),
-            vortex_velocity_table(),
-            nws_velocity_table(),
-            gr2_velocity_table(),
-            tight_couplet_velocity_table(),
             radarscope_contrast_velocity_table(),
-            nws_split_velocity_table(),
-            dark_analyst_velocity_table(),
         ],
         ColorTableFamily::SpectrumWidth => vec![builtin_spectrum_width_table()],
         ColorTableFamily::Generic => vec![builtin_generic_table()],
@@ -527,27 +517,8 @@ pub fn analyst_reflectivity_table() -> ColorTable {
 }
 
 pub fn nws_reflectivity_table() -> ColorTable {
-    ColorTable::new_stepped(
-        "NWS Classic REF",
-        vec![
-            stop(5.0, 4, 233, 231),
-            stop(10.0, 1, 159, 244),
-            stop(15.0, 3, 0, 244),
-            stop(20.0, 2, 253, 2),
-            stop(25.0, 1, 197, 1),
-            stop(30.0, 0, 142, 0),
-            stop(35.0, 253, 248, 2),
-            stop(40.0, 229, 188, 0),
-            stop(45.0, 253, 149, 0),
-            stop(50.0, 253, 0, 0),
-            stop(55.0, 212, 0, 0),
-            stop(60.0, 188, 0, 0),
-            stop(65.0, 248, 0, 253),
-            stop(70.0, 152, 84, 198),
-            stop(75.0, 255, 255, 255),
-        ],
-    )
-    .expect("built-in nws reflectivity color table is valid")
+    ColorTable::parse_stepped("NWS Classic REF", NWS_CLASSIC_REFLECTIVITY_TABLE)
+        .expect("built-in nws reflectivity color table is valid")
 }
 
 pub fn gr2_reflectivity_table() -> ColorTable {
@@ -796,47 +767,50 @@ fn unit_value_to_mps_scale(units: &str) -> f32 {
     }
 }
 
-const RADARSCOPE_REFLECTIVITY_TABLE: &str = r#"
-product: BR
-units: dBZ
-step: 5
-color4: -15 0 0 0 0
-color: 5 29 37 60
-color: 17.5 89 155 171
-color: 22.5 33 186 72
-color: 32.5 5 101 1
-color: 37.5 251 252 0
-color: 42.5 253 149 2
-color: 50 253 38 0
-color: 60 193 148 179
-color: 70 165 2 215
-color: 75 135 255 253
-color: 80 173 99 64
-color: 85 105 0 4
-color: 95 0 0 0
-"#;
-
 const GR2_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
 step: 5
 color4: -10 0 0 0 0
-color4: 0 0 0 0 0
-color: 5 4 233 231
-color: 10 1 159 244
-color: 15 3 0 244
-color: 20 2 253 2
-color: 25 1 197 1
-color: 30 0 142 0
-color: 35 253 248 2
-color: 40 229 188 0
-color: 45 253 149 0
-color: 50 253 0 0
-color: 55 212 0 0
-color: 60 188 0 0
-color: 65 248 0 253
-color: 70 152 84 198
-color: 75 255 255 255
+color4: 7.5 0 0 0 0
+color: 10 4 233 231
+color: 15 1 159 244
+color: 20 3 0 244
+color: 25 2 253 2
+color: 30 1 197 1
+color: 35 0 142 0
+color: 40 253 248 2
+color: 45 229 188 0
+color: 50 253 149 0
+color: 55 253 0 0
+color: 62.5 212 0 0
+color: 70 188 0 0
+color: 77.5 248 0 253
+color: 85 152 84 198
+color: 92.5 255 255 255
+"#;
+
+const NWS_CLASSIC_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 5
+color4: -10 0 0 0 0
+color4: 7.5 0 0 0 0
+color: 10 4 233 231
+color: 15 1 159 244
+color: 20 3 0 244
+color: 25 2 253 2
+color: 30 1 197 1
+color: 35 0 142 0
+color: 40 253 248 2
+color: 45 229 188 0
+color: 50 253 149 0
+color: 55 253 0 0
+color: 62.5 212 0 0
+color: 70 188 0 0
+color: 77.5 248 0 253
+color: 85 152 84 198
+color: 92.5 255 255 255
 "#;
 
 const STORM_DETAIL_REFLECTIVITY_TABLE: &str = r#"
@@ -867,8 +841,7 @@ product: BR
 units: dBZ
 step: 5
 color4: -10 0 0 0 0
-color4: 0 0 0 0 0
-color: 5 24 46 82
+color4: 7.5 0 0 0 0
 color: 10 35 98 164
 color: 15 33 168 210
 color: 20 16 172 78
@@ -878,12 +851,12 @@ color: 35 234 232 36
 color: 40 252 168 22
 color: 45 252 88 18
 color: 50 246 26 28
-color: 55 176 0 16
-color: 60 116 0 0
-color: 65 210 38 190
-color: 70 255 255 255
-color: 75 112 228 255
+color: 57.5 176 0 16
+color: 65 116 0 0
+color: 72.5 182 20 150
 color: 80 255 255 255
+color: 87.5 112 228 255
+color: 95 255 255 255
 "#;
 
 const LOW_PRECIP_REFLECTIVITY_TABLE: &str = r#"
@@ -891,9 +864,7 @@ product: BR
 units: dBZ
 step: 2.5
 color4: -15 0 0 0 0
-color4: 0 0 0 0 0
-color: 2.5 14 28 58
-color: 5 24 56 100
+color4: 7.5 0 0 0 0
 color: 10 38 116 174
 color: 15 42 184 214
 color: 20 58 204 132
@@ -903,9 +874,10 @@ color: 35 224 226 64
 color: 40 250 178 50
 color: 45 244 96 42
 color: 50 218 44 52
-color: 55 160 26 78
-color: 60 188 78 190
-color: 70 238 238 244
+color: 57.5 160 26 78
+color: 65 136 18 44
+color: 75 188 78 190
+color: 90 238 238 244
 "#;
 
 const DARK_SCOPE_REFLECTIVITY_TABLE: &str = r#"
@@ -913,8 +885,7 @@ product: BR
 units: dBZ
 step: 5
 color4: -10 0 0 0 0
-color4: 0 0 0 0 0
-color: 5 18 36 62
+color4: 7.5 0 0 0 0
 color: 10 38 86 128
 color: 15 52 136 170
 color: 20 30 158 86
@@ -924,11 +895,11 @@ color: 35 196 206 54
 color: 40 232 156 42
 color: 45 234 88 34
 color: 50 218 38 40
-color: 55 156 24 30
-color: 60 126 30 112
-color: 65 172 68 196
-color: 70 226 226 232
-color: 80 255 255 255
+color: 57.5 156 24 30
+color: 65 126 30 72
+color: 75 172 68 196
+color: 87.5 226 226 232
+color: 95 255 255 255
 "#;
 
 const VORTEX_VELO_TABLE: &str = r#"
@@ -1302,16 +1273,15 @@ mod tests {
     }
 
     #[test]
-    fn radarscope_reflectivity_preset_is_stepped() {
+    fn default_reflectivity_preset_filters_low_dbz_and_stretches_high_end() {
         let table = builtin_reflectivity_table();
 
-        assert_eq!(table.name(), "WxTools RadarScope BR");
+        assert_eq!(table.name(), "GR2Analyst Classic REF");
         assert!(!table.interpolates());
         assert_eq!(table.sample_mode_label(), "quantized stepped");
         assert_eq!(table.step_size(), Some(5.0));
-        assert_eq!(table.sample(0.0), Rgba8::TRANSPARENT);
-        assert_eq!(table.sample(5.0), Rgba8::opaque(29, 37, 60));
-        assert_ne!(table.sample(10.0), table.sample(5.0));
+        assert_eq!(table.sample(5.0), Rgba8::TRANSPARENT);
+        assert_ne!(table.sample(10.0), Rgba8::TRANSPARENT);
     }
 
     #[test]
@@ -1370,23 +1340,43 @@ mod tests {
 
     #[test]
     fn built_in_presets_offer_multiple_ref_and_velocity_choices() {
-        assert!(builtin_tables_for_family(ColorTableFamily::Reflectivity).len() >= 8);
-        assert!(builtin_tables_for_family(ColorTableFamily::Velocity).len() >= 9);
+        let reflectivity = builtin_tables_for_family(ColorTableFamily::Reflectivity)
+            .into_iter()
+            .map(|table| table.name().to_owned())
+            .collect::<Vec<_>>();
+        let velocity = builtin_tables_for_family(ColorTableFamily::Velocity)
+            .into_iter()
+            .map(|table| table.name().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            reflectivity,
+            vec![
+                "GR2Analyst Classic REF",
+                "NWS Classic REF",
+                "Dark Scope REF",
+                "Analyst Hail Core REF",
+                "Analyst Low Precip REF",
+            ]
+        );
+        assert_eq!(
+            velocity,
+            vec![
+                "Analyst Tornado VEL",
+                "Analyst Pro VEL",
+                "RadarScope Contrast VEL",
+            ]
+        );
     }
 
     #[test]
-    fn added_analyst_presets_use_quantized_steps() {
+    fn accepted_reflectivity_presets_filter_junk_and_delay_purple() {
         for table in [
             gr2_reflectivity_table(),
-            storm_detail_reflectivity_table(),
+            nws_reflectivity_table(),
+            dark_scope_reflectivity_table(),
             hail_core_reflectivity_table(),
             low_precip_reflectivity_table(),
-            dark_scope_reflectivity_table(),
-            gr2_velocity_table(),
-            tight_couplet_velocity_table(),
-            radarscope_contrast_velocity_table(),
-            nws_split_velocity_table(),
-            dark_analyst_velocity_table(),
         ] {
             assert_eq!(table.sample_mode_label(), "quantized stepped");
             assert!(
@@ -1394,6 +1384,34 @@ mod tests {
                 "{} has step size",
                 table.name()
             );
+            assert_eq!(table.sample(5.0), Rgba8::TRANSPARENT);
+            assert_ne!(
+                table.sample(10.0),
+                Rgba8::TRANSPARENT,
+                "{} should show 10 dBZ and higher",
+                table.name()
+            );
+            for stop in table.stops() {
+                let [red, green, blue, alpha] = stop.color.to_array();
+                let purple_or_magenta = alpha > 0 && red > 120 && blue > 120 && green < 120;
+                assert!(
+                    !purple_or_magenta || stop.value >= 70.0,
+                    "{} brings purple too early at {:.1} dBZ: {red},{green},{blue}",
+                    table.name(),
+                    stop.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_velocity_presets_stay_available() {
+        for table in [
+            builtin_velocity_table(),
+            analyst_velocity_table(),
+            radarscope_contrast_velocity_table(),
+        ] {
+            assert!(!table.interpolates());
         }
     }
 }
