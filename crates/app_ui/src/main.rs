@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use color_tables::{ColorTable, ColorTableFamily, ColorTableSet, builtin_tables_for_family};
-use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite};
+use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
@@ -40,7 +40,8 @@ const LOW_CORE_PREVIEW_THREADS: usize = 4;
 const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 8;
 const LIVE_HAZARD_REFRESH_SECONDS: u64 = 10;
-const REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
+const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
+const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
 const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
 const DEFAULT_RADAR_OVERLAY_ALPHA: u8 = 210;
 const MIN_RADAR_OVERLAY_ALPHA: u8 = 48;
@@ -342,6 +343,7 @@ struct ViewerApp {
     hidden_hazard_families: BTreeSet<String>,
     realtime_level2_auto_refresh: bool,
     last_realtime_level2_refresh: Option<Instant>,
+    live_refresh_skip_reason: Option<String>,
     live_hazard_auto_refresh: bool,
     show_performance_stats: bool,
     sidebar_tab: SidebarTab,
@@ -419,7 +421,10 @@ struct AsyncLoadResult {
 enum AsyncLoadUpdate {
     Preview(DecodedLoad),
     History(DecodedLoadBatch, bool),
-    Unchanged,
+    Unchanged {
+        timings: Option<LoadTimings>,
+        reason: String,
+    },
     Final(Result<DecodedLoadBatch, String>),
 }
 
@@ -440,6 +445,17 @@ struct LoadTimings {
     read_ms: Option<f32>,
     decode_ms: f32,
     preview_ms: Option<f32>,
+    realtime_poll_start_utc: Option<DateTime<Utc>>,
+    realtime_poll_end_utc: Option<DateTime<Utc>>,
+    realtime_volume_id: Option<u16>,
+    realtime_chunk_count: Option<usize>,
+    realtime_last_chunk_id: Option<u16>,
+    realtime_last_chunk_type: Option<RealtimeChunkType>,
+    realtime_complete: Option<bool>,
+    realtime_total_size: Option<u64>,
+    realtime_assembled_size: Option<u64>,
+    realtime_last_modified_utc: Option<DateTime<Utc>>,
+    realtime_volume_time_utc: Option<DateTime<Utc>>,
 }
 
 impl LoadTimings {
@@ -447,6 +463,43 @@ impl LoadTimings {
         self.total_ms = total_start.elapsed().as_secs_f32() * 1000.0;
         self
     }
+}
+
+#[derive(Clone, Debug)]
+struct RealtimeLoadError {
+    reason: String,
+    timings: Option<LoadTimings>,
+}
+
+impl RealtimeLoadError {
+    fn new(reason: String) -> Self {
+        Self {
+            reason,
+            timings: None,
+        }
+    }
+
+    fn with_timings(reason: String, timings: LoadTimings) -> Self {
+        Self {
+            reason,
+            timings: Some(timings),
+        }
+    }
+}
+
+fn record_realtime_level2_metadata(
+    timings: &mut LoadTimings,
+    realtime: &data_source::RealtimeLevel2Volume,
+) {
+    let latest_chunk = realtime.chunks.last();
+    timings.realtime_volume_id = Some(realtime.volume_id);
+    timings.realtime_chunk_count = Some(realtime.chunks.len());
+    timings.realtime_last_chunk_id = latest_chunk.map(|chunk| chunk.chunk_id);
+    timings.realtime_last_chunk_type = latest_chunk.map(|chunk| chunk.chunk_type);
+    timings.realtime_complete = Some(realtime.complete);
+    timings.realtime_total_size = Some(realtime.total_size);
+    timings.realtime_last_modified_utc = latest_chunk.and_then(|chunk| chunk.object.last_modified);
+    timings.realtime_volume_time_utc = Some(realtime.volume_time);
 }
 
 struct AsyncSiteCatalogResult {
@@ -692,34 +745,50 @@ fn spawn_latest_level2_load_worker(
 
             let should_load_realtime = !explicit_loop_load || selected_identity.is_none();
             if should_load_realtime {
-                let realtime_result = (|| -> Result<DecodedLoad, String> {
+                let realtime_result = (|| -> Result<DecodedLoad, RealtimeLoadError> {
                     let mut realtime_timings = LoadTimings::default();
+                    let poll_start_utc = Utc::now();
+                    realtime_timings.realtime_poll_start_utc = Some(poll_start_utc);
                     let lookup_start = Instant::now();
                     let realtime = data_source::latest_realtime_level2_volume(&site.level2_id)
-                        .map_err(|err| err.to_string())?;
+                        .map_err(|err| RealtimeLoadError::new(err.to_string()))?;
                     realtime_timings.lookup_ms =
                         Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
                     realtime_timings.lookup_cache_hit = Some(false);
+                    record_realtime_level2_metadata(&mut realtime_timings, &realtime);
 
                     let fetch_start = Instant::now();
                     let downloaded =
                         data_source::download_realtime_volume(&realtime, &site_cache_dir)
-                            .map_err(|err| err.to_string())?;
+                            .map_err(|err| {
+                                realtime_timings.realtime_poll_end_utc = Some(Utc::now());
+                                RealtimeLoadError::with_timings(
+                                    err.to_string(),
+                                    realtime_timings.finish(total_start),
+                                )
+                            })?;
                     realtime_timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
                     realtime_timings.fetch_cache_hit = Some(downloaded.cache_hit);
+                    realtime_timings.realtime_assembled_size =
+                        downloaded.path.metadata().ok().map(|metadata| metadata.len());
                     if is_unchanged_realtime_refresh(
                         downloaded.cache_hit,
                         &downloaded.path,
                         current_source_path.as_deref(),
                     ) {
-                        return Err("realtime chunks unchanged".to_owned());
+                        realtime_timings.realtime_poll_end_utc = Some(Utc::now());
+                        return Err(RealtimeLoadError::with_timings(
+                            "unchanged cache hit".to_owned(),
+                            realtime_timings.finish(total_start),
+                        ));
                     }
 
+                    let decode_timings = realtime_timings;
                     let decoded = decode_load_path_with_optional_preview(
                         downloaded.path,
                         &format!("realtime L2 {site_id}"),
                         total_start,
-                        realtime_timings,
+                        decode_timings,
                         &sender,
                         should_preview_loads(),
                         if realtime.complete {
@@ -728,10 +797,22 @@ fn spawn_latest_level2_load_worker(
                             FrameStatus::LivePartial
                         },
                         format!("realtime L2 {site_id}"),
-                    )?;
+                    )
+                    .map_err(|err| {
+                        let mut timings = decode_timings;
+                        timings.realtime_poll_end_utc = Some(Utc::now());
+                        RealtimeLoadError::with_timings(err, timings.finish(total_start))
+                    })?;
                     if global_displayable_products(&decoded.volume).is_empty() {
-                        return Err("realtime chunks are not displayable yet".to_owned());
+                        let mut timings = decoded.timings;
+                        timings.realtime_poll_end_utc = Some(Utc::now());
+                        return Err(RealtimeLoadError::with_timings(
+                            "realtime chunks are not displayable yet".to_owned(),
+                            timings,
+                        ));
                     }
+                    let mut decoded = decoded;
+                    decoded.timings.realtime_poll_end_utc = Some(Utc::now());
                     Ok(decoded)
                 })();
                 if let Ok(decoded) = realtime_result {
@@ -749,9 +830,12 @@ fn spawn_latest_level2_load_worker(
                     decoded_frames.push(decoded);
                 } else if let Err(err) = realtime_result {
                     if mode == LatestLoadMode::AutoRefresh && current_source_path.is_some() {
-                        return Ok(AsyncLoadUpdate::Unchanged);
+                        return Ok(AsyncLoadUpdate::Unchanged {
+                            timings: err.timings,
+                            reason: err.reason,
+                        });
                     }
-                    fallback_error = Some(err);
+                    fallback_error = Some(err.reason);
                 }
             }
 
@@ -840,7 +924,11 @@ fn spawn_latest_level2_load_worker(
                     })));
                 }
                 if mode == LatestLoadMode::AutoRefresh {
-                    return Ok(AsyncLoadUpdate::Unchanged);
+                    return Ok(AsyncLoadUpdate::Unchanged {
+                        timings: None,
+                        reason: fallback_error
+                            .unwrap_or_else(|| "no displayable Level II scans found".to_owned()),
+                    });
                 }
                 return Err(fallback_error
                     .unwrap_or_else(|| "no displayable Level II scans found".to_owned()));
@@ -1585,7 +1673,7 @@ impl ViewerApp {
             color_tables: ColorTableSet::default(),
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
-            color_table_status: "Built-in Analyst Pro velocity and RadarScope reflectivity"
+            color_table_status: "Built-in GR2/NWS/Analyst reflectivity and Analyst velocity presets"
                 .to_owned(),
             texture: None,
             texture_key: None,
@@ -1626,6 +1714,7 @@ impl ViewerApp {
             hidden_hazard_families: default_hidden_hazard_families(),
             realtime_level2_auto_refresh: true,
             last_realtime_level2_refresh: None,
+            live_refresh_skip_reason: None,
             live_hazard_auto_refresh: true,
             show_performance_stats: false,
             sidebar_tab: SidebarTab::Radar,
@@ -1714,21 +1803,29 @@ impl ViewerApp {
     }
 
     fn maybe_refresh_realtime_level2(&mut self, ctx: &egui::Context) {
-        if !self.realtime_level2_auto_refresh || self.load_receiver.is_some() {
+        if !self.realtime_level2_auto_refresh {
+            return;
+        }
+        if self.load_receiver.is_some() {
+            self.live_refresh_skip_reason = Some("load receiver busy".to_owned());
+            ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
         let should_refresh = self
             .last_realtime_level2_refresh
             .is_none_or(|last_refresh| {
-                last_refresh.elapsed() >= Duration::from_secs(REALTIME_LEVEL2_REFRESH_SECONDS)
+                last_refresh.elapsed()
+                    >= Duration::from_secs(PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS)
             });
         if !should_refresh {
             ctx.request_repaint_after(Duration::from_secs(1));
             return;
         }
         let Some(site) = self.selected_site().cloned() else {
+            self.live_refresh_skip_reason = Some("no selected site".to_owned());
             return;
         };
+        self.live_refresh_skip_reason = None;
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::AutoRefresh);
     }
 
@@ -1742,7 +1839,7 @@ impl ViewerApp {
             if !layer.visible || layer.load_receiver.is_some() {
                 continue;
             }
-            let refresh_after = Duration::from_secs(REALTIME_LEVEL2_REFRESH_SECONDS)
+            let refresh_after = Duration::from_secs(OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS)
                 + Duration::from_millis((index as u64 % 8) * 350);
             let should_refresh = layer
                 .last_realtime_level2_refresh
@@ -1837,9 +1934,15 @@ impl ViewerApp {
                                     layer.status = format!("Loaded {}", message.label);
                                 }
                             }
-                            AsyncLoadUpdate::Unchanged => {
+                            AsyncLoadUpdate::Unchanged {
+                                timings,
+                                reason,
+                            } => {
+                                if let Some(timings) = timings {
+                                    layer.load_timing = Some(timings);
+                                }
                                 layer.load_receiver = None;
-                                layer.status = format!("Current {}", message.label);
+                                layer.status = format!("Current {} ({reason})", message.label);
                                 break;
                             }
                             AsyncLoadUpdate::Final(result) => {
@@ -2100,6 +2203,10 @@ impl ViewerApp {
             .unwrap_or_else(|| "No Level II frame loaded".to_owned())
     }
 
+    fn selected_frame(&self) -> Option<&FrameHistoryEntry> {
+        self.frame_history.get(self.selected_frame_index)
+    }
+
     fn current_history_paths(&self) -> BTreeSet<PathBuf> {
         self.frame_history
             .iter()
@@ -2343,14 +2450,22 @@ impl ViewerApp {
                         }
                         AsyncLoadUpdate::History(batch, select_frame) => {
                             self.install_decoded_load_batch(batch, false, select_frame, ctx);
+                            self.live_refresh_skip_reason = None;
                             if select_frame {
                                 self.status = format!("Loaded {}", message.label);
                             }
                         }
-                        AsyncLoadUpdate::Unchanged => {
+                        AsyncLoadUpdate::Unchanged {
+                            timings,
+                            reason,
+                        } => {
+                            if let Some(timings) = timings {
+                                self.load_timing = Some(timings);
+                            }
                             self.load_receiver = None;
                             self.pending_site_id = None;
-                            self.status = format!("Current {}", message.label);
+                            self.live_refresh_skip_reason = Some(reason.clone());
+                            self.status = format!("Current {} ({reason})", message.label);
                             ctx.request_repaint_after(Duration::from_secs(1));
                             return;
                         }
@@ -2360,6 +2475,7 @@ impl ViewerApp {
                             match result {
                                 Ok(batch) => {
                                     self.install_decoded_load_batch(batch, true, true, ctx);
+                                    self.live_refresh_skip_reason = None;
                                     self.status = format!("Loaded {}", message.label);
                                 }
                                 Err(err) => {
@@ -3854,7 +3970,15 @@ impl ViewerApp {
 
         ui.label("Level 2 Volume");
         ui.label(format!("Site {site}"));
-        ui.label(volume_time);
+        ui.label(format!("Start {volume_time}"));
+        if let Some(frame) = self.selected_frame()
+            && frame.identity.site_id == site
+        {
+            ui.label(format!("Status {}", frame.status.label()));
+            if let Some(readout) = live_chunk_readout(frame, Utc::now()) {
+                ui.label(readout);
+            }
+        }
         ui.label(format!("VCP {vcp}"));
         ui.label(format!("{cut_count} cuts, {decoded_radials} radials"));
 
@@ -4594,6 +4718,13 @@ impl ViewerApp {
             if let Some(preview_ms) = timing.preview_ms {
                 ui.label(format!("Preview {:.1} ms", preview_ms));
             }
+            if timing.realtime_volume_id.is_some() {
+                ui.add_space(4.0);
+                self.live_latency_readout(ui, timing);
+            }
+        }
+        if let Some(reason) = &self.live_refresh_skip_reason {
+            ui.label(format!("Live skip {reason}"));
         }
         if let Some(first_data_ms) = self.first_data_ms {
             ui.label(format!("First data {:.1} ms", first_data_ms));
@@ -4624,6 +4755,63 @@ impl ViewerApp {
         self.perf_metric_readout(ui, "Worker", &self.perf.worker);
         self.perf_metric_readout(ui, "Texture", &self.perf.texture);
         self.perf_metric_readout(ui, "Cache build", &self.perf.cache_build);
+    }
+
+    fn live_latency_readout(&self, ui: &mut egui::Ui, timing: LoadTimings) {
+        ui.label("Live Latency Debug");
+        if let Some(site) = self.selected_site() {
+            ui.label(format!(
+                "Selected {} poll {}s",
+                site.level2_id, PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS
+            ));
+        }
+        if let Some(start) = timing.realtime_poll_start_utc {
+            ui.label(format!("Poll start {}", format_utc_seconds(start)));
+        }
+        if let Some(end) = timing.realtime_poll_end_utc {
+            ui.label(format!("Poll end {}", format_utc_seconds(end)));
+        }
+        let mut volume_line = String::new();
+        if let Some(volume_id) = timing.realtime_volume_id {
+            volume_line.push_str(&format!("Volume id {volume_id}"));
+        }
+        if let Some(chunk_count) = timing.realtime_chunk_count {
+            volume_line.push_str(&format!(" chunks {chunk_count}"));
+        }
+        if let Some(complete) = timing.realtime_complete {
+            volume_line.push_str(if complete { " complete" } else { " partial" });
+        }
+        if !volume_line.is_empty() {
+            ui.label(volume_line);
+        }
+        if let Some(chunk_id) = timing.realtime_last_chunk_id {
+            let chunk_type = timing
+                .realtime_last_chunk_type
+                .map(RealtimeChunkType::label)
+                .unwrap_or("unknown");
+            ui.label(format!("Last chunk {chunk_id} {chunk_type}"));
+        }
+        if let Some(total_size) = timing.realtime_total_size {
+            ui.label(format!("Listed {}", compact_byte_label(total_size)));
+        }
+        if let Some(assembled_size) = timing.realtime_assembled_size {
+            ui.label(format!("Assembled {}", compact_byte_label(assembled_size)));
+        }
+        let now_utc = Utc::now();
+        if let Some(last_modified) = timing.realtime_last_modified_utc {
+            ui.label(format!(
+                "LastModified {} age {}",
+                format_utc_seconds(last_modified),
+                frame_age_label(last_modified, now_utc)
+            ));
+        }
+        if let Some(volume_time) = timing.realtime_volume_time_utc {
+            ui.label(format!(
+                "Volume time {} age {}",
+                format_utc_seconds(volume_time),
+                frame_age_label(volume_time, now_utc)
+            ));
+        }
     }
 
     fn perf_metric_readout(&self, ui: &mut egui::Ui, label: &str, series: &MetricSeries) {
@@ -8305,14 +8493,40 @@ fn volume_total_radials(volume: &RadarVolume) -> usize {
 }
 
 fn frame_status_text(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> String {
+    let live_chunk = live_chunk_readout(frame, now_utc)
+        .map(|readout| format!(" {readout}"))
+        .unwrap_or_default();
     format!(
-        "{} {} {} age {} ({})",
+        "{} {} {} age {}{} ({})",
         frame.identity.site_id,
         frame.identity.scan_time_utc.format("%Y-%m-%d %H:%M:%S UTC"),
         frame.status.label(),
         frame_age_label(frame.identity.scan_time_utc, now_utc),
+        live_chunk,
         frame.source_label
     )
+}
+
+fn live_chunk_readout(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> Option<String> {
+    if !matches!(frame.status, FrameStatus::LivePartial | FrameStatus::LiveComplete) {
+        return None;
+    }
+    let timings = frame.timings?;
+    let last_modified = timings.realtime_last_modified_utc?;
+    let chunk_count = timings.realtime_chunk_count.unwrap_or_default();
+    let chunk_id = timings.realtime_last_chunk_id.unwrap_or_default();
+    let chunk_type = timings
+        .realtime_last_chunk_type
+        .map(RealtimeChunkType::label)
+        .unwrap_or("chunk");
+    Some(format!(
+        "last chunk {} age {} chunks {} id {} {}",
+        last_modified.format("%H:%M:%S UTC"),
+        frame_age_label(last_modified, now_utc),
+        chunk_count,
+        chunk_id,
+        chunk_type
+    ))
 }
 
 fn compact_frame_label(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> String {
@@ -8360,6 +8574,16 @@ fn frame_age_label(scan_time_utc: DateTime<Utc>, now_utc: DateTime<Utc>) -> Stri
         format!("{}m", age_seconds / 60)
     } else {
         format!("{:.1}h", age_seconds as f32 / 3600.0)
+    }
+}
+
+fn compact_byte_label(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f32 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f32 / (1024.0 * 1024.0))
     }
 }
 
@@ -9892,6 +10116,7 @@ mod tests {
             hidden_hazard_families: default_hidden_hazard_families(),
             realtime_level2_auto_refresh: false,
             last_realtime_level2_refresh: None,
+            live_refresh_skip_reason: None,
             live_hazard_auto_refresh: false,
             show_performance_stats: false,
             sidebar_tab: SidebarTab::Radar,

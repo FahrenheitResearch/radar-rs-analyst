@@ -54,6 +54,7 @@ pub struct RadarSite {
 pub struct S3Object {
     pub key: String,
     pub size: u64,
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +90,14 @@ impl RealtimeChunkType {
 
     fn is_end(self) -> bool {
         matches!(self, Self::End)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Intermediate => "intermediate",
+            Self::End => "end",
+        }
     }
 }
 
@@ -472,6 +481,10 @@ pub fn download_realtime_volume(
             object: S3Object {
                 key: filename,
                 size: volume.total_size,
+                last_modified: volume
+                    .chunks
+                    .last()
+                    .and_then(|chunk| chunk.object.last_modified),
             },
             path,
             url,
@@ -542,6 +555,10 @@ pub fn download_realtime_volume(
             object: S3Object {
                 key: filename,
                 size: volume.total_size,
+                last_modified: volume
+                    .chunks
+                    .last()
+                    .and_then(|chunk| chunk.object.last_modified),
             },
             path,
             url,
@@ -575,6 +592,10 @@ pub fn download_realtime_volume(
         object: S3Object {
             key: filename,
             size: volume.total_size,
+            last_modified: volume
+                .chunks
+                .last()
+                .and_then(|chunk| chunk.object.last_modified),
         },
         path,
         url,
@@ -976,6 +997,8 @@ struct WeatherGovProperties {
 struct S3ObjectXml {
     #[serde(rename = "Key")]
     key: String,
+    #[serde(rename = "LastModified")]
+    last_modified: Option<String>,
     #[serde(rename = "Size")]
     size: u64,
 }
@@ -991,8 +1014,18 @@ impl From<S3ObjectXml> for S3Object {
         Self {
             key: value.key,
             size: value.size,
+            last_modified: value
+                .last_modified
+                .as_deref()
+                .and_then(parse_s3_last_modified),
         }
     }
+}
+
+fn parse_s3_last_modified(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
 }
 
 impl From<CommonPrefixXml> for CommonPrefix {
@@ -1113,6 +1146,7 @@ mod tests {
         let chunk = parse_realtime_chunk_object(S3Object {
             key: "KGGW/628/20260608-002828-025-I".to_owned(),
             size: 129_481,
+            last_modified: None,
         })
         .expect("valid realtime chunk key");
 
@@ -1121,6 +1155,14 @@ mod tests {
         assert_eq!(chunk.chunk_id, 25);
         assert_eq!(chunk.chunk_type, RealtimeChunkType::Intermediate);
         assert_eq!(chunk.volume_time.to_rfc3339(), "2026-06-08T00:28:28+00:00");
+    }
+
+    #[test]
+    fn s3_last_modified_parser_handles_aws_timestamp() {
+        let parsed =
+            parse_s3_last_modified("2026-06-08T22:23:33.000Z").expect("S3 LastModified parses");
+
+        assert_eq!(parsed.to_rfc3339(), "2026-06-08T22:23:33+00:00");
     }
 
     #[test]
@@ -1189,6 +1231,7 @@ mod tests {
                     object: S3Object {
                         key: format!("KTLX/1/20260608-000000-{chunk_id:03}-I"),
                         size: *size,
+                        last_modified: None,
                     },
                     site: "KTLX".to_owned(),
                     volume_id: 1,

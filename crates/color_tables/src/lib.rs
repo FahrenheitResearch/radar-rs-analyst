@@ -480,15 +480,21 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
     match family {
         ColorTableFamily::Reflectivity => vec![
             builtin_reflectivity_table(),
+            analyst_classic_reflectivity_table(),
             nws_reflectivity_table(),
             dark_scope_reflectivity_table(),
             hail_core_reflectivity_table(),
             low_precip_reflectivity_table(),
+            tornado_debris_reflectivity_table(),
+            clean_light_reflectivity_table(),
         ],
         ColorTableFamily::Velocity => vec![
             builtin_velocity_table(),
             analyst_velocity_table(),
             radarscope_contrast_velocity_table(),
+            couplet_pop_velocity_table(),
+            gr2_ish_analyst_velocity_table(),
+            subtle_srv_velocity_table(),
         ],
         ColorTableFamily::SpectrumWidth => vec![builtin_spectrum_width_table()],
         ColorTableFamily::Generic => vec![builtin_generic_table()],
@@ -521,6 +527,11 @@ pub fn nws_reflectivity_table() -> ColorTable {
         .expect("built-in nws reflectivity color table is valid")
 }
 
+pub fn analyst_classic_reflectivity_table() -> ColorTable {
+    ColorTable::parse_stepped("Analyst Classic REF", ANALYST_CLASSIC_REFLECTIVITY_TABLE)
+        .expect("built-in analyst classic reflectivity color table is valid")
+}
+
 pub fn gr2_reflectivity_table() -> ColorTable {
     ColorTable::parse_stepped("GR2Analyst Classic REF", GR2_REFLECTIVITY_TABLE)
         .expect("built-in GR2 reflectivity color table is valid")
@@ -544,6 +555,16 @@ pub fn low_precip_reflectivity_table() -> ColorTable {
 pub fn dark_scope_reflectivity_table() -> ColorTable {
     ColorTable::parse_stepped("Dark Scope REF", DARK_SCOPE_REFLECTIVITY_TABLE)
         .expect("built-in dark scope reflectivity color table is valid")
+}
+
+pub fn tornado_debris_reflectivity_table() -> ColorTable {
+    ColorTable::parse_stepped("Tornado Debris REF", TORNADO_DEBRIS_REFLECTIVITY_TABLE)
+        .expect("built-in tornado debris reflectivity color table is valid")
+}
+
+pub fn clean_light_reflectivity_table() -> ColorTable {
+    ColorTable::parse_stepped("Clean Light REF", CLEAN_LIGHT_REFLECTIVITY_TABLE)
+        .expect("built-in clean light reflectivity color table is valid")
 }
 
 pub fn analyst_velocity_table() -> ColorTable {
@@ -572,6 +593,21 @@ pub fn radarscope_contrast_velocity_table() -> ColorTable {
         RADARSCOPE_CONTRAST_VELOCITY_TABLE,
     )
     .expect("built-in radarscope contrast velocity color table is valid")
+}
+
+pub fn couplet_pop_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("Couplet Pop VEL", COUPLET_POP_VELOCITY_TABLE)
+        .expect("built-in couplet pop velocity color table is valid")
+}
+
+pub fn gr2_ish_analyst_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("GR2-ish Analyst VEL", GR2_ISH_ANALYST_VELOCITY_TABLE)
+        .expect("built-in GR2-ish analyst velocity color table is valid")
+}
+
+pub fn subtle_srv_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("Subtle SRV VEL", SUBTLE_SRV_VELOCITY_TABLE)
+        .expect("built-in subtle SRV velocity color table is valid")
 }
 
 pub fn nws_split_velocity_table() -> ColorTable {
@@ -813,6 +849,29 @@ color: 85 152 84 198
 color: 92.5 255 255 255
 "#;
 
+const ANALYST_CLASSIC_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 5
+color4: -10 0 0 0 0
+color4: 7.5 0 0 0 0
+color: 10 0 204 220
+color: 15 0 132 232
+color: 20 12 58 226
+color: 25 0 222 44
+color: 30 0 174 24
+color: 35 0 124 12
+color: 40 235 226 34
+color: 45 238 174 28
+color: 50 242 112 22
+color: 55 238 28 30
+color: 62.5 190 0 18
+color: 70 138 0 12
+color: 77.5 214 42 180
+color: 85 150 82 198
+color: 92.5 246 246 246
+"#;
+
 const STORM_DETAIL_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
@@ -900,6 +959,50 @@ color: 65 126 30 72
 color: 75 172 68 196
 color: 87.5 226 226 232
 color: 95 255 255 255
+"#;
+
+const TORNADO_DEBRIS_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 5
+color4: -10 0 0 0 0
+color4: 7.5 0 0 0 0
+color: 10 30 96 152
+color: 15 34 152 196
+color: 20 26 190 112
+color: 25 0 146 52
+color: 30 72 176 42
+color: 35 214 220 48
+color: 40 246 174 32
+color: 45 250 102 26
+color: 50 238 32 30
+color: 57.5 178 0 24
+color: 65 118 0 0
+color: 72.5 166 32 132
+color: 80 224 94 210
+color: 87.5 176 230 255
+color: 95 255 255 255
+"#;
+
+const CLEAN_LIGHT_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 2.5
+color4: -15 0 0 0 0
+color4: 7.5 0 0 0 0
+color: 10 30 114 160
+color: 17.5 38 164 190
+color: 22.5 42 186 110
+color: 27.5 22 132 52
+color: 32.5 94 176 48
+color: 37.5 220 218 58
+color: 42.5 242 160 42
+color: 47.5 236 90 38
+color: 52.5 218 38 44
+color: 60 156 22 34
+color: 70 120 14 28
+color: 80 184 72 190
+color: 92.5 238 238 242
 "#;
 
 const VORTEX_VELO_TABLE: &str = r#"
@@ -1026,6 +1129,81 @@ color: 32 152 18 42
 color: 42 200 88 112
 color: 55 238 192 204
 color: 70 250 250 250
+"#;
+
+const COUPLET_POP_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 1
+color: -70 238 255 255
+color: -58 92 238 216
+color: -46 20 206 152
+color: -36 0 150 82
+color: -28 0 92 42
+color: -21 0 172 58
+color: -15 0 236 44
+color: -10 34 186 48
+color: -6 36 122 50
+color: -2 78 98 76
+color: 0 92 92 92
+color: 2 104 72 70
+color: 6 132 34 34
+color: 10 214 24 24
+color: 15 255 34 34
+color: 21 236 16 38
+color: 28 180 8 34
+color: 36 122 6 34
+color: 46 196 78 96
+color: 58 240 184 190
+color: 70 255 255 255
+"#;
+
+const GR2_ISH_ANALYST_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 2
+color: -70 0 252 252
+color: -55 0 174 244
+color: -42 20 90 238
+color: -32 0 176 82
+color: -24 0 214 0
+color: -16 0 150 0
+color: -8 74 132 74
+color: -2 96 108 96
+color: 0 124 124 124
+color: 2 126 94 94
+color: 8 160 42 42
+color: 16 204 0 0
+color: 24 246 0 0
+color: 32 255 92 38
+color: 42 246 156 128
+color: 55 255 222 222
+color: 70 172 172 172
+"#;
+
+const SUBTLE_SRV_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 1
+color: -70 184 236 230
+color: -55 90 206 190
+color: -42 32 168 132
+color: -32 12 122 76
+color: -24 18 88 52
+color: -16 36 140 64
+color: -10 62 196 82
+color: -5 58 132 70
+color: -1 82 98 84
+color: 0 94 94 94
+color: 1 104 86 84
+color: 5 128 58 54
+color: 10 188 52 48
+color: 16 222 64 58
+color: 24 184 42 54
+color: 32 138 34 54
+color: 42 190 96 114
+color: 55 224 184 190
+color: 70 242 242 242
 "#;
 
 const NWS_SPLIT_VELOCITY_TABLE: &str = r#"
@@ -1353,10 +1531,13 @@ mod tests {
             reflectivity,
             vec![
                 "GR2Analyst Classic REF",
+                "Analyst Classic REF",
                 "NWS Classic REF",
                 "Dark Scope REF",
                 "Analyst Hail Core REF",
                 "Analyst Low Precip REF",
+                "Tornado Debris REF",
+                "Clean Light REF",
             ]
         );
         assert_eq!(
@@ -1365,6 +1546,9 @@ mod tests {
                 "Analyst Tornado VEL",
                 "Analyst Pro VEL",
                 "RadarScope Contrast VEL",
+                "Couplet Pop VEL",
+                "GR2-ish Analyst VEL",
+                "Subtle SRV VEL",
             ]
         );
     }
@@ -1412,6 +1596,20 @@ mod tests {
             radarscope_contrast_velocity_table(),
         ] {
             assert!(!table.interpolates());
+        }
+    }
+
+    #[test]
+    fn review_candidate_palettes_are_stepped() {
+        for table in [
+            analyst_classic_reflectivity_table(),
+            tornado_debris_reflectivity_table(),
+            clean_light_reflectivity_table(),
+            couplet_pop_velocity_table(),
+            gr2_ish_analyst_velocity_table(),
+            subtle_srv_velocity_table(),
+        ] {
+            assert!(!table.interpolates(), "{} should be stepped", table.name());
         }
     }
 }
