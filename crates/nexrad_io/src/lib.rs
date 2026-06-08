@@ -1156,11 +1156,9 @@ fn parse_message_31(
             b'R' if &body[pointer + 1..pointer + 4] == b"RAD" => {
                 nyquist_velocity_mps = parse_radial_constant_block(body, pointer)?;
             }
-            b'D' => {
-                if moment_count < moments.len() {
-                    moments[moment_count] = Some(parse_generic_moment_block(body, pointer)?);
-                    moment_count += 1;
-                }
+            b'D' if moment_count < moments.len() => {
+                moments[moment_count] = Some(parse_generic_moment_block(body, pointer)?);
+                moment_count += 1;
             }
             _ => {}
         }
