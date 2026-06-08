@@ -146,7 +146,11 @@ impl ColorTable {
                 "product" => product = non_empty(value),
                 "units" => units = non_empty(value),
                 "scale" => scale = parse_positive_f32(value),
-                "step" => sample_mode = SampleMode::Stepped,
+                "step" => {
+                    sample_mode = parse_positive_f32(value)
+                        .map(|step| SampleMode::QuantizedInterpolated { step, origin: 0.0 })
+                        .unwrap_or(SampleMode::Stepped);
+                }
                 "mode" | "samplemode" | "interpolate" | "interpolation" | "smooth" => {
                     if let Some(parsed_mode) = parse_sample_mode(value) {
                         sample_mode = parsed_mode;
@@ -170,6 +174,7 @@ impl ColorTable {
             for stop in &mut stops {
                 stop.value *= unit_scale;
             }
+            sample_mode = sample_mode.scale_values(unit_scale);
         }
 
         Self::from_parts(name, product, units, range_folded, sample_mode, stops)
@@ -203,10 +208,30 @@ impl ColorTable {
         self.sample_mode.label()
     }
 
+    pub fn step_size(&self) -> Option<f32> {
+        self.sample_mode.step_size()
+    }
+
     pub fn sample(&self, value: f32) -> Rgba8 {
         if !value.is_finite() {
             return Rgba8::TRANSPARENT;
         }
+        match self.sample_mode {
+            SampleMode::Interpolated => self.sample_interpolated(value),
+            SampleMode::Stepped => self.sample_stepped(value),
+            SampleMode::QuantizedInterpolated { step, origin } => {
+                if let Some(first_opaque_value) = self.first_opaque_value()
+                    && value < first_opaque_value
+                {
+                    return Rgba8::TRANSPARENT;
+                }
+                let quantized = quantize_value(value, step, origin);
+                self.sample_interpolated(quantized)
+            }
+        }
+    }
+
+    fn sample_interpolated(&self, value: f32) -> Rgba8 {
         let Some(first) = self.stops.first() else {
             return Rgba8::TRANSPARENT;
         };
@@ -226,13 +251,40 @@ impl ColorTable {
             return right.color;
         }
         let left = self.stops[index - 1];
-        match self.sample_mode {
-            SampleMode::Interpolated => {
-                let span = (right.value - left.value).max(f32::EPSILON);
-                left.color.lerp(right.color, (value - left.value) / span)
-            }
-            SampleMode::Stepped => left.color,
+        let span = (right.value - left.value).max(f32::EPSILON);
+        left.color.lerp(right.color, (value - left.value) / span)
+    }
+
+    fn sample_stepped(&self, value: f32) -> Rgba8 {
+        let Some(first) = self.stops.first() else {
+            return Rgba8::TRANSPARENT;
+        };
+        if value <= first.value {
+            return first.color;
         }
+        let index = self.stops.partition_point(|stop| stop.value < value);
+        if index >= self.stops.len() {
+            return self
+                .stops
+                .last()
+                .map(|stop| stop.color)
+                .unwrap_or(Rgba8::TRANSPARENT);
+        }
+        let right = self.stops[index];
+        if value == right.value {
+            return right.color;
+        }
+        self.stops[index - 1].color
+    }
+
+    fn first_opaque_value(&self) -> Option<f32> {
+        let first = self.stops.first()?;
+        (first.color.a == 0).then(|| {
+            self.stops
+                .iter()
+                .find(|stop| stop.color.a > 0)
+                .map(|stop| stop.value)
+        })?
     }
 
     pub fn color_for_value(&self, value: f32) -> [u8; 4] {
@@ -296,10 +348,11 @@ impl ColorTable {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SampleMode {
     Interpolated,
     Stepped,
+    QuantizedInterpolated { step: f32, origin: f32 },
 }
 
 impl SampleMode {
@@ -307,6 +360,38 @@ impl SampleMode {
         match self {
             Self::Interpolated => "interpolated",
             Self::Stepped => "stepped",
+            Self::QuantizedInterpolated { .. } => "quantized stepped",
+        }
+    }
+
+    fn step_size(self) -> Option<f32> {
+        match self {
+            Self::QuantizedInterpolated { step, .. } => Some(step),
+            Self::Interpolated | Self::Stepped => None,
+        }
+    }
+
+    fn scale_values(self, scale: f32) -> Self {
+        match self {
+            Self::QuantizedInterpolated { step, origin } => Self::QuantizedInterpolated {
+                step: step * scale,
+                origin: origin * scale,
+            },
+            Self::Interpolated | Self::Stepped => self,
+        }
+    }
+}
+
+impl Hash for SampleMode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match *self {
+            Self::Interpolated => 0_u8.hash(state),
+            Self::Stepped => 1_u8.hash(state),
+            Self::QuantizedInterpolated { step, origin } => {
+                2_u8.hash(state);
+                step.to_bits().hash(state);
+                origin.to_bits().hash(state);
+            }
         }
     }
 }
@@ -379,7 +464,12 @@ pub fn builtin_reflectivity_table() -> ColorTable {
 }
 
 pub fn builtin_velocity_table() -> ColorTable {
-    analyst_velocity_table()
+    tornado_velocity_table()
+}
+
+pub fn tornado_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("Analyst Tornado VEL", TORNADO_VELOCITY_TABLE)
+        .expect("built-in tornado velocity color table is valid")
 }
 
 pub fn vortex_velocity_table() -> ColorTable {
@@ -393,11 +483,22 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
             builtin_reflectivity_table(),
             analyst_reflectivity_table(),
             nws_reflectivity_table(),
+            gr2_reflectivity_table(),
+            storm_detail_reflectivity_table(),
+            hail_core_reflectivity_table(),
+            low_precip_reflectivity_table(),
+            dark_scope_reflectivity_table(),
         ],
         ColorTableFamily::Velocity => vec![
             builtin_velocity_table(),
+            analyst_velocity_table(),
             vortex_velocity_table(),
             nws_velocity_table(),
+            gr2_velocity_table(),
+            tight_couplet_velocity_table(),
+            radarscope_contrast_velocity_table(),
+            nws_split_velocity_table(),
+            dark_analyst_velocity_table(),
         ],
         ColorTableFamily::SpectrumWidth => vec![builtin_spectrum_width_table()],
         ColorTableFamily::Generic => vec![builtin_generic_table()],
@@ -449,6 +550,31 @@ pub fn nws_reflectivity_table() -> ColorTable {
     .expect("built-in nws reflectivity color table is valid")
 }
 
+pub fn gr2_reflectivity_table() -> ColorTable {
+    ColorTable::parse_stepped("GR2Analyst Classic REF", GR2_REFLECTIVITY_TABLE)
+        .expect("built-in GR2 reflectivity color table is valid")
+}
+
+pub fn storm_detail_reflectivity_table() -> ColorTable {
+    ColorTable::parse_stepped("Analyst Storm Detail REF", STORM_DETAIL_REFLECTIVITY_TABLE)
+        .expect("built-in storm detail reflectivity color table is valid")
+}
+
+pub fn hail_core_reflectivity_table() -> ColorTable {
+    ColorTable::parse_stepped("Analyst Hail Core REF", HAIL_CORE_REFLECTIVITY_TABLE)
+        .expect("built-in hail core reflectivity color table is valid")
+}
+
+pub fn low_precip_reflectivity_table() -> ColorTable {
+    ColorTable::parse_stepped("Analyst Low Precip REF", LOW_PRECIP_REFLECTIVITY_TABLE)
+        .expect("built-in low precip reflectivity color table is valid")
+}
+
+pub fn dark_scope_reflectivity_table() -> ColorTable {
+    ColorTable::parse_stepped("Dark Scope REF", DARK_SCOPE_REFLECTIVITY_TABLE)
+        .expect("built-in dark scope reflectivity color table is valid")
+}
+
 pub fn analyst_velocity_table() -> ColorTable {
     ColorTable::parse_stepped("Analyst Pro VEL", ANALYST_PRO_VELOCITY_TABLE)
         .expect("built-in analyst velocity color table is valid")
@@ -457,6 +583,34 @@ pub fn analyst_velocity_table() -> ColorTable {
 pub fn nws_velocity_table() -> ColorTable {
     ColorTable::parse_stepped("NWS Classic VEL", NWS_VELOCITY_TABLE)
         .expect("built-in nws velocity color table is valid")
+}
+
+pub fn gr2_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("GR2Analyst Classic VEL", GR2_VELOCITY_TABLE)
+        .expect("built-in GR2 velocity color table is valid")
+}
+
+pub fn tight_couplet_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("Analyst Tight Couplet VEL", TIGHT_COUPLET_VELOCITY_TABLE)
+        .expect("built-in tight couplet velocity color table is valid")
+}
+
+pub fn radarscope_contrast_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped(
+        "RadarScope Contrast VEL",
+        RADARSCOPE_CONTRAST_VELOCITY_TABLE,
+    )
+    .expect("built-in radarscope contrast velocity color table is valid")
+}
+
+pub fn nws_split_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("NWS Split VEL", NWS_SPLIT_VELOCITY_TABLE)
+        .expect("built-in split velocity color table is valid")
+}
+
+pub fn dark_analyst_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("Dark Analyst VEL", DARK_ANALYST_VELOCITY_TABLE)
+        .expect("built-in dark analyst velocity color table is valid")
 }
 
 pub fn builtin_spectrum_width_table() -> ColorTable {
@@ -509,6 +663,13 @@ fn default_range_folded_color() -> Rgba8 {
 
 fn lerp_u8(left: u8, right: u8, amount: f32) -> u8 {
     ((left as f32 + (right as f32 - left as f32) * amount).round()).clamp(0.0, 255.0) as u8
+}
+
+fn quantize_value(value: f32, step: f32, origin: f32) -> f32 {
+    if !step.is_finite() || step <= 0.0 {
+        return value;
+    }
+    ((value - origin) / step).round() * step + origin
 }
 
 fn normalize_line(line: &str) -> String {
@@ -609,7 +770,7 @@ fn byte_component(value: f32, line: usize) -> Result<u8, ColorTableError> {
 }
 
 fn parse_positive_f32(value: &str) -> Option<f32> {
-    let value = value.trim().parse::<f32>().ok()?;
+    let value = parse_numbers(value).first().copied()?;
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
@@ -655,6 +816,121 @@ color: 85 105 0 4
 color: 95 0 0 0
 "#;
 
+const GR2_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 5
+color4: -10 0 0 0 0
+color4: 0 0 0 0 0
+color: 5 4 233 231
+color: 10 1 159 244
+color: 15 3 0 244
+color: 20 2 253 2
+color: 25 1 197 1
+color: 30 0 142 0
+color: 35 253 248 2
+color: 40 229 188 0
+color: 45 253 149 0
+color: 50 253 0 0
+color: 55 212 0 0
+color: 60 188 0 0
+color: 65 248 0 253
+color: 70 152 84 198
+color: 75 255 255 255
+"#;
+
+const STORM_DETAIL_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 2.5
+color4: -10 0 0 0 0
+color4: 0 0 0 0 0
+color: 5 18 42 86
+color: 10 25 92 154
+color: 15 31 164 206
+color: 20 28 184 114
+color: 25 21 132 44
+color: 30 88 178 42
+color: 35 218 226 45
+color: 40 251 180 32
+color: 45 254 101 22
+color: 50 238 32 28
+color: 55 174 0 22
+color: 60 214 52 168
+color: 65 142 34 214
+color: 70 228 228 236
+color: 80 255 255 255
+"#;
+
+const HAIL_CORE_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 5
+color4: -10 0 0 0 0
+color4: 0 0 0 0 0
+color: 5 24 46 82
+color: 10 35 98 164
+color: 15 33 168 210
+color: 20 16 172 78
+color: 25 0 120 36
+color: 30 82 170 40
+color: 35 234 232 36
+color: 40 252 168 22
+color: 45 252 88 18
+color: 50 246 26 28
+color: 55 176 0 16
+color: 60 116 0 0
+color: 65 210 38 190
+color: 70 255 255 255
+color: 75 112 228 255
+color: 80 255 255 255
+"#;
+
+const LOW_PRECIP_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 2.5
+color4: -15 0 0 0 0
+color4: 0 0 0 0 0
+color: 2.5 14 28 58
+color: 5 24 56 100
+color: 10 38 116 174
+color: 15 42 184 214
+color: 20 58 204 132
+color: 25 44 154 66
+color: 30 84 188 50
+color: 35 224 226 64
+color: 40 250 178 50
+color: 45 244 96 42
+color: 50 218 44 52
+color: 55 160 26 78
+color: 60 188 78 190
+color: 70 238 238 244
+"#;
+
+const DARK_SCOPE_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+step: 5
+color4: -10 0 0 0 0
+color4: 0 0 0 0 0
+color: 5 18 36 62
+color: 10 38 86 128
+color: 15 52 136 170
+color: 20 30 158 86
+color: 25 18 118 48
+color: 30 78 164 44
+color: 35 196 206 54
+color: 40 232 156 42
+color: 45 234 88 34
+color: 50 218 38 40
+color: 55 156 24 30
+color: 60 126 30 112
+color: 65 172 68 196
+color: 70 226 226 232
+color: 80 255 255 255
+"#;
+
 const VORTEX_VELO_TABLE: &str = r#"
 units: MPH
 step: 20
@@ -679,6 +955,154 @@ color: -70 4 5 254
 color: -90 4 87 254
 color: -110 5 177 255
 color: -130 0 255 255
+"#;
+
+const TORNADO_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 2
+color: -70 238 255 255
+color: -55 86 236 222
+color: -42 0 196 146
+color: -32 0 132 70
+color: -24 0 84 38
+color: -16 0 158 28
+color: -10 22 238 34
+color: -6 0 172 30
+color: -3 42 116 54
+color: -1 82 96 82
+color: 0 104 104 104
+color: 1 110 82 82
+color: 3 132 42 42
+color: 6 224 24 24
+color: 10 255 34 34
+color: 16 210 0 0
+color: 24 156 0 0
+color: 32 116 0 0
+color: 42 226 116 120
+color: 55 252 214 218
+color: 70 255 255 255
+"#;
+
+const GR2_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 2
+color: -70 0 255 255
+color: -55 0 170 255
+color: -42 0 80 255
+color: -32 0 180 80
+color: -24 0 220 0
+color: -16 0 148 0
+color: -8 74 132 74
+color: -2 96 108 96
+color: 0 128 128 128
+color: 2 126 94 94
+color: 8 156 44 44
+color: 16 198 0 0
+color: 24 244 0 0
+color: 32 255 116 0
+color: 42 255 220 0
+color: 55 255 255 255
+color: 70 172 172 172
+"#;
+
+const TIGHT_COUPLET_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 1
+color: -70 230 255 255
+color: -50 54 236 214
+color: -36 0 188 122
+color: -26 0 114 48
+color: -18 0 176 34
+color: -12 32 252 46
+color: -7 0 176 34
+color: -3 36 112 50
+color: -1 78 94 78
+color: 0 112 112 112
+color: 1 112 78 78
+color: 3 152 36 36
+color: 7 246 22 22
+color: 12 255 42 42
+color: 18 202 0 0
+color: 26 142 0 0
+color: 36 110 0 0
+color: 50 238 124 132
+color: 70 255 255 255
+"#;
+
+const RADARSCOPE_CONTRAST_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 2
+color: -70 164 250 248
+color: -55 62 220 206
+color: -42 18 172 138
+color: -32 0 128 78
+color: -24 0 90 52
+color: -16 0 164 64
+color: -10 12 226 48
+color: -5 38 144 52
+color: -1 84 100 80
+color: 0 100 100 100
+color: 1 112 84 84
+color: 5 142 38 38
+color: 10 226 30 30
+color: 16 255 62 62
+color: 24 220 26 46
+color: 32 152 18 42
+color: 42 200 88 112
+color: 55 238 192 204
+color: 70 250 250 250
+"#;
+
+const NWS_SPLIT_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 2
+color: -70 0 240 240
+color: -55 0 150 240
+color: -42 0 62 220
+color: -32 0 150 60
+color: -24 0 210 0
+color: -16 0 136 0
+color: -8 76 140 76
+color: -2 104 118 104
+color: 0 130 130 130
+color: 2 142 104 104
+color: 8 168 54 54
+color: 16 210 0 0
+color: 24 248 0 0
+color: 32 255 118 0
+color: 42 255 226 0
+color: 55 255 255 255
+color: 70 170 170 170
+"#;
+
+const DARK_ANALYST_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+step: 2
+color: -70 210 246 240
+color: -55 82 210 196
+color: -42 0 164 126
+color: -32 0 114 68
+color: -24 0 80 44
+color: -16 0 142 50
+color: -10 20 206 42
+color: -5 34 126 46
+color: -1 72 88 74
+color: 0 94 94 94
+color: 1 102 72 72
+color: 5 132 34 34
+color: 10 208 24 24
+color: 16 238 42 42
+color: 24 188 18 36
+color: 32 128 16 36
+color: 42 198 92 112
+color: 55 232 202 206
+color: 70 250 250 250
 "#;
 
 const ANALYST_PRO_VELOCITY_TABLE: &str = r#"
@@ -804,24 +1228,45 @@ mod tests {
     }
 
     #[test]
-    fn step_rows_make_pal_style_tables_stepped() {
+    fn step_rows_make_pal_style_tables_quantized_ramps() {
         let table = ColorTable::parse(
             "RadarScope sample",
             r#"
             product: BR
             units: dBZ
             step: 5
-            color4: -15 0 0 0 0
-            color: 5 29 37 60
+            color4: -5 0 0 0 0
+            color: 5 0 0 100
+            color: 15 0 0 200
             "#,
         )
         .expect("table parses");
 
         assert!(!table.interpolates());
-        assert_eq!(table.sample_mode_label(), "stepped");
-        assert_eq!(table.sample(-10.0), Rgba8::TRANSPARENT);
+        assert_eq!(table.sample_mode_label(), "quantized stepped");
+        assert_eq!(table.step_size(), Some(5.0));
         assert_eq!(table.sample(0.0), Rgba8::TRANSPARENT);
-        assert_eq!(table.sample(5.0), Rgba8::opaque(29, 37, 60));
+        assert_eq!(table.sample(7.4), Rgba8::opaque(0, 0, 100));
+        assert_eq!(table.sample(11.0), Rgba8::opaque(0, 0, 150));
+        assert_eq!(table.sample(12.4), Rgba8::opaque(0, 0, 150));
+        assert_eq!(table.sample(12.6), Rgba8::opaque(0, 0, 200));
+    }
+
+    #[test]
+    fn quantized_step_converts_with_velocity_units() {
+        let table = ColorTable::parse(
+            "Velocity sample",
+            r#"
+            units: MPH
+            step: 10
+            color: 0 80 80 80
+            color: 20 240 0 0
+            "#,
+        )
+        .expect("table parses");
+
+        let step = table.step_size().expect("numeric step preserved");
+        assert!((step - 10.0 * MPH_TO_MPS).abs() < 0.001);
     }
 
     #[test]
@@ -862,9 +1307,11 @@ mod tests {
 
         assert_eq!(table.name(), "WxTools RadarScope BR");
         assert!(!table.interpolates());
-        assert_eq!(table.sample_mode_label(), "stepped");
+        assert_eq!(table.sample_mode_label(), "quantized stepped");
+        assert_eq!(table.step_size(), Some(5.0));
         assert_eq!(table.sample(0.0), Rgba8::TRANSPARENT);
         assert_eq!(table.sample(5.0), Rgba8::opaque(29, 37, 60));
+        assert_ne!(table.sample(10.0), table.sample(5.0));
     }
 
     #[test]
@@ -896,7 +1343,7 @@ mod tests {
     fn default_velocity_table_avoids_orange_yellow_purple_bins() {
         let table = builtin_velocity_table();
 
-        assert_eq!(table.name(), "Analyst Pro VEL");
+        assert_eq!(table.name(), "Analyst Tornado VEL");
         assert!(!table.interpolates());
         for stop in table.stops() {
             let [red, green, blue, alpha] = stop.color.to_array();
@@ -923,7 +1370,30 @@ mod tests {
 
     #[test]
     fn built_in_presets_offer_multiple_ref_and_velocity_choices() {
-        assert!(builtin_tables_for_family(ColorTableFamily::Reflectivity).len() >= 3);
-        assert!(builtin_tables_for_family(ColorTableFamily::Velocity).len() >= 3);
+        assert!(builtin_tables_for_family(ColorTableFamily::Reflectivity).len() >= 8);
+        assert!(builtin_tables_for_family(ColorTableFamily::Velocity).len() >= 9);
+    }
+
+    #[test]
+    fn added_analyst_presets_use_quantized_steps() {
+        for table in [
+            gr2_reflectivity_table(),
+            storm_detail_reflectivity_table(),
+            hail_core_reflectivity_table(),
+            low_precip_reflectivity_table(),
+            dark_scope_reflectivity_table(),
+            gr2_velocity_table(),
+            tight_couplet_velocity_table(),
+            radarscope_contrast_velocity_table(),
+            nws_split_velocity_table(),
+            dark_analyst_velocity_table(),
+        ] {
+            assert_eq!(table.sample_mode_label(), "quantized stepped");
+            assert!(
+                table.step_size().is_some(),
+                "{} has step size",
+                table.name()
+            );
+        }
     }
 }

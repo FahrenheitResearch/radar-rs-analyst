@@ -4899,11 +4899,11 @@ impl ViewerApp {
             }
             let selected = self.selected_hazard_index == Some(index);
             let color = hazard_color(record);
-            let fill_alpha = if selected {
-                self.hazard_fill_alpha.saturating_add(20).min(100)
-            } else {
-                self.hazard_fill_alpha
-            };
+            let fill_alpha = hazard_fill_alpha_for_product(
+                self.hazard_fill_alpha,
+                selected,
+                &self.selected_product,
+            );
             let fill =
                 egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), fill_alpha);
             let stroke = egui::Stroke::new(
@@ -5958,12 +5958,20 @@ fn color_table_summary(table: &ColorTable) -> String {
         .zip(table.stops().last())
         .map(|(first, last)| format!("range {:.1}..{:.1}", first.value, last.value))
         .unwrap_or_else(|| "range unavailable".to_owned());
+    let mode = color_table_mode_summary(table);
     format!(
         "{} stops, {}, {}, {range}",
         table.stops().len(),
-        table.sample_mode_label(),
+        mode,
         color_table_units_summary(table)
     )
+}
+
+fn color_table_mode_summary(table: &ColorTable) -> String {
+    table
+        .step_size()
+        .map(|step| format!("{}, step {:.2}", table.sample_mode_label(), step))
+        .unwrap_or_else(|| table.sample_mode_label().to_owned())
 }
 
 fn color_table_units_summary(table: &ColorTable) -> String {
@@ -7878,6 +7886,16 @@ fn hazard_color(record: &HazardRecord) -> egui::Color32 {
     }
 }
 
+fn hazard_fill_alpha_for_product(base_alpha: u8, selected: bool, product: &DisplayProduct) -> u8 {
+    if product.base_moment() == MomentType::Velocity {
+        0
+    } else if selected {
+        base_alpha.saturating_add(20).min(100)
+    } else {
+        base_alpha
+    }
+}
+
 fn hazard_bbox(points: &[HazardPoint]) -> [f32; 4] {
     let mut west = f32::INFINITY;
     let mut south = f32::INFINITY;
@@ -8481,6 +8499,44 @@ mod tests {
         assert_eq!(gate_for_range(&grid, 0.75), Some(1));
         assert_eq!(gate_for_range(&grid, 1.25), Some(3));
         assert_eq!(gate_for_range(&grid, 1.50), None);
+    }
+
+    #[test]
+    fn color_summary_reports_quantized_step_size() {
+        let table = ColorTable::parse("summary", "step: 5\ncolor: 0 0 0 0\ncolor: 10 255 255 255")
+            .expect("table parses");
+
+        let summary = color_table_summary(&table);
+
+        assert!(summary.contains("quantized stepped, step 5.00"));
+    }
+
+    #[test]
+    fn velocity_products_draw_hazard_polygons_outline_only() {
+        assert_eq!(
+            hazard_fill_alpha_for_product(50, false, &DisplayProduct::Moment(MomentType::Velocity)),
+            0
+        );
+        assert_eq!(
+            hazard_fill_alpha_for_product(50, true, &DisplayProduct::StormRelativeVelocity),
+            0
+        );
+        assert_eq!(
+            hazard_fill_alpha_for_product(
+                50,
+                false,
+                &DisplayProduct::Moment(MomentType::Reflectivity)
+            ),
+            50
+        );
+        assert_eq!(
+            hazard_fill_alpha_for_product(
+                50,
+                true,
+                &DisplayProduct::Moment(MomentType::Reflectivity)
+            ),
+            70
+        );
     }
 
     #[test]

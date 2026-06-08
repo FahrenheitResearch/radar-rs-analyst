@@ -379,6 +379,42 @@ pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume>
         });
     };
 
+    let candidates = realtime_volume_candidate_ids_from_active_ids(&active_ids);
+    let mut best_volume = None;
+    let mut first_error = None;
+    for candidate_id in candidates {
+        match realtime_level2_volume_for_id(&site, candidate_id) {
+            Ok(volume) => {
+                if best_volume
+                    .as_ref()
+                    .is_none_or(|best: &RealtimeLevel2Volume| {
+                        volume.volume_time > best.volume_time
+                            || (volume.volume_time == best.volume_time
+                                && volume.chunks.len() > best.chunks.len())
+                    })
+                {
+                    best_volume = Some(volume);
+                }
+            }
+            Err(err) => {
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+
+    if let Some(volume) = best_volume {
+        return Ok(volume);
+    }
+
+    realtime_level2_volume_for_id(&site, volume_id).or_else(|_| {
+        Err(first_error.unwrap_or(DataSourceError::NoObjects {
+            bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+            prefix: site_prefix,
+        }))
+    })
+}
+
+fn realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeLevel2Volume> {
     let volume_prefix = format!("{site}/{volume_id}/");
     let mut chunks = list_s3_limited(
         LEVEL2_CHUNKS_BUCKET,
@@ -406,7 +442,7 @@ pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume>
     let total_size = chunks.iter().map(|chunk| chunk.object.size).sum();
 
     Ok(RealtimeLevel2Volume {
-        site,
+        site: site.to_owned(),
         volume_id,
         volume_time,
         chunks,
@@ -692,6 +728,34 @@ fn latest_realtime_volume_id_from_active_ids(ids: &[u16]) -> Option<u16> {
     } else {
         Some(latest_id)
     }
+}
+
+fn realtime_volume_candidate_ids_from_active_ids(ids: &[u16]) -> Vec<u16> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    if ids.len() == 1 {
+        return ids;
+    }
+
+    let mut candidates = Vec::new();
+    for (index, current) in ids.iter().copied().enumerate() {
+        let next = if index + 1 == ids.len() {
+            ids[0] + REALTIME_VOLUME_ID_MODULUS
+        } else {
+            ids[index + 1]
+        };
+        if next - current > 1 {
+            candidates.push(current);
+        }
+    }
+    if candidates.is_empty() {
+        candidates.push(*ids.last().expect("non-empty ids"));
+    }
+    candidates
 }
 
 fn parse_realtime_chunk_object(object: S3Object) -> Option<RealtimeChunkObject> {
@@ -1020,6 +1084,27 @@ mod tests {
         assert_eq!(
             latest_realtime_volume_id_from_active_ids(&contiguous_ids),
             Some(628)
+        );
+    }
+
+    #[test]
+    fn realtime_volume_candidates_include_each_active_run_end() {
+        let wrapped_ids = [998, 999, 1, 2, 3];
+        assert_eq!(
+            realtime_volume_candidate_ids_from_active_ids(&wrapped_ids),
+            vec![3, 999]
+        );
+
+        let kama_like_split_ids = [1, 2, 3, 73, 74, 75, 205, 206, 559];
+        assert_eq!(
+            realtime_volume_candidate_ids_from_active_ids(&kama_like_split_ids),
+            vec![3, 75, 206, 559]
+        );
+
+        let contiguous_ids = (102..=628).collect::<Vec<_>>();
+        assert_eq!(
+            realtime_volume_candidate_ids_from_active_ids(&contiguous_ids),
+            vec![628]
         );
     }
 
