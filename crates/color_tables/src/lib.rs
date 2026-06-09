@@ -820,9 +820,9 @@ color: 45 229 188 0
 color: 50 253 149 0
 color: 55 253 0 0
 color: 62.5 212 0 0
-color: 70 188 0 0
-color: 77.5 248 0 253
-color: 85 152 84 198
+color: 67.5 188 0 0
+color: 72.5 232 32 206
+color: 80 156 70 206
 color: 92.5 255 255 255
 "#;
 
@@ -843,9 +843,9 @@ color: 45 229 188 0
 color: 50 253 149 0
 color: 55 253 0 0
 color: 62.5 212 0 0
-color: 70 188 0 0
-color: 77.5 248 0 253
-color: 85 152 84 198
+color: 67.5 188 0 0
+color: 72.5 232 32 206
+color: 80 156 70 206
 color: 92.5 255 255 255
 "#;
 
@@ -866,9 +866,9 @@ color: 45 238 174 28
 color: 50 242 112 22
 color: 55 238 28 30
 color: 62.5 190 0 18
-color: 70 138 0 12
-color: 77.5 214 42 180
-color: 85 150 82 198
+color: 67.5 150 0 18
+color: 72.5 214 42 180
+color: 80 150 82 198
 color: 92.5 246 246 246
 "#;
 
@@ -911,8 +911,9 @@ color: 40 252 168 22
 color: 45 252 88 18
 color: 50 246 26 28
 color: 57.5 176 0 16
-color: 65 116 0 0
-color: 72.5 182 20 150
+color: 65 154 0 28
+color: 70 206 32 174
+color: 77.5 152 74 204
 color: 80 255 255 255
 color: 87.5 112 228 255
 color: 95 255 255 255
@@ -934,8 +935,9 @@ color: 40 250 178 50
 color: 45 244 96 42
 color: 50 218 44 52
 color: 57.5 160 26 78
-color: 65 136 18 44
-color: 75 188 78 190
+color: 65 170 28 128
+color: 72.5 202 68 196
+color: 80 154 84 204
 color: 90 238 238 244
 "#;
 
@@ -955,8 +957,9 @@ color: 40 232 156 42
 color: 45 234 88 34
 color: 50 218 38 40
 color: 57.5 156 24 30
-color: 65 126 30 72
-color: 75 172 68 196
+color: 65 168 30 130
+color: 72.5 196 70 204
+color: 80 154 82 210
 color: 87.5 226 226 232
 color: 95 255 255 255
 "#;
@@ -977,9 +980,9 @@ color: 40 246 174 32
 color: 45 250 102 26
 color: 50 238 32 30
 color: 57.5 178 0 24
-color: 65 118 0 0
-color: 72.5 166 32 132
-color: 80 224 94 210
+color: 65 164 0 40
+color: 70 206 36 168
+color: 77.5 224 94 210
 color: 87.5 176 230 255
 color: 95 255 255 255
 "#;
@@ -1000,8 +1003,9 @@ color: 42.5 242 160 42
 color: 47.5 236 90 38
 color: 52.5 218 38 44
 color: 60 156 22 34
-color: 70 120 14 28
-color: 80 184 72 190
+color: 67.5 174 34 132
+color: 75 206 72 198
+color: 82.5 156 84 206
 color: 92.5 238 238 242
 "#;
 
@@ -1035,27 +1039,30 @@ const TORNADO_VELOCITY_TABLE: &str = r#"
 product: BV
 units: m/s
 step: 2
-color: -70 238 255 255
-color: -55 86 236 222
-color: -42 0 196 146
-color: -32 0 132 70
-color: -24 0 84 38
-color: -16 0 158 28
-color: -10 22 238 34
-color: -6 0 172 30
-color: -3 42 116 54
-color: -1 82 96 82
-color: 0 104 104 104
-color: 1 110 82 82
-color: 3 132 42 42
-color: 6 224 24 24
-color: 10 255 34 34
-color: 16 210 0 0
-color: 24 156 0 0
-color: 32 116 0 0
-color: 42 226 116 120
-color: 55 252 214 218
-color: 70 255 255 255
+color: -70 236 255 255
+color: -58 156 244 238
+color: -48 76 220 192
+color: -38 18 178 116
+color: -30 0 118 66
+color: -24 0 84 44
+color: -18 0 156 54
+color: -13 18 232 54
+color: -9 82 244 104
+color: -5 36 136 54
+color: -2 84 100 84
+color: 0 112 112 112
+color: 2 120 86 84
+color: 5 154 46 44
+color: 9 216 28 28
+color: 14 255 34 40
+color: 20 242 0 0
+color: 26 182 0 22
+color: 34 126 0 28
+color: 42 224 84 118
+color: 50 255 154 194
+color: 58 255 218 232
+color: 64 255 204 138
+color: 70 255 240 202
 "#;
 
 const GR2_VELOCITY_TABLE: &str = r#"
@@ -1110,25 +1117,31 @@ const RADARSCOPE_CONTRAST_VELOCITY_TABLE: &str = r#"
 product: BV
 units: m/s
 step: 2
-color: -70 164 250 248
-color: -55 62 220 206
-color: -42 18 172 138
-color: -32 0 128 78
-color: -24 0 90 52
-color: -16 0 164 64
-color: -10 12 226 48
-color: -5 38 144 52
-color: -1 84 100 80
-color: 0 100 100 100
-color: 1 112 84 84
-color: 5 142 38 38
-color: 10 226 30 30
-color: 16 255 62 62
-color: 24 220 26 46
-color: 32 152 18 42
-color: 42 200 88 112
-color: 55 238 192 204
-color: 70 250 250 250
+color: -70 216 255 255
+color: -58 122 244 232
+color: -48 48 210 176
+color: -38 0 160 98
+color: -30 0 104 58
+color: -22 0 148 54
+color: -16 0 224 54
+color: -11 42 255 66
+color: -7 106 240 116
+color: -4 46 134 54
+color: -1 98 104 96
+color: 0 122 122 122
+color: 1 128 96 96
+color: 4 156 64 62
+color: 7 198 42 42
+color: 11 246 28 28
+color: 16 255 40 46
+color: 22 244 0 24
+color: 28 184 0 28
+color: 36 130 0 26
+color: 44 232 92 130
+color: 50 255 150 190
+color: 56 255 214 228
+color: 62 255 210 152
+color: 70 255 242 198
 "#;
 
 const COUPLET_POP_VELOCITY_TABLE: &str = r#"
@@ -1258,27 +1271,28 @@ const ANALYST_PRO_VELOCITY_TABLE: &str = r#"
 product: BV
 units: m/s
 mode: stepped
-color: -70 166 247 238
-color: -58 95 222 202
-color: -46 27 183 146
-color: -36 0 140 92
-color: -28 0 104 60
-color: -21 0 170 70
-color: -15 0 228 54
-color: -10 16 164 45
-color: -6 24 112 50
-color: -2 64 96 72
-color: 0 82 82 82
-color: 2 105 64 64
-color: 6 112 28 28
-color: 10 166 22 22
-color: 15 224 32 32
-color: 21 255 64 64
-color: 28 226 18 44
-color: 36 176 14 48
-color: 46 126 14 48
-color: 58 222 176 186
-color: 70 244 232 234
+color: -70 222 255 255
+color: -58 126 236 224
+color: -46 58 204 164
+color: -36 0 146 90
+color: -28 0 96 56
+color: -21 0 166 66
+color: -15 0 226 58
+color: -10 42 214 70
+color: -6 42 132 54
+color: -2 82 98 80
+color: 0 110 110 110
+color: 2 116 84 84
+color: 6 148 42 42
+color: 10 204 30 30
+color: 15 248 36 42
+color: 21 255 78 86
+color: 28 230 20 44
+color: 36 170 12 42
+color: 46 132 10 42
+color: 58 236 176 194
+color: 66 255 214 166
+color: 70 255 240 220
 "#;
 
 const NWS_VELOCITY_TABLE: &str = r#"
@@ -1488,22 +1502,33 @@ mod tests {
     }
 
     #[test]
-    fn default_velocity_table_avoids_orange_yellow_purple_bins() {
+    fn default_velocity_table_has_radarscope_style_velocity_contrast() {
         let table = builtin_velocity_table();
 
         assert_eq!(table.name(), "Analyst Tornado VEL");
         assert!(!table.interpolates());
-        for stop in table.stops() {
-            let [red, green, blue, alpha] = stop.color.to_array();
-            assert_eq!(alpha, 255);
-            let orange_or_yellow = red > 210 && green > 100 && blue < 90;
-            let purple = red > 90 && blue > 115 && green < 100;
-            assert!(
-                !orange_or_yellow && !purple,
-                "bad velocity hue at {}: {red},{green},{blue}",
-                stop.value
-            );
-        }
+        let zero = table.sample(0.0);
+        let inbound = table.sample(-58.0);
+        let inbound_core = table.sample(-9.0);
+        let outbound = table.sample(14.0);
+        let outbound_high = table.sample(50.0);
+        let outbound_extreme = table.sample(64.0);
+        let [zero_r, zero_g, zero_b, zero_a] = zero.to_array();
+        assert_eq!(zero_a, 255);
+        assert!((zero_r as i16 - zero_g as i16).abs() <= 8);
+        assert!((zero_g as i16 - zero_b as i16).abs() <= 8);
+
+        let [in_r, in_g, in_b, _] = inbound.to_array();
+        assert!(in_b > 210 && in_g > 200 && in_r < 180);
+        let [core_r, core_g, core_b, _] = inbound_core.to_array();
+        assert!(core_g > 220 && core_r < 120 && core_b < 140);
+
+        let [out_r, out_g, out_b, _] = outbound.to_array();
+        assert!(out_r > 230 && out_g < 90 && out_b < 90);
+        let [high_r, high_g, high_b, _] = outbound_high.to_array();
+        assert!(high_r > 230 && high_g > 120 && high_b > 160);
+        let [extreme_r, extreme_g, extreme_b, _] = outbound_extreme.to_array();
+        assert!(extreme_r > 230 && extreme_g > 170 && extreme_b > 110);
     }
 
     #[test]
@@ -1579,12 +1604,33 @@ mod tests {
                 let [red, green, blue, alpha] = stop.color.to_array();
                 let purple_or_magenta = alpha > 0 && red > 120 && blue > 120 && green < 120;
                 assert!(
-                    !purple_or_magenta || stop.value >= 70.0,
+                    !purple_or_magenta || stop.value >= 65.0,
                     "{} brings purple too early at {:.1} dBZ: {red},{green},{blue}",
                     table.name(),
                     stop.value
                 );
             }
+        }
+    }
+
+    #[test]
+    fn accepted_reflectivity_presets_keep_high_dbz_purple() {
+        for table in [
+            gr2_reflectivity_table(),
+            nws_reflectivity_table(),
+            analyst_classic_reflectivity_table(),
+            dark_scope_reflectivity_table(),
+            hail_core_reflectivity_table(),
+            low_precip_reflectivity_table(),
+        ] {
+            assert!(
+                table.stops().iter().any(|stop| {
+                    let [red, green, blue, alpha] = stop.color.to_array();
+                    alpha > 0 && stop.value >= 65.0 && red > 140 && blue > 120 && green < 120
+                }),
+                "{} should keep a high-dBZ purple/magenta bin",
+                table.name()
+            );
         }
     }
 

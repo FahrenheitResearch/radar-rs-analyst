@@ -21,6 +21,7 @@ const HTTP_USER_AGENT: &str = "radar-rs-analyst/0.1 local-desktop";
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
 const REALTIME_CHUNK_DOWNLOAD_BATCH: usize = 8;
+const MIN_RECENT_LEVEL2_SITE_CATALOG_COUNT: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RadarDataLevel {
@@ -211,14 +212,26 @@ pub fn list_level2_sites_for_date(date: NaiveDate) -> Result<Vec<RadarSite>> {
 
 pub fn list_recent_level2_sites(days_back: i64) -> Result<Vec<RadarSite>> {
     let today = Utc::now().date_naive();
+    let mut sites_by_id = BTreeMap::<String, RadarSite>::new();
     for offset in 0..=days_back.max(0) {
         let date = today - Duration::days(offset);
-        let sites = list_level2_sites_for_date(date)?;
-        if !sites.is_empty() {
-            return Ok(sites);
+        if let Ok(sites) = list_level2_sites_for_date(date) {
+            for site in sites {
+                sites_by_id.entry(site.level2_id.clone()).or_insert(site);
+            }
+            if sites_by_id.len() >= MIN_RECENT_LEVEL2_SITE_CATALOG_COUNT {
+                break;
+            }
         }
     }
-    Ok(fallback_sites())
+
+    for site in fallback_sites() {
+        sites_by_id.entry(site.level2_id.clone()).or_insert(site);
+    }
+
+    let mut sites = sites_by_id.into_values().collect::<Vec<_>>();
+    sites.sort_by(|left, right| left.level2_id.cmp(&right.level2_id));
+    Ok(sites)
 }
 
 pub fn fetch_weather_gov_radar_sites() -> Result<Vec<RadarSite>> {

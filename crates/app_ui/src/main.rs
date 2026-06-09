@@ -39,7 +39,7 @@ const HIGH_END_SAMPLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const LOW_CORE_PREVIEW_THREADS: usize = 4;
 const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 8;
-const LIVE_HAZARD_REFRESH_SECONDS: u64 = 10;
+const LIVE_HAZARD_REFRESH_SECONDS: u64 = 60;
 const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
 const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
 const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
@@ -53,6 +53,8 @@ const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
 const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30];
 const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
+const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.0;
+const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 90;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
@@ -74,6 +76,8 @@ const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
 const HAZARD_DETAIL_SCROLL_HEIGHT: f32 = 150.0;
 const TILT_LIST_SCROLL_HEIGHT: f32 = 168.0;
+const HISTORY_STATUS_SCROLL_HEIGHT: f32 = 42.0;
+const HISTORY_FRAME_BUTTONS_SCROLL_HEIGHT: f32 = 58.0;
 const PANEL_BUTTON_HEIGHT: f32 = 24.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 380.0;
 const SIDEBAR_MIN_WIDTH: f32 = 300.0;
@@ -759,18 +763,22 @@ fn spawn_latest_level2_load_worker(
 
                     let fetch_start = Instant::now();
                     let downloaded =
-                        data_source::download_realtime_volume(&realtime, &site_cache_dir)
-                            .map_err(|err| {
+                        data_source::download_realtime_volume(&realtime, &site_cache_dir).map_err(
+                            |err| {
                                 realtime_timings.realtime_poll_end_utc = Some(Utc::now());
                                 RealtimeLoadError::with_timings(
                                     err.to_string(),
                                     realtime_timings.finish(total_start),
                                 )
-                            })?;
+                            },
+                        )?;
                     realtime_timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
                     realtime_timings.fetch_cache_hit = Some(downloaded.cache_hit);
-                    realtime_timings.realtime_assembled_size =
-                        downloaded.path.metadata().ok().map(|metadata| metadata.len());
+                    realtime_timings.realtime_assembled_size = downloaded
+                        .path
+                        .metadata()
+                        .ok()
+                        .map(|metadata| metadata.len());
                     if is_unchanged_realtime_refresh(
                         downloaded.cache_hit,
                         &downloaded.path,
@@ -784,13 +792,15 @@ fn spawn_latest_level2_load_worker(
                     }
 
                     let decode_timings = realtime_timings;
+                    let eager_realtime_display =
+                        mode != LatestLoadMode::AutoRefresh || current_source_path.is_none();
                     let decoded = decode_load_path_with_optional_preview(
                         downloaded.path,
                         &format!("realtime L2 {site_id}"),
                         total_start,
                         decode_timings,
                         &sender,
-                        should_preview_loads(),
+                        should_preview_loads() && eager_realtime_display,
                         if realtime.complete {
                             FrameStatus::LiveComplete
                         } else {
@@ -817,16 +827,18 @@ fn spawn_latest_level2_load_worker(
                 })();
                 if let Ok(decoded) = realtime_result {
                     selected_identity = Some(frame_identity_for_volume(&decoded.volume));
-                    let _ = sender.send(AsyncLoadResult {
-                        label: format!("L2 {site_id} current"),
-                        update: AsyncLoadUpdate::History(
-                            DecodedLoadBatch {
-                                frames: vec![decoded.clone()],
-                                selected_index: 0,
-                            },
-                            true,
-                        ),
-                    });
+                    if mode != LatestLoadMode::AutoRefresh || current_source_path.is_none() {
+                        let _ = sender.send(AsyncLoadResult {
+                            label: format!("L2 {site_id} current"),
+                            update: AsyncLoadUpdate::History(
+                                DecodedLoadBatch {
+                                    frames: vec![decoded.clone()],
+                                    selected_index: 0,
+                                },
+                                true,
+                            ),
+                        });
+                    }
                     decoded_frames.push(decoded);
                 } else if let Err(err) = realtime_result {
                     if mode == LatestLoadMode::AutoRefresh && current_source_path.is_some() {
@@ -1673,8 +1685,8 @@ impl ViewerApp {
             color_tables: ColorTableSet::default(),
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
-            color_table_status: "Built-in GR2/NWS/Analyst reflectivity and Analyst velocity presets"
-                .to_owned(),
+            color_table_status:
+                "Built-in GR2/NWS/Analyst reflectivity and Analyst velocity presets".to_owned(),
             texture: None,
             texture_key: None,
             render_sender,
@@ -1934,10 +1946,7 @@ impl ViewerApp {
                                     layer.status = format!("Loaded {}", message.label);
                                 }
                             }
-                            AsyncLoadUpdate::Unchanged {
-                                timings,
-                                reason,
-                            } => {
+                            AsyncLoadUpdate::Unchanged { timings, reason } => {
                                 if let Some(timings) = timings {
                                     layer.load_timing = Some(timings);
                                 }
@@ -2014,6 +2023,13 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    fn clear_frame_history(&mut self) {
+        self.frame_history.clear();
+        self.selected_frame_index = 0;
+        self.history_playing = false;
+        self.last_history_step = None;
+    }
+
     fn install_preview_volume(&mut self, decoded: DecodedLoad, ctx: &egui::Context) {
         let source_path = decoded.path;
         self.source_path = Some(source_path.clone());
@@ -2048,9 +2064,9 @@ impl ViewerApp {
             .volume
             .as_ref()
             .is_some_and(|volume| volume.site.id != selected_site_id)
+            || history_contains_other_site(&self.frame_history, &selected_site_id)
         {
-            self.frame_history.clear();
-            self.selected_frame_index = 0;
+            self.clear_frame_history();
         }
 
         for decoded in batch.frames {
@@ -2060,7 +2076,8 @@ impl ViewerApp {
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         self.trim_frame_history();
 
-        if select_loaded_frame {
+        let should_select_loaded_frame = select_loaded_frame && !self.history_playing;
+        if should_select_loaded_frame {
             let next_index = self
                 .frame_history
                 .iter()
@@ -2153,11 +2170,14 @@ impl ViewerApp {
         source_path: Option<PathBuf>,
         ctx: &egui::Context,
     ) {
+        let previous_cut = self.selected_cut;
+        let previous_product = self.selected_product.clone();
         let (selected_cut, selected_product) = selection_for_installed_volume(
             self.volume.as_deref(),
             self.selected_cut,
             &self.selected_product,
             volume.as_ref(),
+            !self.history_playing,
         );
         if let Some(index) = self
             .sites
@@ -2175,6 +2195,20 @@ impl ViewerApp {
             .map(|volume| Arc::as_ptr(volume) as usize);
         let next_volume_ptr = Arc::as_ptr(&volume) as usize;
         let same_volume = previous_volume_ptr == Some(next_volume_ptr);
+        let keep_existing_texture = should_keep_texture_for_volume_install(
+            self.volume.as_deref(),
+            volume.as_ref(),
+            same_volume,
+        );
+        let retarget_existing_texture = self.texture.is_some()
+            && selected_cut == previous_cut
+            && selected_product == previous_product
+            && selected_cut_render_data_unchanged(
+                self.volume.as_deref(),
+                volume.as_ref(),
+                selected_cut,
+                &selected_product,
+            );
         if let Some(source_path) = source_path {
             self.source_path = Some(source_path);
         }
@@ -2184,8 +2218,13 @@ impl ViewerApp {
         self.selected_cut = selected_cut;
         self.selected_product = selected_product;
         self.sanitize_selection();
-        if same_volume {
+        if keep_existing_texture {
             self.pending_render_key = None;
+            if retarget_existing_texture && let Some(texture_key) = &mut self.texture_key {
+                texture_key.volume_ptr = next_volume_ptr;
+                texture_key.cut = self.selected_cut;
+                texture_key.product = self.selected_product.clone();
+            }
             self.render_ms = None;
             self.worker_ms = None;
             self.texture_ms = None;
@@ -2311,7 +2350,31 @@ impl ViewerApp {
         match result {
             Ok(overlay) => {
                 if updating {
-                    return false;
+                    if !overlay.source_label.contains("NWS active alerts") {
+                        return false;
+                    }
+                    if overlay.records.is_empty()
+                        || self.hazard_overlay.as_ref().is_some_and(|existing| {
+                            hazard_overlay_records_match(existing, &overlay)
+                        })
+                    {
+                        return false;
+                    }
+                    let selected_event_id = self
+                        .selected_hazard_record()
+                        .map(|record| record.event_id.clone());
+                    self.hazard_status = format!(
+                        "Preview {} polygons from {} items in {:.1} ms",
+                        overlay.records.len(),
+                        overlay.parsed_items,
+                        overlay.load_ms
+                    );
+                    self.selected_hazard_index = selected_hazard_index_for_event_id(
+                        &overlay.records,
+                        selected_event_id.as_deref(),
+                    );
+                    self.hazard_overlay = Some(overlay);
+                    return true;
                 }
                 if let Some(existing) = &self.hazard_overlay
                     && hazard_overlay_records_match(existing, &overlay)
@@ -2455,10 +2518,7 @@ impl ViewerApp {
                                 self.status = format!("Loaded {}", message.label);
                             }
                         }
-                        AsyncLoadUpdate::Unchanged {
-                            timings,
-                            reason,
-                        } => {
+                        AsyncLoadUpdate::Unchanged { timings, reason } => {
                             if let Some(timings) = timings {
                                 self.load_timing = Some(timings);
                             }
@@ -2636,8 +2696,6 @@ impl ViewerApp {
                         }
                         Err(err) if is_latest => {
                             self.pending_render_key = None;
-                            self.texture = None;
-                            self.texture_key = None;
                             self.render_ms = None;
                             self.worker_ms = None;
                             self.texture_ms = None;
@@ -2689,8 +2747,6 @@ impl ViewerApp {
                             }
                             Err(err) if is_latest => {
                                 layer.pending_render_key = None;
-                                layer.texture = None;
-                                layer.texture_key = None;
                                 layer.render_ms = None;
                                 layer.worker_ms = None;
                                 layer.texture_ms = None;
@@ -3730,6 +3786,9 @@ impl ViewerApp {
         mode: LatestLoadMode,
     ) {
         let site_id = site.level2_id.clone();
+        if history_contains_other_site(&self.frame_history, &site_id) {
+            self.clear_frame_history();
+        }
         if mode == LatestLoadMode::User || self.volume.is_none() {
             self.begin_primary_load_telemetry();
         }
@@ -3756,7 +3815,12 @@ impl ViewerApp {
             .as_ref()
             .filter(|volume| volume.site.id == site_id)
             .map(|volume| frame_identity_for_volume(volume.as_ref()));
-        if should_clear_display_for_latest_load(self.volume.as_deref(), &site_id, Utc::now()) {
+        if should_clear_display_before_latest_load(
+            mode,
+            self.volume.as_deref(),
+            &site_id,
+            Utc::now(),
+        ) {
             self.clear_displayed_volume_for_pending_load(ctx);
         }
 
@@ -3962,6 +4026,7 @@ impl ViewerApp {
                     index,
                     cut.elevation_deg,
                     cut.radials.len(),
+                    cut_start_time_utc(volume, index),
                     index == self.selected_cut,
                     is_displayable_on_cut(volume, index, &self.selected_product),
                 )
@@ -4036,12 +4101,23 @@ impl ViewerApp {
             .max_height(TILT_LIST_SCROLL_HEIGHT)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                for (index, elevation_deg, radial_count, is_selected, has_selected_product) in
-                    &cut_rows
+                for (
+                    index,
+                    elevation_deg,
+                    radial_count,
+                    start_time,
+                    is_selected,
+                    has_selected_product,
+                ) in &cut_rows
                 {
                     let label = format!(
-                        "#{:02}  {:>4.2} deg  {:>4} radials",
-                        index, elevation_deg, radial_count
+                        "#{:02}  {:>4.2} deg  {:>4} radials  {}",
+                        index,
+                        elevation_deg,
+                        radial_count,
+                        start_time
+                            .map(|time| time.format("%H:%M:%S").to_string())
+                            .unwrap_or_else(|| "--:--:--".to_owned())
                     );
                     let response = ui
                         .add_enabled_ui(*has_selected_product, |ui| {
@@ -4084,7 +4160,15 @@ impl ViewerApp {
             return;
         }
 
-        ui.label(self.selected_frame_status_text());
+        let selected_status_text = self.selected_frame_status_text();
+        fixed_height_scroll(
+            ui,
+            "history_selected_frame_status",
+            HISTORY_STATUS_SCROLL_HEIGHT,
+            |ui| {
+                wrapped_label(ui, &selected_status_text);
+            },
+        );
 
         let frame_count = self.frame_history.len();
         let mut next_frame_index = None;
@@ -4126,33 +4210,43 @@ impl ViewerApp {
         });
 
         let mut slider_index = self.selected_frame_index.min(frame_count - 1);
-        if ui
-            .add_enabled(
-                frame_count > 1,
-                egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false),
-            )
+        let slider_response = ui
+            .add_enabled_ui(frame_count > 1, |ui| {
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
+                    egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false),
+                )
+            })
+            .inner
             .on_hover_text("Scrub decoded frame history")
-            .changed()
-        {
+            .changed();
+        if slider_response {
             next_frame_index = Some(slider_index);
         }
 
-        ui.horizontal_wrapped(|ui| {
-            for (index, frame) in self.frame_history.iter().enumerate() {
-                let label = compact_frame_label(frame, Utc::now());
-                let selected = index == self.selected_frame_index;
-                if ui
-                    .add_sized(
-                        egui::vec2(72.0, PANEL_BUTTON_HEIGHT),
-                        egui::Button::selectable(selected, label),
-                    )
-                    .on_hover_text(frame_status_text(frame, Utc::now()))
-                    .clicked()
-                {
-                    next_frame_index = Some(index);
-                }
-            }
-        });
+        fixed_height_scroll(
+            ui,
+            "history_frame_buttons",
+            HISTORY_FRAME_BUTTONS_SCROLL_HEIGHT,
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (index, frame) in self.frame_history.iter().enumerate() {
+                        let label = compact_frame_label(frame, Utc::now());
+                        let selected = index == self.selected_frame_index;
+                        if ui
+                            .add_sized(
+                                egui::vec2(72.0, PANEL_BUTTON_HEIGHT),
+                                egui::Button::selectable(selected, label),
+                            )
+                            .on_hover_text(frame_status_text(frame, Utc::now()))
+                            .clicked()
+                        {
+                            next_frame_index = Some(index);
+                        }
+                    }
+                });
+            },
+        );
 
         if let Some(index) = next_frame_index {
             self.history_playing = false;
@@ -6185,6 +6279,46 @@ fn hazard_record_is_active_or_pending(record: &HazardRecord) -> bool {
     )
 }
 
+fn live_hazard_record_is_current(record: &HazardRecord) -> bool {
+    matches!(
+        record.lifecycle_status.as_deref(),
+        Some("Active") | Some("Pending")
+    )
+}
+
+fn active_alert_event_ids(records: &[HazardRecord]) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter(|record| record.action == "ALERT")
+        .filter(|record| live_hazard_record_is_current(record))
+        .map(|record| base_hazard_event_id(&record.event_id).to_owned())
+        .collect()
+}
+
+fn live_hazard_record_has_authoritative_source(
+    record: &HazardRecord,
+    active_alert_event_ids: &BTreeSet<String>,
+) -> bool {
+    !live_warning_requires_active_alert(record)
+        || active_alert_event_ids.contains(base_hazard_event_id(&record.event_id))
+}
+
+fn live_warning_requires_active_alert(record: &HazardRecord) -> bool {
+    matches!(
+        record.event_family.as_str(),
+        "tornado"
+            | "severe thunderstorm"
+            | "flash flood"
+            | "flood"
+            | "special marine"
+            | "snow squall"
+    )
+}
+
+fn base_hazard_event_id(event_id: &str) -> &str {
+    event_id.split_once('#').map_or(event_id, |(base, _)| base)
+}
+
 fn fixed_height_scroll(
     ui: &mut egui::Ui,
     id: &'static str,
@@ -6736,8 +6870,12 @@ fn build_live_hazard_overlay(
     start: Instant,
     mut records: Vec<HazardRecord>,
 ) -> HazardOverlay {
-    records.retain(hazard_record_is_active_or_pending);
+    let active_alert_event_ids = active_alert_event_ids(&records);
     dedupe_hazard_records(&mut records);
+    records.retain(|record| {
+        live_hazard_record_is_current(record)
+            && live_hazard_record_has_authoritative_source(record, &active_alert_event_ids)
+    });
     sort_hazard_records(&mut records);
 
     HazardOverlay {
@@ -6930,6 +7068,10 @@ fn merge_duplicate_hazard_record(
     if merged.lifecycle_status.is_none() {
         merged.lifecycle_status = fallback_source.lifecycle_status.clone();
     }
+    merged.lifecycle_status = preferred_lifecycle_status(
+        existing.lifecycle_status.as_deref(),
+        candidate.lifecycle_status.as_deref(),
+    );
     if merged.severity.is_none() {
         merged.severity = fallback_source.severity.clone();
     }
@@ -6952,6 +7094,24 @@ fn merge_duplicate_hazard_record(
         merged.damage_threat = fallback_source.damage_threat.clone();
     }
     merged
+}
+
+fn preferred_lifecycle_status(left: Option<&str>, right: Option<&str>) -> Option<String> {
+    [left, right]
+        .into_iter()
+        .flatten()
+        .max_by_key(|status| lifecycle_status_priority(status))
+        .map(str::to_owned)
+}
+
+fn lifecycle_status_priority(status: &str) -> u8 {
+    match status {
+        "Active" => 4,
+        "Pending" => 3,
+        "Canceled" => 1,
+        "Expired" => 0,
+        _ => 2,
+    }
 }
 
 fn hazard_record_detail_score(record: &HazardRecord) -> usize {
@@ -8345,6 +8505,36 @@ fn displayable_products(volume: &RadarVolume, cut_index: usize) -> Vec<DisplayPr
     product_order(&available)
 }
 
+fn cut_start_time_utc(volume: &RadarVolume, cut_index: usize) -> Option<DateTime<Utc>> {
+    let cut = volume.cuts.get(cut_index)?;
+    cut.radials
+        .iter()
+        .filter_map(|radial| {
+            radial_collection_time_from_volume_time_utc(volume.volume_time, radial.time_offset_ms)
+        })
+        .min()
+}
+
+fn radial_collection_time_from_volume_time_utc(
+    volume_time: DateTime<Utc>,
+    time_offset_ms: i32,
+) -> Option<DateTime<Utc>> {
+    let midnight = volume_time
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map(|naive| Utc.from_utc_datetime(&naive))?;
+    let milliseconds = chrono::Duration::milliseconds(time_offset_ms as i64);
+    let midnight_candidate = midnight + milliseconds;
+    let relative_candidate = volume_time + milliseconds;
+    let midnight_delta = (midnight_candidate - volume_time).num_milliseconds().abs();
+    let relative_delta = (relative_candidate - volume_time).num_milliseconds().abs();
+    Some(if midnight_delta <= relative_delta {
+        midnight_candidate
+    } else {
+        relative_candidate
+    })
+}
+
 fn displayable_cuts_for_product(volume: &RadarVolume, product: &DisplayProduct) -> Vec<usize> {
     (0..volume.cuts.len())
         .filter(|index| is_displayable_on_cut(volume, *index, product))
@@ -8394,18 +8584,107 @@ fn displayable_radial_threshold(cut_radials: usize) -> usize {
     MIN_DISPLAYABLE_RADIALS.min((cut_radials / 2).max(1))
 }
 
+fn should_keep_texture_for_volume_install(
+    previous_volume: Option<&RadarVolume>,
+    next_volume: &RadarVolume,
+    same_volume: bool,
+) -> bool {
+    same_volume || previous_volume.is_some_and(|previous| previous.site.id == next_volume.site.id)
+}
+
+fn selected_cut_render_data_unchanged(
+    previous_volume: Option<&RadarVolume>,
+    next_volume: &RadarVolume,
+    selected_cut: usize,
+    selected_product: &DisplayProduct,
+) -> bool {
+    let Some(previous_volume) = previous_volume else {
+        return false;
+    };
+    if frame_identity_for_volume(previous_volume) != frame_identity_for_volume(next_volume) {
+        return false;
+    }
+    let Some(previous_cut) = previous_volume.cuts.get(selected_cut) else {
+        return false;
+    };
+    let Some(next_cut) = next_volume.cuts.get(selected_cut) else {
+        return false;
+    };
+    if (previous_cut.elevation_deg - next_cut.elevation_deg).abs() > 0.05 {
+        return false;
+    }
+    let base_moment = selected_product.base_moment();
+    let Some(previous_grid) = previous_cut.moments.get(&base_moment) else {
+        return false;
+    };
+    let Some(next_grid) = next_cut.moments.get(&base_moment) else {
+        return false;
+    };
+    previous_cut.radials.len() == next_cut.radials.len()
+        && previous_grid.radial_count() == next_grid.radial_count()
+        && previous_grid.gate_range == next_grid.gate_range
+}
+
 fn selection_for_installed_volume(
     previous_volume: Option<&RadarVolume>,
     previous_cut: usize,
     previous_product: &DisplayProduct,
     volume: &RadarVolume,
+    allow_low_level_auto_advance: bool,
 ) -> (usize, DisplayProduct) {
     let same_site = previous_volume.is_some_and(|previous| previous.site.id == volume.site.id);
+    if same_site
+        && allow_low_level_auto_advance
+        && let Some(next_cut) =
+            latest_newer_low_level_cut(previous_volume, previous_cut, previous_product, volume)
+    {
+        return (next_cut, previous_product.clone());
+    }
+    if same_site && is_displayable_on_cut(volume, previous_cut, previous_product) {
+        return (previous_cut, previous_product.clone());
+    }
     if same_site && let Some(cut) = best_cut_for_product(volume, previous_cut, previous_product) {
         return (cut, previous_product.clone());
     }
 
     default_selection_for_volume(volume)
+}
+
+fn latest_newer_low_level_cut(
+    previous_volume: Option<&RadarVolume>,
+    previous_cut: usize,
+    previous_product: &DisplayProduct,
+    volume: &RadarVolume,
+) -> Option<usize> {
+    let previous_volume = previous_volume?;
+    if frame_identity_for_volume(previous_volume) != frame_identity_for_volume(volume) {
+        return None;
+    }
+    let previous_cut_data = previous_volume.cuts.get(previous_cut)?;
+    if !is_auto_advance_low_level_cut(previous_cut_data) {
+        return None;
+    }
+    let previous_time = cut_start_time_utc(previous_volume, previous_cut)?;
+
+    (0..volume.cuts.len())
+        .filter(|cut_index| {
+            volume
+                .cuts
+                .get(*cut_index)
+                .is_some_and(is_auto_advance_low_level_cut)
+                && is_displayable_on_cut(volume, *cut_index, previous_product)
+        })
+        .filter_map(|cut_index| {
+            let cut_time = cut_start_time_utc(volume, cut_index)?;
+            ((cut_time - previous_time).num_seconds() >= LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS)
+                .then_some((cut_index, cut_time))
+        })
+        .max_by_key(|(_, cut_time)| *cut_time)
+        .map(|(cut_index, _)| cut_index)
+}
+
+fn is_auto_advance_low_level_cut(cut: &ElevationCut) -> bool {
+    cut.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG
 }
 
 fn default_selection_for_volume(volume: &RadarVolume) -> (usize, DisplayProduct) {
@@ -8439,6 +8718,16 @@ fn should_clear_display_for_latest_load(
         .signed_duration_since(volume.volume_time.with_timezone(&Utc))
         .num_seconds()
         > STALE_LATEST_DISPLAY_CLEAR_SECONDS
+}
+
+fn should_clear_display_before_latest_load(
+    mode: LatestLoadMode,
+    volume: Option<&RadarVolume>,
+    site_id: &str,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    mode != LatestLoadMode::AutoRefresh
+        && should_clear_display_for_latest_load(volume, site_id, now_utc)
 }
 
 fn normalized_history_limit(limit: usize) -> usize {
@@ -8508,7 +8797,10 @@ fn frame_status_text(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> Strin
 }
 
 fn live_chunk_readout(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> Option<String> {
-    if !matches!(frame.status, FrameStatus::LivePartial | FrameStatus::LiveComplete) {
+    if !matches!(
+        frame.status,
+        FrameStatus::LivePartial | FrameStatus::LiveComplete
+    ) {
         return None;
     }
     let timings = frame.timings?;
@@ -8535,6 +8827,12 @@ fn compact_frame_label(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> Str
         frame.identity.scan_time_utc.format("%H:%M"),
         short_frame_status_label(frame.status, frame.identity.scan_time_utc, now_utc)
     )
+}
+
+fn history_contains_other_site(history: &[FrameHistoryEntry], site_id: &str) -> bool {
+    history
+        .iter()
+        .any(|frame| frame.identity.site_id != site_id)
 }
 
 fn short_frame_status_label(
@@ -9196,7 +9494,8 @@ mod tests {
                 Some(&previous),
                 0,
                 &DisplayProduct::Moment(MomentType::Velocity),
-                &next
+                &next,
+                true,
             ),
             (1, DisplayProduct::Moment(MomentType::Velocity))
         );
@@ -9205,9 +9504,48 @@ mod tests {
                 Some(&previous),
                 0,
                 &DisplayProduct::StormRelativeVelocity,
-                &next
+                &next,
+                true,
             ),
             (1, DisplayProduct::StormRelativeVelocity)
+        );
+    }
+
+    #[test]
+    fn same_site_live_update_advances_to_newer_low_level_sails_sweep() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let previous = test_reflectivity_sails_volume(&[(0.5, 0)]);
+        let next = test_reflectivity_sails_volume(&[
+            (0.5, 0),
+            (1.8, 60_000),
+            (0.6, 180_000),
+            (0.5, 360_000),
+        ]);
+
+        assert_eq!(
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, true),
+            (3, product.clone())
+        );
+        assert_eq!(
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, false),
+            (0, product)
+        );
+    }
+
+    #[test]
+    fn low_level_auto_advance_ignores_short_lag_and_high_tilts() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let previous = test_reflectivity_sails_volume(&[(0.5, 0)]);
+        let short_lag = test_reflectivity_sails_volume(&[(0.5, 0), (0.7, 75_000)]);
+        let high_tilt = test_reflectivity_sails_volume(&[(0.5, 0), (1.8, 180_000)]);
+
+        assert_eq!(
+            selection_for_installed_volume(Some(&previous), 0, &product, &short_lag, true),
+            (0, product.clone())
+        );
+        assert_eq!(
+            selection_for_installed_volume(Some(&previous), 0, &product, &high_tilt, true),
+            (0, product)
         );
     }
 
@@ -9222,10 +9560,167 @@ mod tests {
                 Some(&previous),
                 1,
                 &DisplayProduct::Moment(MomentType::Velocity),
-                &next
+                &next,
+                true,
             ),
             (0, DisplayProduct::Moment(MomentType::Reflectivity))
         );
+    }
+
+    #[test]
+    fn same_site_refresh_keeps_existing_texture_until_replacement_render() {
+        let previous = test_ref_then_velocity_volume();
+        let next = previous.clone();
+        let mut different = previous.clone();
+        different.site.id = "OTHER".to_owned();
+
+        assert!(should_keep_texture_for_volume_install(
+            Some(&previous),
+            &next,
+            false
+        ));
+        assert!(should_keep_texture_for_volume_install(
+            Some(&previous),
+            &different,
+            true
+        ));
+        assert!(!should_keep_texture_for_volume_install(
+            Some(&previous),
+            &different,
+            false
+        ));
+    }
+
+    #[test]
+    fn history_scope_detects_frames_from_other_sites() {
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let decoded = test_decoded_live_partial(PathBuf::from("KTLX-live"), "KTLX", scan_time, 10);
+        let frame = FrameHistoryEntry {
+            identity: frame_identity_for_volume(&decoded.volume),
+            path: decoded.path,
+            volume: Arc::new(decoded.volume),
+            timings: Some(decoded.timings),
+            status: decoded.status,
+            source_label: decoded.source_label,
+        };
+
+        assert!(!history_contains_other_site(
+            std::slice::from_ref(&frame),
+            "KTLX"
+        ));
+        assert!(history_contains_other_site(&[frame], "KFTG"));
+    }
+
+    #[test]
+    fn installing_new_site_batch_drops_previous_site_history() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        app.upsert_history_frame(test_decoded_live_partial(
+            PathBuf::from("KTLX-live"),
+            "KTLX",
+            scan_time,
+            10,
+        ));
+        app.history_playing = true;
+
+        let ctx = egui::Context::default();
+        app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_live_partial(
+                    PathBuf::from("KFTG-live"),
+                    "KFTG",
+                    scan_time + chrono::Duration::minutes(3),
+                    10,
+                )],
+                selected_index: 0,
+            },
+            false,
+            true,
+            &ctx,
+        );
+
+        assert_eq!(app.frame_history.len(), 1);
+        assert_eq!(app.frame_history[0].identity.site_id, "KFTG");
+        assert!(!app.history_playing);
+    }
+
+    #[test]
+    fn live_update_does_not_steal_selection_while_history_is_playing() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        app.upsert_history_frame(test_decoded_live_partial(
+            PathBuf::from("KTLX-0130"),
+            "KTLX",
+            scan_time,
+            10,
+        ));
+        app.upsert_history_frame(test_decoded_live_partial(
+            PathBuf::from("KTLX-0133"),
+            "KTLX",
+            scan_time + chrono::Duration::minutes(3),
+            10,
+        ));
+        app.frame_history
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
+        app.selected_frame_index = 0;
+        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
+        app.history_playing = true;
+
+        let ctx = egui::Context::default();
+        app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_live_partial(
+                    PathBuf::from("KTLX-0136"),
+                    "KTLX",
+                    scan_time + chrono::Duration::minutes(6),
+                    10,
+                )],
+                selected_index: 0,
+            },
+            false,
+            true,
+            &ctx,
+        );
+
+        assert!(app.history_playing);
+        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(
+            app.frame_history[app.selected_frame_index]
+                .identity
+                .scan_time_utc,
+            scan_time
+        );
+    }
+
+    #[test]
+    fn same_scan_unrelated_tilt_growth_reuses_selected_cut_texture() {
+        let mut previous = test_reflectivity_sails_volume(&[(0.5, 0)]);
+        previous.metadata.source_path = Some("KTLX20260608_010000_RT001_V06".to_owned());
+        let mut next = test_reflectivity_sails_volume(&[(0.5, 0), (1.8, 60_000), (2.4, 120_000)]);
+        next.metadata.source_path = previous.metadata.source_path.clone();
+
+        assert!(selected_cut_render_data_unchanged(
+            Some(&previous),
+            &next,
+            0,
+            &DisplayProduct::Moment(MomentType::Reflectivity)
+        ));
+
+        let mut changed_selected_cut = next.clone();
+        changed_selected_cut.cuts[0].radials.push(test_radial(
+            1.0,
+            radar_core::GateRange {
+                first_gate_m: 500,
+                gate_spacing_m: 250,
+                gate_count: 3,
+            },
+        ));
+        assert!(!selected_cut_render_data_unchanged(
+            Some(&previous),
+            &changed_selected_cut,
+            0,
+            &DisplayProduct::Moment(MomentType::Reflectivity)
+        ));
     }
 
     #[test]
@@ -9275,6 +9770,18 @@ mod tests {
 
         fresh.volume_time = now - chrono::Duration::minutes(16);
         assert!(should_clear_display_for_latest_load(
+            Some(&fresh),
+            "KTLX",
+            now
+        ));
+        assert!(!should_clear_display_before_latest_load(
+            LatestLoadMode::AutoRefresh,
+            Some(&fresh),
+            "KTLX",
+            now
+        ));
+        assert!(should_clear_display_before_latest_load(
+            LatestLoadMode::User,
             Some(&fresh),
             "KTLX",
             now
@@ -9792,12 +10299,14 @@ mod tests {
             .with_ymd_and_hms(2026, 6, 7, 22, 20, 0)
             .single()
             .expect("valid query time");
-        let active = test_hazard_record(
+        let mut active = test_hazard_record(
             "active",
             "SVR 0001",
             "severe thunderstorm",
             square_hazard_points(0.0, 0.0, 1.0, 1.0),
         );
+        active.action = "ALERT".to_owned();
+        active.source_url = Some("https://api.weather.gov/alerts/active".to_owned());
         let mut expired = test_hazard_record(
             "expired",
             "SVR 0002",
@@ -9818,6 +10327,138 @@ mod tests {
 
         assert_eq!(overlay.records.len(), 1);
         assert_eq!(overlay.records[0].event_id, "active");
+    }
+
+    #[test]
+    fn live_overlay_drops_unknown_lifecycle_records() {
+        let start = Instant::now();
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 7, 22, 20, 0)
+            .single()
+            .expect("valid query time");
+        let mut unknown = test_hazard_record(
+            "unknown",
+            "SVR 0002",
+            "severe thunderstorm",
+            square_hazard_points(2.0, 2.0, 3.0, 3.0),
+        );
+        unknown.lifecycle_status = None;
+
+        let overlay =
+            build_live_hazard_overlay("test".to_owned(), query_time, 1, 1, 0, start, vec![unknown]);
+
+        assert!(overlay.records.is_empty());
+    }
+
+    #[test]
+    fn active_alert_status_wins_over_expired_duplicate_text() {
+        let start = Instant::now();
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 7, 22, 20, 0)
+            .single()
+            .expect("valid query time");
+        let mut alert = test_hazard_record(
+            "KBYZ.SV.W.0027",
+            "SVR 0027",
+            "severe thunderstorm",
+            square_hazard_points(-1.0, -1.0, 1.0, 1.0),
+        );
+        alert.action = "ALERT".to_owned();
+        alert.lifecycle_status = Some("Active".to_owned());
+        let mut text = test_hazard_record(
+            "KBYZ.SV.W.0027",
+            "SVR 0027",
+            "severe thunderstorm",
+            square_hazard_points(-20.0, -20.0, 20.0, 20.0),
+        );
+        text.lifecycle_status = Some("Expired".to_owned());
+        text.details.push("Richer text detail".to_owned());
+
+        let overlay = build_live_hazard_overlay(
+            "test".to_owned(),
+            query_time,
+            2,
+            2,
+            0,
+            start,
+            vec![alert, text],
+        );
+
+        assert_eq!(overlay.records.len(), 1);
+        assert_eq!(
+            overlay.records[0].lifecycle_status.as_deref(),
+            Some("Active")
+        );
+        assert_eq!(overlay.records[0].details, ["Richer text detail"]);
+    }
+
+    #[test]
+    fn live_overlay_drops_standalone_product_warning_without_active_alert() {
+        let start = Instant::now();
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 9, 1, 41, 0)
+            .single()
+            .expect("valid query time");
+        let mut product = test_hazard_record(
+            "KCYS.TO.W.0009",
+            "TOR 0009",
+            "tornado",
+            square_hazard_points(-104.4, 41.5, -104.2, 41.7),
+        );
+        product.action = "NEW".to_owned();
+        product.lifecycle_status = Some("Active".to_owned());
+        product.source_url = Some(
+            "https://api.weather.gov/products/cc98313c-d3b5-4512-b62d-1bf184c3c7ce".to_owned(),
+        );
+
+        let overlay =
+            build_live_hazard_overlay("test".to_owned(), query_time, 1, 1, 0, start, vec![product]);
+
+        assert!(overlay.records.is_empty());
+    }
+
+    #[test]
+    fn product_warning_only_enriches_matching_active_alert() {
+        let start = Instant::now();
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 9, 1, 20, 0)
+            .single()
+            .expect("valid query time");
+        let mut alert = test_hazard_record(
+            "KCYS.TO.W.0009",
+            "TOR 0009",
+            "tornado",
+            square_hazard_points(-104.4, 41.5, -104.2, 41.7),
+        );
+        alert.action = "ALERT".to_owned();
+        alert.lifecycle_status = Some("Active".to_owned());
+        alert.source_url = Some("https://api.weather.gov/alerts/1".to_owned());
+        let mut product = test_hazard_record(
+            "KCYS.TO.W.0009",
+            "TOR 0009",
+            "tornado",
+            square_hazard_points(-106.0, 40.0, -103.0, 43.0),
+        );
+        product.action = "NEW".to_owned();
+        product.lifecycle_status = Some("Active".to_owned());
+        product.source_url = Some(
+            "https://api.weather.gov/products/cc98313c-d3b5-4512-b62d-1bf184c3c7ce".to_owned(),
+        );
+        product.details.push("Richer product text".to_owned());
+
+        let overlay = build_live_hazard_overlay(
+            "test".to_owned(),
+            query_time,
+            2,
+            2,
+            0,
+            start,
+            vec![alert.clone(), product],
+        );
+
+        assert_eq!(overlay.records.len(), 1);
+        assert_eq!(overlay.records[0].bbox, alert.bbox);
+        assert_eq!(overlay.records[0].details, ["Richer product text"]);
     }
 
     #[test]
@@ -10256,6 +10897,38 @@ mod tests {
             .insert(MomentType::Velocity, velocity_grid);
         volume.cuts.push(velocity_cut);
 
+        volume
+    }
+
+    fn test_reflectivity_sails_volume(cuts: &[(f32, i32)]) -> RadarVolume {
+        let gate_range = radar_core::GateRange {
+            first_gate_m: 500,
+            gate_spacing_m: 250,
+            gate_count: 3,
+        };
+        let mut volume = RadarVolume::new(
+            radar_core::RadarSite::new("TEST"),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        );
+        for (index, (elevation_deg, time_offset_ms)) in cuts.iter().enumerate() {
+            let mut cut = ElevationCut::new(*elevation_deg, Some(index as u8));
+            let mut radial = test_radial(0.0, gate_range.clone());
+            radial.elevation_deg = *elevation_deg;
+            radial.time_offset_ms = *time_offset_ms;
+            cut.radials.push(radial);
+            let mut grid = MomentGrid::new_u8(
+                MomentType::Reflectivity,
+                gate_range.clone(),
+                2.0,
+                66.0,
+                Some(0),
+                Some(1),
+            );
+            grid.push_u8_row_slice(0, &[66, 80, 90])
+                .expect("reflectivity row");
+            cut.moments.insert(MomentType::Reflectivity, grid);
+            volume.cuts.push(cut);
+        }
         volume
     }
 
