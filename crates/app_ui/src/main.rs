@@ -55,6 +55,7 @@ const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.0;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 90;
+const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 600;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
@@ -346,6 +347,7 @@ struct ViewerApp {
     hazard_fill_alpha: u8,
     hidden_hazard_families: BTreeSet<String>,
     realtime_level2_auto_refresh: bool,
+    display_live_chunk_updates: bool,
     last_realtime_level2_refresh: Option<Instant>,
     live_refresh_skip_reason: Option<String>,
     live_hazard_auto_refresh: bool,
@@ -729,6 +731,7 @@ fn spawn_latest_level2_load_worker(
     known_frame_paths: BTreeSet<PathBuf>,
     current_frame_identity: Option<FrameIdentity>,
     history_limit: usize,
+    display_live_chunk_updates: bool,
     sender: mpsc::Sender<AsyncLoadResult>,
 ) {
     thread::spawn(move || {
@@ -794,13 +797,16 @@ fn spawn_latest_level2_load_worker(
                     let decode_timings = realtime_timings;
                     let eager_realtime_display =
                         mode != LatestLoadMode::AutoRefresh || current_source_path.is_none();
+                    let realtime_preview_enabled = should_preview_loads()
+                        && eager_realtime_display
+                        && display_live_chunk_updates;
                     let decoded = decode_load_path_with_optional_preview(
                         downloaded.path,
                         &format!("realtime L2 {site_id}"),
                         total_start,
                         decode_timings,
                         &sender,
-                        should_preview_loads() && eager_realtime_display,
+                        realtime_preview_enabled,
                         if realtime.complete {
                             FrameStatus::LiveComplete
                         } else {
@@ -818,6 +824,17 @@ fn spawn_latest_level2_load_worker(
                         timings.realtime_poll_end_utc = Some(Utc::now());
                         return Err(RealtimeLoadError::with_timings(
                             "realtime chunks are not displayable yet".to_owned(),
+                            timings,
+                        ));
+                    }
+                    if !realtime.complete
+                        && !display_live_chunk_updates
+                        && !live_partial_has_complete_low_level_tilt(&decoded.volume)
+                    {
+                        let mut timings = decoded.timings;
+                        timings.realtime_poll_end_utc = Some(Utc::now());
+                        return Err(RealtimeLoadError::with_timings(
+                            "waiting for complete live low-level tilt".to_owned(),
                             timings,
                         ));
                     }
@@ -1725,6 +1742,7 @@ impl ViewerApp {
             hazard_fill_alpha: DEFAULT_HAZARD_FILL_ALPHA,
             hidden_hazard_families: default_hidden_hazard_families(),
             realtime_level2_auto_refresh: true,
+            display_live_chunk_updates: false,
             last_realtime_level2_refresh: None,
             live_refresh_skip_reason: None,
             live_hazard_auto_refresh: true,
@@ -1923,6 +1941,7 @@ impl ViewerApp {
             BTreeSet::new(),
             None,
             1,
+            false,
             sender,
         );
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
@@ -2178,6 +2197,7 @@ impl ViewerApp {
             &self.selected_product,
             volume.as_ref(),
             !self.history_playing,
+            self.display_live_chunk_updates,
         );
         if let Some(index) = self
             .sites
@@ -3831,6 +3851,7 @@ impl ViewerApp {
             known_frame_paths,
             current_frame_identity,
             self.history_frame_limit,
+            self.display_live_chunk_updates,
             sender,
         );
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
@@ -3984,6 +4005,10 @@ impl ViewerApp {
                 self.center_selected_site();
             }
             ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live");
+            ui.checkbox(&mut self.display_live_chunk_updates, "Chunks")
+                .on_hover_text(
+                    "Display incomplete live chunk tilts before a full low-level tilt is available",
+                );
         });
 
         self.radar_layers_panel(ui, ctx);
@@ -8541,6 +8566,28 @@ fn displayable_cuts_for_product(volume: &RadarVolume, product: &DisplayProduct) 
         .collect()
 }
 
+fn live_partial_has_complete_low_level_tilt(volume: &RadarVolume) -> bool {
+    volume.cuts.iter().enumerate().any(|(index, cut)| {
+        is_complete_live_low_level_tilt(cut) && !displayable_products(volume, index).is_empty()
+    })
+}
+
+fn is_complete_live_low_level_tilt(cut: &ElevationCut) -> bool {
+    is_live_low_level_tilt(cut) && cut.radials.len() >= LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS
+}
+
+fn is_live_low_level_tilt(cut: &ElevationCut) -> bool {
+    cut.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG
+}
+
+fn is_allowed_live_low_level_tilt(cut: &ElevationCut, allow_incomplete: bool) -> bool {
+    if allow_incomplete {
+        is_live_low_level_tilt(cut)
+    } else {
+        is_complete_live_low_level_tilt(cut)
+    }
+}
+
 fn stepped_product<'a>(
     products: &'a [DisplayProduct],
     current: &DisplayProduct,
@@ -8631,12 +8678,18 @@ fn selection_for_installed_volume(
     previous_product: &DisplayProduct,
     volume: &RadarVolume,
     allow_low_level_auto_advance: bool,
+    allow_incomplete_live_chunk_advance: bool,
 ) -> (usize, DisplayProduct) {
     let same_site = previous_volume.is_some_and(|previous| previous.site.id == volume.site.id);
     if same_site
         && allow_low_level_auto_advance
-        && let Some(next_cut) =
-            latest_newer_low_level_cut(previous_volume, previous_cut, previous_product, volume)
+        && let Some(next_cut) = latest_newer_low_level_cut(
+            previous_volume,
+            previous_cut,
+            previous_product,
+            volume,
+            allow_incomplete_live_chunk_advance,
+        )
     {
         return (next_cut, previous_product.clone());
     }
@@ -8655,24 +8708,23 @@ fn latest_newer_low_level_cut(
     previous_cut: usize,
     previous_product: &DisplayProduct,
     volume: &RadarVolume,
+    allow_incomplete_live_chunk_advance: bool,
 ) -> Option<usize> {
     let previous_volume = previous_volume?;
     if frame_identity_for_volume(previous_volume) != frame_identity_for_volume(volume) {
         return None;
     }
     let previous_cut_data = previous_volume.cuts.get(previous_cut)?;
-    if !is_auto_advance_low_level_cut(previous_cut_data) {
+    if !is_allowed_live_low_level_tilt(previous_cut_data, allow_incomplete_live_chunk_advance) {
         return None;
     }
     let previous_time = cut_start_time_utc(previous_volume, previous_cut)?;
 
     (0..volume.cuts.len())
         .filter(|cut_index| {
-            volume
-                .cuts
-                .get(*cut_index)
-                .is_some_and(is_auto_advance_low_level_cut)
-                && is_displayable_on_cut(volume, *cut_index, previous_product)
+            volume.cuts.get(*cut_index).is_some_and(|cut| {
+                is_allowed_live_low_level_tilt(cut, allow_incomplete_live_chunk_advance)
+            }) && is_displayable_on_cut(volume, *cut_index, previous_product)
         })
         .filter_map(|cut_index| {
             let cut_time = cut_start_time_utc(volume, cut_index)?;
@@ -8681,10 +8733,6 @@ fn latest_newer_low_level_cut(
         })
         .max_by_key(|(_, cut_time)| *cut_time)
         .map(|(cut_index, _)| cut_index)
-}
-
-fn is_auto_advance_low_level_cut(cut: &ElevationCut) -> bool {
-    cut.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG
 }
 
 fn default_selection_for_volume(volume: &RadarVolume) -> (usize, DisplayProduct) {
@@ -9496,6 +9544,7 @@ mod tests {
                 &DisplayProduct::Moment(MomentType::Velocity),
                 &next,
                 true,
+                false,
             ),
             (1, DisplayProduct::Moment(MomentType::Velocity))
         );
@@ -9506,6 +9555,7 @@ mod tests {
                 &DisplayProduct::StormRelativeVelocity,
                 &next,
                 true,
+                false,
             ),
             (1, DisplayProduct::StormRelativeVelocity)
         );
@@ -9514,20 +9564,18 @@ mod tests {
     #[test]
     fn same_site_live_update_advances_to_newer_low_level_sails_sweep() {
         let product = DisplayProduct::Moment(MomentType::Reflectivity);
-        let previous = test_reflectivity_sails_volume(&[(0.5, 0)]);
-        let next = test_reflectivity_sails_volume(&[
-            (0.5, 0),
-            (1.8, 60_000),
-            (0.6, 180_000),
-            (0.5, 360_000),
-        ]);
+        let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        let next = test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (1.8, 60_000), (0.6, 180_000), (0.5, 360_000)],
+            720,
+        );
 
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &next, true),
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, false),
             (3, product.clone())
         );
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &next, false),
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, false, false),
             (0, product)
         );
     }
@@ -9535,18 +9583,62 @@ mod tests {
     #[test]
     fn low_level_auto_advance_ignores_short_lag_and_high_tilts() {
         let product = DisplayProduct::Moment(MomentType::Reflectivity);
-        let previous = test_reflectivity_sails_volume(&[(0.5, 0)]);
-        let short_lag = test_reflectivity_sails_volume(&[(0.5, 0), (0.7, 75_000)]);
-        let high_tilt = test_reflectivity_sails_volume(&[(0.5, 0), (1.8, 180_000)]);
+        let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        let short_lag =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.7, 75_000)], 720);
+        let high_tilt =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (1.8, 180_000)], 720);
 
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &short_lag, true),
+            selection_for_installed_volume(Some(&previous), 0, &product, &short_lag, true, false),
             (0, product.clone())
         );
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &high_tilt, true),
+            selection_for_installed_volume(Some(&previous), 0, &product, &high_tilt, true, false),
             (0, product)
         );
+    }
+
+    #[test]
+    fn low_level_auto_advance_ignores_incomplete_chunk_tilt_by_default() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        let next = test_reflectivity_sails_volume_mixed_radials(&[
+            (0.5, 0, 720),
+            (1.8, 60_000, 360),
+            (0.6, 180_000, 240),
+        ]);
+
+        assert!(live_partial_has_complete_low_level_tilt(&next));
+        assert_eq!(
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, false),
+            (0, product)
+        );
+    }
+
+    #[test]
+    fn low_level_auto_advance_allows_incomplete_chunk_tilt_when_enabled() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        let next = test_reflectivity_sails_volume_mixed_radials(&[
+            (0.5, 0, 720),
+            (1.8, 60_000, 360),
+            (0.6, 180_000, 240),
+        ]);
+
+        assert_eq!(
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, true),
+            (2, product)
+        );
+    }
+
+    #[test]
+    fn live_partial_complete_low_level_tilt_gate_rejects_chunk_only_volume() {
+        let chunk_only = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 240);
+        let full_low = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+
+        assert!(!live_partial_has_complete_low_level_tilt(&chunk_only));
+        assert!(live_partial_has_complete_low_level_tilt(&full_low));
     }
 
     #[test]
@@ -9562,6 +9654,7 @@ mod tests {
                 &DisplayProduct::Moment(MomentType::Velocity),
                 &next,
                 true,
+                false,
             ),
             (0, DisplayProduct::Moment(MomentType::Reflectivity))
         );
@@ -10756,6 +10849,7 @@ mod tests {
             hazard_fill_alpha: DEFAULT_HAZARD_FILL_ALPHA,
             hidden_hazard_families: default_hidden_hazard_families(),
             realtime_level2_auto_refresh: false,
+            display_live_chunk_updates: false,
             last_realtime_level2_refresh: None,
             live_refresh_skip_reason: None,
             live_hazard_auto_refresh: false,
@@ -10901,6 +10995,21 @@ mod tests {
     }
 
     fn test_reflectivity_sails_volume(cuts: &[(f32, i32)]) -> RadarVolume {
+        test_reflectivity_sails_volume_with_radials(cuts, 1)
+    }
+
+    fn test_reflectivity_sails_volume_with_radials(
+        cuts: &[(f32, i32)],
+        radial_count: usize,
+    ) -> RadarVolume {
+        let cuts = cuts
+            .iter()
+            .map(|(elevation, offset)| (*elevation, *offset, radial_count))
+            .collect::<Vec<_>>();
+        test_reflectivity_sails_volume_mixed_radials(&cuts)
+    }
+
+    fn test_reflectivity_sails_volume_mixed_radials(cuts: &[(f32, i32, usize)]) -> RadarVolume {
         let gate_range = radar_core::GateRange {
             first_gate_m: 500,
             gate_spacing_m: 250,
@@ -10910,12 +11019,8 @@ mod tests {
             radar_core::RadarSite::new("TEST"),
             chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
         );
-        for (index, (elevation_deg, time_offset_ms)) in cuts.iter().enumerate() {
+        for (index, (elevation_deg, time_offset_ms, radial_count)) in cuts.iter().enumerate() {
             let mut cut = ElevationCut::new(*elevation_deg, Some(index as u8));
-            let mut radial = test_radial(0.0, gate_range.clone());
-            radial.elevation_deg = *elevation_deg;
-            radial.time_offset_ms = *time_offset_ms;
-            cut.radials.push(radial);
             let mut grid = MomentGrid::new_u8(
                 MomentType::Reflectivity,
                 gate_range.clone(),
@@ -10924,8 +11029,14 @@ mod tests {
                 Some(0),
                 Some(1),
             );
-            grid.push_u8_row_slice(0, &[66, 80, 90])
-                .expect("reflectivity row");
+            for row in 0..*radial_count {
+                let mut radial = test_radial(row as f32, gate_range.clone());
+                radial.elevation_deg = *elevation_deg;
+                radial.time_offset_ms = *time_offset_ms + row as i32;
+                cut.radials.push(radial);
+                grid.push_u8_row_slice(row, &[66, 80, 90])
+                    .expect("reflectivity row");
+            }
             cut.moments.insert(MomentType::Reflectivity, grid);
             volume.cuts.push(cut);
         }
