@@ -309,6 +309,7 @@ struct ViewerApp {
     last_history_step: Option<Instant>,
     color_tables: ColorTableSet,
     flip_velocity_color_polarity: bool,
+    unfold_velocity_display: bool,
     color_table_target: ColorTableFamily,
     color_table_path_text: String,
     color_table_status: String,
@@ -1008,6 +1009,8 @@ struct RenderRequest {
     volume: Arc<RadarVolume>,
     cut: usize,
     product: DisplayProduct,
+    render_dealiased_velocity: bool,
+    plain_velocity_render_dealiased: bool,
     color_tables: ColorTableSet,
     storm_motion: StormMotion,
     viewport_options: ViewportRasterOptions,
@@ -1368,8 +1371,11 @@ impl RenderWorkerCachePolicy {
 struct RenderWorkerViewportSignature {
     volume_ptr: usize,
     cut: usize,
+    product: DisplayProduct,
     moment: MomentType,
+    dealiased_velocity: bool,
     color_table_signature: u64,
+    storm_motion_key: (i16, i16),
     viewport: ViewportKey,
 }
 
@@ -1377,15 +1383,21 @@ impl RenderWorkerViewportSignature {
     fn new(
         volume_ptr: usize,
         cut: usize,
+        product: DisplayProduct,
         moment: MomentType,
+        dealiased_velocity: bool,
         color_table_signature: u64,
+        storm_motion_key: (i16, i16),
         viewport: ViewportKey,
     ) -> Self {
         Self {
             volume_ptr,
             cut,
+            product,
             moment,
+            dealiased_velocity,
             color_table_signature,
+            storm_motion_key,
             viewport,
         }
     }
@@ -1395,16 +1407,27 @@ impl RenderWorkerViewportSignature {
 struct RenderWorkerSampleCacheSignature {
     volume_ptr: usize,
     cut: usize,
+    product: DisplayProduct,
     moment: MomentType,
+    dealiased_velocity: bool,
     viewport: ViewportKey,
 }
 
 impl RenderWorkerSampleCacheSignature {
-    fn new(volume_ptr: usize, cut: usize, moment: MomentType, viewport: ViewportKey) -> Self {
+    fn new(
+        volume_ptr: usize,
+        cut: usize,
+        product: DisplayProduct,
+        moment: MomentType,
+        dealiased_velocity: bool,
+        viewport: ViewportKey,
+    ) -> Self {
         Self {
             volume_ptr,
             cut,
+            product,
             moment,
+            dealiased_velocity,
             viewport,
         }
     }
@@ -1460,8 +1483,11 @@ fn spawn_render_worker_with_mode(
             let requested_buffer_signature = RenderWorkerViewportSignature::new(
                 Arc::as_ptr(&request.volume) as usize,
                 request.cut,
+                request.product.clone(),
                 request.product.base_moment(),
+                request.render_dealiased_velocity,
                 request.key.color_table_signature,
+                request.key.storm_motion_key,
                 request.key.viewport,
             );
             while let Ok(recycled) = recycle_receiver.try_recv() {
@@ -1608,6 +1634,14 @@ impl DisplayProduct {
         )
     }
 
+    fn render_uses_dealiased_velocity(&self, unfold_plain_velocity: bool) -> bool {
+        match self {
+            Self::Moment(MomentType::Velocity) => unfold_plain_velocity,
+            Self::DealiasedVelocity | Self::StormRelativeDealiasedVelocity => true,
+            _ => false,
+        }
+    }
+
     fn color_family(&self) -> ColorTableFamily {
         match self {
             Self::Moment(moment) => color_family_for_moment(moment),
@@ -1709,6 +1743,7 @@ impl ViewerApp {
             last_history_step: None,
             color_tables: ColorTableSet::default(),
             flip_velocity_color_polarity: false,
+            unfold_velocity_display: true,
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
             color_table_status:
@@ -2929,10 +2964,13 @@ impl ViewerApp {
         let color_tables = self.render_color_tables_for_product(&self.selected_product);
         let color_table_signature =
             color_tables.signature_for_family(self.selected_product.color_family());
+        let render_dealiased_velocity =
+            self.product_render_uses_dealiased_velocity(&self.selected_product);
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             cut: self.selected_cut,
             product: self.selected_product.clone(),
+            render_dealiased_velocity,
             color_table_signature,
             storm_motion_key: self.storm_motion_key(),
             viewport: viewport_key,
@@ -2951,6 +2989,8 @@ impl ViewerApp {
                 volume,
                 cut: self.selected_cut,
                 product: self.selected_product.clone(),
+                render_dealiased_velocity,
+                plain_velocity_render_dealiased: self.unfold_velocity_display,
                 color_tables,
                 storm_motion: self.current_storm_motion(),
                 viewport_options,
@@ -2960,6 +3000,10 @@ impl ViewerApp {
             },
             ctx,
         );
+    }
+
+    fn product_render_uses_dealiased_velocity(&self, product: &DisplayProduct) -> bool {
+        product.render_uses_dealiased_velocity(self.unfold_velocity_display)
     }
 
     fn render_color_tables_for_product(&self, product: &DisplayProduct) -> ColorTableSet {
@@ -2999,10 +3043,12 @@ impl ViewerApp {
             };
             let color_tables = self.render_color_tables_for_product(&product);
             let color_table_signature = color_tables.signature_for_family(product.color_family());
+            let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
             let key = TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
                 cut,
                 product: product.clone(),
+                render_dealiased_velocity,
                 color_table_signature,
                 storm_motion_key: self.storm_motion_key(),
                 viewport: viewport_key,
@@ -3021,6 +3067,8 @@ impl ViewerApp {
                     volume,
                     cut,
                     product,
+                    render_dealiased_velocity,
+                    plain_velocity_render_dealiased: self.unfold_velocity_display,
                     color_tables,
                     storm_motion: self.current_storm_motion(),
                     viewport_options,
@@ -3090,7 +3138,7 @@ impl ViewerApp {
 
         let volume_ptr = Arc::as_ptr(&request.volume) as usize;
         let base_moment = request.product.base_moment();
-        let dealiased_velocity = request.product.uses_dealiased_velocity();
+        let dealiased_velocity = request.render_dealiased_velocity;
         let color_table_signature = request.key.color_table_signature;
         let cached_volume_ptr = moment_caches.first().map(|cached| cached.volume_ptr);
         if cached_volume_ptr.is_some_and(|cached_volume_ptr| cached_volume_ptr != volume_ptr) {
@@ -3144,14 +3192,19 @@ impl ViewerApp {
         let viewport_signature = RenderWorkerViewportSignature::new(
             volume_ptr,
             request.cut,
+            request.product.clone(),
             base_moment.clone(),
+            dealiased_velocity,
             color_table_signature,
+            request.key.storm_motion_key,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
             volume_ptr,
             request.cut,
+            request.product.clone(),
             base_moment.clone(),
+            dealiased_velocity,
             request.key.viewport,
         );
 
@@ -3345,14 +3398,19 @@ impl ViewerApp {
         let viewport_signature = RenderWorkerViewportSignature::new(
             volume_ptr,
             request.cut,
+            request.product.clone(),
             request.product.base_moment(),
+            request.render_dealiased_velocity,
             request.key.color_table_signature,
+            request.key.storm_motion_key,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
             volume_ptr,
             request.cut,
+            request.product.clone(),
             request.product.base_moment(),
+            request.render_dealiased_velocity,
             request.key.viewport,
         );
         if Self::touch_sample_cache(sample_caches, &sample_cache_signature) {
@@ -3363,7 +3421,7 @@ impl ViewerApp {
             viewport_signature.volume_ptr,
             viewport_signature.cut,
             &viewport_signature.moment,
-            request.product.uses_dealiased_velocity(),
+            request.render_dealiased_velocity,
             viewport_signature.color_table_signature,
         ) else {
             return;
@@ -3409,10 +3467,13 @@ impl ViewerApp {
         let velocity_color_table_signature = request
             .color_tables
             .signature_for_family(ColorTableFamily::Velocity);
+        let velocity_render_dealiased = request.plain_velocity_render_dealiased;
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
             volume_ptr,
             cut,
+            DisplayProduct::Moment(MomentType::Velocity),
             MomentType::Velocity,
+            velocity_render_dealiased,
             request.key.viewport,
         );
 
@@ -3421,17 +3482,26 @@ impl ViewerApp {
             volume_ptr,
             cut,
             &MomentType::Velocity,
-            false,
+            velocity_render_dealiased,
             velocity_color_table_signature,
         )
         .is_none()
         {
-            let Ok(cache) = ViewportMomentCache::new_with_color_tables(
-                request.volume.as_ref(),
-                cut,
-                MomentType::Velocity,
-                &request.color_tables,
-            ) else {
+            let cache = if velocity_render_dealiased {
+                ViewportMomentCache::new_dealiased_velocity_with_color_tables(
+                    request.volume.as_ref(),
+                    cut,
+                    &request.color_tables,
+                )
+            } else {
+                ViewportMomentCache::new_with_color_tables(
+                    request.volume.as_ref(),
+                    cut,
+                    MomentType::Velocity,
+                    &request.color_tables,
+                )
+            };
+            let Ok(cache) = cache else {
                 return;
             };
             Self::insert_moment_cache(
@@ -3441,7 +3511,7 @@ impl ViewerApp {
                     volume_ptr,
                     cut,
                     moment: MomentType::Velocity,
-                    dealiased_velocity: false,
+                    dealiased_velocity: velocity_render_dealiased,
                     color_table_signature: velocity_color_table_signature,
                     cache,
                     storm_palette_cache: None,
@@ -3468,7 +3538,7 @@ impl ViewerApp {
             volume_ptr,
             cut,
             &MomentType::Velocity,
-            false,
+            velocity_render_dealiased,
             velocity_color_table_signature,
         ) else {
             return;
@@ -4148,6 +4218,21 @@ impl ViewerApp {
         self.active_product_color_picker(ui, ctx);
 
         if self.selected_product.color_family() == ColorTableFamily::Velocity {
+            if matches!(
+                self.selected_product,
+                DisplayProduct::Moment(MomentType::Velocity)
+            ) {
+                let changed = ui
+                    .checkbox(&mut self.unfold_velocity_display, "Unfold VEL")
+                    .on_hover_text(
+                        "Use the dealiased continuity grid for base velocity display colors",
+                    )
+                    .changed();
+                if changed {
+                    self.clear_texture();
+                    ctx.request_repaint();
+                }
+            }
             let changed = ui
                 .checkbox(&mut self.flip_velocity_color_polarity, "Flip VEL colors")
                 .on_hover_text("Diagnostic: color positive velocity values with the negative side of the active velocity table, and vice versa")
@@ -6019,6 +6104,7 @@ struct TextureKey {
     volume_ptr: usize,
     cut: usize,
     product: DisplayProduct,
+    render_dealiased_velocity: bool,
     color_table_signature: u64,
     storm_motion_key: (i16, i16),
     viewport: ViewportKey,
@@ -9514,17 +9600,54 @@ mod tests {
             km_per_px_y: 160_000,
         };
 
-        let first_pixels =
-            RenderWorkerViewportSignature::new(10, 1, MomentType::Reflectivity, 123, viewport);
-        let second_pixels =
-            RenderWorkerViewportSignature::new(10, 1, MomentType::Reflectivity, 456, viewport);
+        let first_pixels = RenderWorkerViewportSignature::new(
+            10,
+            1,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            MomentType::Reflectivity,
+            false,
+            123,
+            (0, 0),
+            viewport,
+        );
+        let second_pixels = RenderWorkerViewportSignature::new(
+            10,
+            1,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            MomentType::Reflectivity,
+            false,
+            456,
+            (0, 0),
+            viewport,
+        );
         assert_ne!(first_pixels, second_pixels);
 
-        let first_samples =
-            RenderWorkerSampleCacheSignature::new(10, 1, MomentType::Reflectivity, viewport);
-        let second_samples =
-            RenderWorkerSampleCacheSignature::new(10, 1, MomentType::Reflectivity, viewport);
+        let first_samples = RenderWorkerSampleCacheSignature::new(
+            10,
+            1,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            MomentType::Reflectivity,
+            false,
+            viewport,
+        );
+        let second_samples = RenderWorkerSampleCacheSignature::new(
+            10,
+            1,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            MomentType::Reflectivity,
+            false,
+            viewport,
+        );
         assert_eq!(first_samples, second_samples);
+    }
+
+    #[test]
+    fn plain_velocity_render_unfolds_by_default_but_can_show_raw() {
+        let velocity = DisplayProduct::Moment(MomentType::Velocity);
+        assert!(velocity.render_uses_dealiased_velocity(true));
+        assert!(!velocity.render_uses_dealiased_velocity(false));
+        assert!(DisplayProduct::DealiasedVelocity.render_uses_dealiased_velocity(false));
+        assert!(!DisplayProduct::StormRelativeVelocity.render_uses_dealiased_velocity(false));
     }
 
     #[test]
@@ -9690,6 +9813,7 @@ mod tests {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
                 cut: 0,
                 product: DisplayProduct::Moment(MomentType::Reflectivity),
+                render_dealiased_velocity: false,
                 color_table_signature,
                 storm_motion_key: (450, 350),
                 viewport: test_viewport_key(1320, 820),
@@ -9697,6 +9821,8 @@ mod tests {
             volume,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
+            render_dealiased_velocity: false,
+            plain_velocity_render_dealiased: true,
             color_tables,
             storm_motion: StormMotion {
                 direction_deg: 45.0,
@@ -11164,6 +11290,7 @@ mod tests {
             last_history_step: None,
             color_tables: ColorTableSet::default(),
             flip_velocity_color_polarity: false,
+            unfold_velocity_display: true,
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
             color_table_status: String::new(),
@@ -11460,8 +11587,11 @@ mod tests {
         RenderWorkerViewportSignature::new(
             1,
             width as usize,
+            DisplayProduct::Moment(MomentType::Velocity),
             MomentType::Velocity,
+            false,
             0,
+            (0, 0),
             test_viewport_key(width, 100),
         )
     }
@@ -11508,8 +11638,11 @@ mod tests {
             buffer_signature: RenderWorkerViewportSignature::new(
                 1,
                 1,
+                DisplayProduct::Moment(MomentType::Velocity),
                 MomentType::Velocity,
+                false,
                 0,
+                (0, 0),
                 test_viewport_key(width, height),
             ),
             render_ms,

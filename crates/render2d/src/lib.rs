@@ -2861,6 +2861,9 @@ pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentG
             },
         );
 
+    apply_azimuthal_dealias_consensus(cut, source, &mut corrected, fallback_nyquist, 2);
+    suppress_isolated_dealias_spikes(cut, source, &mut corrected, fallback_nyquist);
+
     MomentGrid {
         moment: MomentType::Velocity,
         gate_range: source.gate_range.clone(),
@@ -2876,6 +2879,10 @@ pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentG
 const DEALIASED_VELOCITY_SCALE: f32 = 10.0;
 const DEALIASED_VELOCITY_OFFSET: f32 = 32_768.0;
 const DEALIASED_VELOCITY_NODATA: u16 = 0;
+const DEALIAS_SPIKE_NEIGHBOR_ROWS: isize = 3;
+const DEALIAS_SPIKE_NEIGHBOR_GATES: isize = 1;
+const DEALIAS_SPIKE_MIN_SUPPORT: usize = 2;
+const DEALIAS_CONSENSUS_MAX_FOLD: i32 = 4;
 
 fn encode_dealiased_velocity_row(values: &[f32], output: &mut [u16]) {
     debug_assert_eq!(values.len(), output.len());
@@ -2891,6 +2898,200 @@ fn encode_dealiased_velocity(value: f32) -> u16 {
     (value * DEALIASED_VELOCITY_SCALE + DEALIASED_VELOCITY_OFFSET)
         .round()
         .clamp(1.0, u16::MAX as f32) as u16
+}
+
+fn decode_dealiased_velocity(raw: u16) -> Option<f32> {
+    if raw == DEALIASED_VELOCITY_NODATA {
+        return None;
+    }
+    Some((raw as f32 - DEALIASED_VELOCITY_OFFSET) / DEALIASED_VELOCITY_SCALE)
+}
+
+fn apply_azimuthal_dealias_consensus(
+    cut: &ElevationCut,
+    source: &MomentGrid,
+    corrected: &mut [u16],
+    fallback_nyquist: Option<f32>,
+    passes: usize,
+) {
+    let rows = source.radial_count();
+    let gate_count = source.gate_range.gate_count;
+    if rows < 3 || gate_count == 0 || corrected.len() != rows.saturating_mul(gate_count) {
+        return;
+    }
+
+    for _ in 0..passes {
+        let snapshot = corrected.to_vec();
+        corrected
+            .par_chunks_mut(gate_count)
+            .enumerate()
+            .for_each(|(row, output)| {
+                let Some(nyquist) = row_nyquist_mps(cut, source, row)
+                    .or(fallback_nyquist)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                else {
+                    return;
+                };
+
+                for (gate, raw) in output.iter_mut().enumerate() {
+                    let Some(observed) = source.scaled_value(row, gate) else {
+                        continue;
+                    };
+                    let mut references = [0.0; 4];
+                    let mut reference_count = 0usize;
+                    for (neighbor_row, neighbor_gate) in [
+                        gate.checked_sub(1).map(|gate| (row, gate)),
+                        (gate + 1 < gate_count).then_some((row, gate + 1)),
+                        row.checked_sub(1).map(|row| (row, gate)),
+                        (row + 1 < rows).then_some((row + 1, gate)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let Some(value) = decode_dealiased_velocity(
+                            snapshot[neighbor_row * gate_count + neighbor_gate],
+                        )
+                        .filter(|value| value.is_finite()) else {
+                            continue;
+                        };
+                        references[reference_count] = value;
+                        reference_count += 1;
+                    }
+                    if reference_count < 2 {
+                        continue;
+                    }
+                    let reference = median_small_f32(&mut references, reference_count);
+                    let unfolded = unfold_velocity_to_reference(
+                        observed,
+                        reference,
+                        nyquist,
+                        reference_count,
+                        DEALIAS_CONSENSUS_MAX_FOLD,
+                    );
+                    *raw = encode_dealiased_velocity(unfolded);
+                }
+            });
+    }
+}
+
+fn suppress_isolated_dealias_spikes(
+    cut: &ElevationCut,
+    source: &MomentGrid,
+    corrected: &mut [u16],
+    fallback_nyquist: Option<f32>,
+) {
+    let rows = source.radial_count();
+    let gate_count = source.gate_range.gate_count;
+    if rows < 3 || gate_count == 0 || corrected.len() != rows.saturating_mul(gate_count) {
+        return;
+    }
+
+    let original = corrected.to_vec();
+    corrected
+        .par_chunks_mut(gate_count)
+        .enumerate()
+        .for_each(|(row, output)| {
+            let Some(nyquist) = row_nyquist_mps(cut, source, row)
+                .or(fallback_nyquist)
+                .filter(|value| value.is_finite() && *value > 0.0)
+            else {
+                return;
+            };
+            for (gate, raw) in output.iter_mut().enumerate() {
+                let Some(observed) = source.scaled_value(row, gate) else {
+                    continue;
+                };
+                let Some(corrected_value) =
+                    decode_dealiased_velocity(original[row * gate_count + gate])
+                else {
+                    continue;
+                };
+                let Some(fold) = dealias_fold_count(observed, corrected_value, nyquist) else {
+                    continue;
+                };
+                let support = dealias_fold_neighbor_support(
+                    cut,
+                    source,
+                    &original,
+                    row,
+                    gate,
+                    fold,
+                    corrected_value,
+                    fallback_nyquist,
+                );
+                if support < DEALIAS_SPIKE_MIN_SUPPORT {
+                    *raw = encode_dealiased_velocity(observed);
+                }
+            }
+        });
+}
+
+fn dealias_fold_neighbor_support(
+    cut: &ElevationCut,
+    source: &MomentGrid,
+    corrected: &[u16],
+    row: usize,
+    gate: usize,
+    fold: i32,
+    corrected_value: f32,
+    fallback_nyquist: Option<f32>,
+) -> usize {
+    let rows = source.radial_count();
+    let gate_count = source.gate_range.gate_count;
+    let mut support = 0;
+    for row_offset in -DEALIAS_SPIKE_NEIGHBOR_ROWS..=DEALIAS_SPIKE_NEIGHBOR_ROWS {
+        if row_offset == 0 {
+            continue;
+        }
+        let Some(neighbor_row) = row.checked_add_signed(row_offset) else {
+            continue;
+        };
+        if neighbor_row >= rows {
+            continue;
+        }
+        let Some(neighbor_nyquist) = row_nyquist_mps(cut, source, neighbor_row)
+            .or(fallback_nyquist)
+            .filter(|value| value.is_finite() && *value > 0.0)
+        else {
+            continue;
+        };
+        for gate_offset in -DEALIAS_SPIKE_NEIGHBOR_GATES..=DEALIAS_SPIKE_NEIGHBOR_GATES {
+            let Some(neighbor_gate) = gate.checked_add_signed(gate_offset) else {
+                continue;
+            };
+            if neighbor_gate >= gate_count {
+                continue;
+            }
+            let Some(neighbor_observed) = source.scaled_value(neighbor_row, neighbor_gate) else {
+                continue;
+            };
+            let Some(neighbor_corrected) =
+                decode_dealiased_velocity(corrected[neighbor_row * gate_count + neighbor_gate])
+            else {
+                continue;
+            };
+            if dealias_fold_count(neighbor_observed, neighbor_corrected, neighbor_nyquist)
+                == Some(fold)
+                && (neighbor_corrected - corrected_value).abs() <= 0.65 * neighbor_nyquist
+            {
+                support += 1;
+            }
+        }
+    }
+    support
+}
+
+fn dealias_fold_count(observed: f32, corrected: f32, nyquist: f32) -> Option<i32> {
+    if !observed.is_finite() || !corrected.is_finite() || !nyquist.is_finite() || nyquist <= 0.0 {
+        return None;
+    }
+    let fold = ((corrected - observed) / (2.0 * nyquist)).round() as i32;
+    if fold == 0 {
+        return None;
+    }
+    let expected_delta = 2.0 * nyquist * fold as f32;
+    let residual = (corrected - observed - expected_delta).abs();
+    (residual <= 0.35 * nyquist).then_some(fold)
 }
 
 fn copy_scaled_velocity_row(source: &MomentGrid, row: usize, row_values: &mut [f32]) {
@@ -3039,7 +3240,7 @@ fn walk_dealias_radial(
     }
 }
 
-fn median_small_f32(values: &mut [f32; 3], count: usize) -> f32 {
+fn median_small_f32(values: &mut [f32], count: usize) -> f32 {
     debug_assert!(count > 0 && count <= values.len());
     values[..count].sort_by(f32::total_cmp);
     values[count / 2]
@@ -3434,6 +3635,42 @@ mod tests {
             .map(|gate| corrected.scaled_value(0, gate).expect("corrected gate"))
             .collect::<Vec<_>>();
         assert_eq!(values, vec![0.0, 5.0, 9.0, 11.0, 13.0]);
+    }
+
+    #[test]
+    fn velocity_dealias_suppresses_unsupported_radial_spikes() {
+        let quiet = vec![0.0, 3.0, 5.0, 7.0, 8.0];
+        let folded = vec![0.0, 5.0, 9.0, -9.0, -7.0];
+        let (cut, grid) = test_velocity_grid_rows(vec![
+            quiet.clone(),
+            quiet.clone(),
+            folded,
+            quiet.clone(),
+            quiet,
+        ]);
+
+        let corrected = dealias_velocity_grid(&cut, &grid);
+
+        assert_eq!(corrected.scaled_value(2, 3), Some(-9.0));
+        assert_eq!(corrected.scaled_value(2, 4), Some(-7.0));
+    }
+
+    #[test]
+    fn velocity_dealias_preserves_supported_adjacent_folds() {
+        let quiet = vec![0.0, 3.0, 5.0, 7.0, 8.0];
+        let folded = vec![0.0, 5.0, 9.0, -9.0, -7.0];
+        let (cut, grid) = test_velocity_grid_rows(vec![
+            quiet.clone(),
+            folded.clone(),
+            folded.clone(),
+            folded,
+            quiet,
+        ]);
+
+        let corrected = dealias_velocity_grid(&cut, &grid);
+
+        assert_eq!(corrected.scaled_value(2, 3), Some(11.0));
+        assert_eq!(corrected.scaled_value(2, 4), Some(13.0));
     }
 
     #[test]
@@ -4203,6 +4440,36 @@ mod tests {
             azimuth_bin,
             gate: gate as usize,
         })
+    }
+
+    fn test_velocity_grid_rows(rows: Vec<Vec<f32>>) -> (ElevationCut, MomentGrid) {
+        let gate_range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 1_000,
+            gate_count: rows.first().map(Vec::len).unwrap_or(0),
+        };
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        for index in 0..rows.len() {
+            cut.radials.push(Radial {
+                azimuth_deg: index as f32,
+                elevation_deg: 0.5,
+                time_offset_ms: 0,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: Some(10.0),
+                radial_status: None,
+            });
+        }
+        let grid = MomentGrid {
+            moment: MomentType::Velocity,
+            gate_range,
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: (0..cut.radials.len()).collect(),
+            storage: MomentStorage::F32(rows.into_iter().flatten().collect()),
+        };
+        (cut, grid)
     }
 
     fn test_volume() -> RadarVolume {

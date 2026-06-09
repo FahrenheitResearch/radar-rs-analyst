@@ -1076,11 +1076,11 @@ product: BV
 units: m/s
 step: 2
 color: -70 236 255 255
-color: -58 218 252 255
-color: -48 166 242 232
-color: -38 196 248 238
-color: -30 238 255 248
-color: -24 206 248 226
+color: -58 126 220 255
+color: -48 166 236 255
+color: -38 210 250 255
+color: -30 246 255 255
+color: -24 232 255 250
 color: -18 0 156 54
 color: -13 18 232 54
 color: -9 82 244 104
@@ -1092,10 +1092,11 @@ color: 5 154 46 44
 color: 9 216 28 28
 color: 14 255 34 40
 color: 20 242 0 0
-color: 26 255 132 110
-color: 34 255 214 166
+color: 24 255 238 218
+color: 28 255 255 238
+color: 34 255 224 168
 color: 42 255 248 220
-color: 50 255 255 238
+color: 50 255 255 240
 color: 58 255 230 190
 color: 64 255 202 130
 color: 70 255 240 204
@@ -1154,11 +1155,12 @@ product: BV
 units: m/s
 step: 2
 color: -70 216 255 255
-color: -58 218 252 255
-color: -48 160 238 228
-color: -38 190 246 236
-color: -30 236 255 248
-color: -22 208 248 226
+color: -58 126 220 255
+color: -48 166 236 255
+color: -38 210 250 255
+color: -30 246 255 255
+color: -24 232 255 250
+color: -22 210 248 226
 color: -16 0 224 54
 color: -11 42 255 66
 color: -7 106 240 116
@@ -1171,7 +1173,8 @@ color: 7 198 42 42
 color: 11 246 28 28
 color: 16 255 40 46
 color: 22 244 0 24
-color: 28 255 132 112
+color: 24 255 238 218
+color: 28 255 255 238
 color: 36 255 220 172
 color: 44 255 250 224
 color: 50 255 255 238
@@ -1320,11 +1323,12 @@ product: BV
 units: m/s
 mode: stepped
 color: -70 222 255 255
-color: -58 220 252 255
-color: -46 168 240 230
-color: -36 202 248 238
-color: -28 238 255 248
-color: -21 208 248 226
+color: -58 126 220 255
+color: -46 170 238 255
+color: -36 214 250 255
+color: -28 246 255 255
+color: -24 232 255 250
+color: -21 210 248 226
 color: -15 0 226 58
 color: -10 42 214 70
 color: -6 42 132 54
@@ -1335,7 +1339,8 @@ color: 6 148 42 42
 color: 10 204 30 30
 color: 15 248 36 42
 color: 21 255 78 86
-color: 28 255 146 116
+color: 24 255 238 218
+color: 28 255 255 238
 color: 36 255 222 174
 color: 46 255 250 226
 color: 58 255 255 238
@@ -1567,7 +1572,7 @@ mod tests {
         assert!((zero_g as i16 - zero_b as i16).abs() <= 8);
 
         let [in_r, in_g, in_b, _] = inbound.to_array();
-        assert!(in_b > 230 && in_g > 230 && in_r > 190);
+        assert!(in_b > 240 && in_g > 180 && in_r < 180);
         let [core_r, core_g, core_b, _] = inbound_core.to_array();
         assert!(core_g > 220 && core_r < 120 && core_b < 140);
 
