@@ -55,7 +55,7 @@ const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.0;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 90;
-const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 600;
+const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
@@ -1617,6 +1617,8 @@ impl DisplayProduct {
 
 #[derive(Clone, Debug)]
 struct CursorReadout {
+    site_id: String,
+    volume_time_utc: DateTime<Utc>,
     product: DisplayProduct,
     cut: usize,
     value: f32,
@@ -1631,6 +1633,9 @@ struct CursorReadout {
     source_azimuth_deg: f32,
     elevation_deg: f32,
     nyquist_velocity_mps: Option<f32>,
+    realtime_volume_id: Option<u16>,
+    realtime_last_chunk_id: Option<u16>,
+    realtime_last_chunk_type: Option<RealtimeChunkType>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2068,9 +2073,9 @@ impl ViewerApp {
         record_final_decode: bool,
         select_loaded_frame: bool,
         ctx: &egui::Context,
-    ) {
+    ) -> bool {
         if batch.frames.is_empty() {
-            return;
+            return false;
         }
         let selected_index = batch.selected_index.min(batch.frames.len() - 1);
         let selected_identity = frame_identity_for_volume(&batch.frames[selected_index].volume);
@@ -2102,7 +2107,29 @@ impl ViewerApp {
                 .iter()
                 .position(|frame| frame.identity == selected_identity)
                 .unwrap_or_else(|| self.frame_history.len().saturating_sub(1));
+            if should_defer_live_partial_selection_for_active_product(
+                self.volume.as_deref(),
+                &self.selected_product,
+                self.frame_history.get(next_index),
+            ) {
+                self.selected_frame_index = active_identity
+                    .clone()
+                    .and_then(|identity| {
+                        self.frame_history
+                            .iter()
+                            .position(|frame| frame.identity == identity)
+                    })
+                    .unwrap_or(self.selected_frame_index);
+                self.status = format!(
+                    "Waiting for {} in {}",
+                    self.selected_product.label(),
+                    selected_identity.site_id
+                );
+                ctx.request_repaint();
+                return false;
+            }
             self.select_history_frame(next_index, record_final_decode, ctx);
+            true
         } else if let Some(active_identity) = active_identity
             && let Some(index) = self
                 .frame_history
@@ -2112,8 +2139,10 @@ impl ViewerApp {
             self.selected_frame_index = index;
             self.status = format!("Backfilled {}", selected_identity.site_id);
             ctx.request_repaint();
+            false
         } else {
             ctx.request_repaint();
+            false
         }
     }
 
@@ -2532,9 +2561,10 @@ impl ViewerApp {
                             self.status = format!("Preview {}", message.label);
                         }
                         AsyncLoadUpdate::History(batch, select_frame) => {
-                            self.install_decoded_load_batch(batch, false, select_frame, ctx);
+                            let selected_loaded =
+                                self.install_decoded_load_batch(batch, false, select_frame, ctx);
                             self.live_refresh_skip_reason = None;
-                            if select_frame {
+                            if select_frame && selected_loaded {
                                 self.status = format!("Loaded {}", message.label);
                             }
                         }
@@ -2554,9 +2584,12 @@ impl ViewerApp {
                             self.pending_site_id = None;
                             match result {
                                 Ok(batch) => {
-                                    self.install_decoded_load_batch(batch, true, true, ctx);
+                                    let selected_loaded =
+                                        self.install_decoded_load_batch(batch, true, true, ctx);
                                     self.live_refresh_skip_reason = None;
-                                    self.status = format!("Loaded {}", message.label);
+                                    if selected_loaded {
+                                        self.status = format!("Loaded {}", message.label);
+                                    }
                                 }
                                 Err(err) => {
                                     self.status =
@@ -5785,7 +5818,10 @@ impl ViewerApp {
         };
         let storm_motion = self.current_storm_motion();
         let vrot = velocity_vrot_probe(cut, grid, row, gate, &selected_product, storm_motion);
+        let load_timing = self.load_timing;
         Some(CursorReadout {
+            site_id: volume.site.id.clone(),
+            volume_time_utc: volume.volume_time.with_timezone(&Utc),
             product: selected_product.clone(),
             cut: selected_cut,
             value,
@@ -5802,6 +5838,10 @@ impl ViewerApp {
             source_azimuth_deg: radial.azimuth_deg,
             elevation_deg: cut.elevation_deg,
             nyquist_velocity_mps: radial.nyquist_velocity_mps,
+            realtime_volume_id: load_timing.and_then(|timing| timing.realtime_volume_id),
+            realtime_last_chunk_id: load_timing.and_then(|timing| timing.realtime_last_chunk_id),
+            realtime_last_chunk_type: load_timing
+                .and_then(|timing| timing.realtime_last_chunk_type),
         })
     }
 
@@ -6523,8 +6563,24 @@ fn format_cursor_readout(readout: &CursorReadout) -> String {
         .nyquist_velocity_mps
         .map(|nyquist| format!(" Nyq {:.1} m/s", nyquist))
         .unwrap_or_default();
+    let realtime = match (
+        readout.realtime_volume_id,
+        readout.realtime_last_chunk_id,
+        readout.realtime_last_chunk_type,
+    ) {
+        (Some(volume_id), Some(chunk_id), Some(chunk_type)) => {
+            format!(" rt v{volume_id:03} c{chunk_id:03} {chunk_type:?}")
+        }
+        (Some(volume_id), Some(chunk_id), None) => {
+            format!(" rt v{volume_id:03} c{chunk_id:03}")
+        }
+        (Some(volume_id), None, _) => format!(" rt v{volume_id:03}"),
+        _ => String::new(),
+    };
     format!(
-        "{} cut {} {} raw {} row {} gate {} @ {} m{}{} az {:05.1} src {:05.1} range {:.1} km elev {:.2}{}",
+        "{} {} {} cut {} {} raw {} row {} gate {} @ {} m{}{} az {:05.1} src {:05.1} range {:.1} km elev {:.2}{}{}",
+        readout.site_id,
+        readout.volume_time_utc.format("%H:%M:%S"),
         readout.product.label(),
         readout.cut,
         value,
@@ -6538,7 +6594,8 @@ fn format_cursor_readout(readout: &CursorReadout) -> String {
         readout.source_azimuth_deg,
         readout.range_km,
         readout.elevation_deg,
-        nyquist
+        nyquist,
+        realtime
     )
 }
 
@@ -8735,6 +8792,31 @@ fn latest_newer_low_level_cut(
         .map(|(cut_index, _)| cut_index)
 }
 
+fn should_defer_live_partial_selection_for_active_product(
+    active_volume: Option<&RadarVolume>,
+    selected_product: &DisplayProduct,
+    candidate: Option<&FrameHistoryEntry>,
+) -> bool {
+    let Some(active_volume) = active_volume else {
+        return false;
+    };
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    if candidate.status != FrameStatus::LivePartial
+        || active_volume.site.id != candidate.identity.site_id
+        || !volume_has_displayable_product(active_volume, selected_product)
+    {
+        return false;
+    }
+
+    !volume_has_displayable_product(candidate.volume.as_ref(), selected_product)
+}
+
+fn volume_has_displayable_product(volume: &RadarVolume, product: &DisplayProduct) -> bool {
+    (0..volume.cuts.len()).any(|cut_index| is_displayable_on_cut(volume, cut_index, product))
+}
+
 fn default_selection_for_volume(volume: &RadarVolume) -> (usize, DisplayProduct) {
     let reflectivity = DisplayProduct::Moment(MomentType::Reflectivity);
     if is_displayable_on_cut(volume, 0, &reflectivity) {
@@ -9182,6 +9264,8 @@ mod tests {
     #[test]
     fn cursor_readout_format_reports_source_gate_provenance() {
         let readout = CursorReadout {
+            site_id: "KTLX".to_owned(),
+            volume_time_utc: Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap(),
             product: DisplayProduct::Moment(MomentType::Velocity),
             cut: 1,
             value: 22.5,
@@ -9196,18 +9280,25 @@ mod tests {
             source_azimuth_deg: 180.9,
             elevation_deg: 0.48,
             nyquist_velocity_mps: Some(32.0),
+            realtime_volume_id: Some(12),
+            realtime_last_chunk_id: Some(34),
+            realtime_last_chunk_type: None,
         };
 
         let formatted = format_cursor_readout(&readout);
 
+        assert!(formatted.contains("KTLX 01:30:00"));
         assert!(formatted.contains("row 42 gate 123"));
         assert!(formatted.contains("az 181.2 src 180.9"));
         assert!(formatted.contains("raw 86"));
+        assert!(formatted.contains("rt v012 c034"));
     }
 
     #[test]
     fn cursor_readout_format_reports_vrot_gate_endpoints() {
         let readout = CursorReadout {
+            site_id: "KTLX".to_owned(),
+            volume_time_utc: Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap(),
             product: DisplayProduct::Moment(MomentType::Velocity),
             cut: 1,
             value: 22.5,
@@ -9238,6 +9329,9 @@ mod tests {
             source_azimuth_deg: 211.0,
             elevation_deg: 0.48,
             nyquist_velocity_mps: Some(32.0),
+            realtime_volume_id: None,
+            realtime_last_chunk_id: None,
+            realtime_last_chunk_type: None,
         };
 
         let formatted = format_cursor_readout(&readout);
@@ -9635,9 +9729,11 @@ mod tests {
     #[test]
     fn live_partial_complete_low_level_tilt_gate_rejects_chunk_only_volume() {
         let chunk_only = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 240);
+        let tail_chunk = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 719);
         let full_low = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
 
         assert!(!live_partial_has_complete_low_level_tilt(&chunk_only));
+        assert!(!live_partial_has_complete_low_level_tilt(&tail_chunk));
         assert!(live_partial_has_complete_low_level_tilt(&full_low));
     }
 
@@ -9783,6 +9879,61 @@ mod tests {
                 .scan_time_utc,
             scan_time
         );
+    }
+
+    #[test]
+    fn live_partial_without_selected_velocity_does_not_switch_visible_frame_to_reflectivity() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let mut previous = test_ref_then_velocity_volume();
+        previous.site.id = "KTLX".to_owned();
+        previous.volume_time = scan_time;
+        let previous_frame = FrameHistoryEntry {
+            identity: frame_identity_for_volume(&previous),
+            path: PathBuf::from("KTLX-0130"),
+            volume: Arc::new(previous.clone()),
+            timings: Some(LoadTimings::default()),
+            status: FrameStatus::LiveComplete,
+            source_label: "realtime L2 KTLX".to_owned(),
+        };
+        app.volume = Some(Arc::clone(&previous_frame.volume));
+        app.selected_cut = 1;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.frame_history.push(previous_frame);
+
+        let mut next = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        next.site.id = "KTLX".to_owned();
+        next.volume_time = scan_time + chrono::Duration::minutes(3);
+
+        let ctx = egui::Context::default();
+        let selected = app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_from_volume(
+                    PathBuf::from("KTLX-0133-partial"),
+                    next,
+                    FrameStatus::LivePartial,
+                )],
+                selected_index: 0,
+            },
+            true,
+            true,
+            &ctx,
+        );
+
+        assert!(!selected);
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(app.selected_cut, 1);
+        assert_eq!(
+            app.volume
+                .as_ref()
+                .map(|volume| volume.volume_time.with_timezone(&Utc)),
+            Some(scan_time)
+        );
+        assert!(app.status.contains("Waiting for VEL"));
+        assert_eq!(app.frame_history.len(), 2);
     }
 
     #[test]
@@ -10788,6 +10939,21 @@ mod tests {
             volume,
             timings: LoadTimings::default(),
             status: FrameStatus::LivePartial,
+            source_label: format!("realtime L2 {site}"),
+        }
+    }
+
+    fn test_decoded_from_volume(
+        path: PathBuf,
+        volume: RadarVolume,
+        status: FrameStatus,
+    ) -> DecodedLoad {
+        let site = volume.site.id.clone();
+        DecodedLoad {
+            path,
+            volume,
+            timings: LoadTimings::default(),
+            status,
             source_label: format!("realtime L2 {site}"),
         }
     }

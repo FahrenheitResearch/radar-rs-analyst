@@ -492,6 +492,7 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
             builtin_velocity_table(),
             analyst_velocity_table(),
             radarscope_contrast_velocity_table(),
+            sign_check_velocity_table(),
             couplet_pop_velocity_table(),
             gr2_ish_analyst_velocity_table(),
             subtle_srv_velocity_table(),
@@ -593,6 +594,11 @@ pub fn radarscope_contrast_velocity_table() -> ColorTable {
         RADARSCOPE_CONTRAST_VELOCITY_TABLE,
     )
     .expect("built-in radarscope contrast velocity color table is valid")
+}
+
+pub fn sign_check_velocity_table() -> ColorTable {
+    ColorTable::parse_stepped("Sign Check VEL", SIGN_CHECK_VELOCITY_TABLE)
+        .expect("built-in sign-check velocity color table is valid")
 }
 
 pub fn couplet_pop_velocity_table() -> ColorTable {
@@ -1144,6 +1150,18 @@ color: 62 255 210 152
 color: 70 255 242 198
 "#;
 
+const SIGN_CHECK_VELOCITY_TABLE: &str = r#"
+product: BV
+units: m/s
+mode: stepped
+rf: 180 80 255 255
+color: -100 0 0 255
+color: -0.01 0 0 255
+color: 0 120 120 120
+color: 0.01 255 0 0
+color: 100 255 0 0
+"#;
+
 const COUPLET_POP_VELOCITY_TABLE: &str = r#"
 product: BV
 units: m/s
@@ -1571,6 +1589,7 @@ mod tests {
                 "Analyst Tornado VEL",
                 "Analyst Pro VEL",
                 "RadarScope Contrast VEL",
+                "Sign Check VEL",
                 "Couplet Pop VEL",
                 "GR2-ish Analyst VEL",
                 "Subtle SRV VEL",
@@ -1640,9 +1659,22 @@ mod tests {
             builtin_velocity_table(),
             analyst_velocity_table(),
             radarscope_contrast_velocity_table(),
+            sign_check_velocity_table(),
         ] {
             assert!(!table.interpolates());
         }
+    }
+
+    #[test]
+    fn sign_check_velocity_table_exposes_raw_velocity_polarity() {
+        let table = sign_check_velocity_table();
+
+        assert_eq!(table.name(), "Sign Check VEL");
+        assert_eq!(table.sample_mode_label(), "stepped");
+        assert_eq!(table.sample(-1.0), Rgba8::opaque(0, 0, 255));
+        assert_eq!(table.sample(0.0), Rgba8::opaque(120, 120, 120));
+        assert_eq!(table.sample(1.0), Rgba8::opaque(255, 0, 0));
+        assert_eq!(table.range_folded_rgba(), Rgba8::opaque(180, 80, 255));
     }
 
     #[test]
