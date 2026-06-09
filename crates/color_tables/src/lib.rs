@@ -1046,11 +1046,11 @@ product: BV
 units: m/s
 step: 2
 color: -70 236 255 255
-color: -58 156 244 238
-color: -48 76 220 192
-color: -38 18 178 116
-color: -30 0 118 66
-color: -24 0 84 44
+color: -58 218 252 255
+color: -48 166 242 232
+color: -38 196 248 238
+color: -30 238 255 248
+color: -24 206 248 226
 color: -18 0 156 54
 color: -13 18 232 54
 color: -9 82 244 104
@@ -1062,13 +1062,13 @@ color: 5 154 46 44
 color: 9 216 28 28
 color: 14 255 34 40
 color: 20 242 0 0
-color: 26 182 0 22
-color: 34 126 0 28
-color: 42 224 84 118
-color: 50 255 154 194
-color: 58 255 218 232
-color: 64 255 204 138
-color: 70 255 240 202
+color: 26 255 132 110
+color: 34 255 214 166
+color: 42 255 248 220
+color: 50 255 255 238
+color: 58 255 230 190
+color: 64 255 202 130
+color: 70 255 240 204
 "#;
 
 const GR2_VELOCITY_TABLE: &str = r#"
@@ -1124,11 +1124,11 @@ product: BV
 units: m/s
 step: 2
 color: -70 216 255 255
-color: -58 122 244 232
-color: -48 48 210 176
-color: -38 0 160 98
-color: -30 0 104 58
-color: -22 0 148 54
+color: -58 218 252 255
+color: -48 160 238 228
+color: -38 190 246 236
+color: -30 236 255 248
+color: -22 208 248 226
 color: -16 0 224 54
 color: -11 42 255 66
 color: -7 106 240 116
@@ -1141,13 +1141,13 @@ color: 7 198 42 42
 color: 11 246 28 28
 color: 16 255 40 46
 color: 22 244 0 24
-color: 28 184 0 28
-color: 36 130 0 26
-color: 44 232 92 130
-color: 50 255 150 190
-color: 56 255 214 228
-color: 62 255 210 152
-color: 70 255 242 198
+color: 28 255 132 112
+color: 36 255 220 172
+color: 44 255 250 224
+color: 50 255 255 238
+color: 56 255 232 190
+color: 62 255 204 134
+color: 70 255 242 202
 "#;
 
 const SIGN_CHECK_VELOCITY_TABLE: &str = r#"
@@ -1290,11 +1290,11 @@ product: BV
 units: m/s
 mode: stepped
 color: -70 222 255 255
-color: -58 126 236 224
-color: -46 58 204 164
-color: -36 0 146 90
-color: -28 0 96 56
-color: -21 0 166 66
+color: -58 220 252 255
+color: -46 168 240 230
+color: -36 202 248 238
+color: -28 238 255 248
+color: -21 208 248 226
 color: -15 0 226 58
 color: -10 42 214 70
 color: -6 42 132 54
@@ -1305,11 +1305,11 @@ color: 6 148 42 42
 color: 10 204 30 30
 color: 15 248 36 42
 color: 21 255 78 86
-color: 28 230 20 44
-color: 36 170 12 42
-color: 46 132 10 42
-color: 58 236 176 194
-color: 66 255 214 166
+color: 28 255 146 116
+color: 36 255 222 174
+color: 46 255 250 226
+color: 58 255 255 238
+color: 66 255 210 146
 color: 70 255 240 220
 "#;
 
@@ -1537,7 +1537,7 @@ mod tests {
         assert!((zero_g as i16 - zero_b as i16).abs() <= 8);
 
         let [in_r, in_g, in_b, _] = inbound.to_array();
-        assert!(in_b > 210 && in_g > 200 && in_r < 180);
+        assert!(in_b > 230 && in_g > 230 && in_r > 190);
         let [core_r, core_g, core_b, _] = inbound_core.to_array();
         assert!(core_g > 220 && core_r < 120 && core_b < 140);
 
@@ -1547,6 +1547,31 @@ mod tests {
         assert!(high_r > 230 && high_g > 120 && high_b > 160);
         let [extreme_r, extreme_g, extreme_b, _] = outbound_extreme.to_array();
         assert!(extreme_r > 230 && extreme_g > 170 && extreme_b > 110);
+    }
+
+    #[test]
+    fn accepted_velocity_presets_whiten_strong_wind_cores() {
+        for table in [
+            builtin_velocity_table(),
+            analyst_velocity_table(),
+            radarscope_contrast_velocity_table(),
+        ] {
+            let inbound = table.sample(-30.0);
+            let [in_r, in_g, in_b, _] = inbound.to_array();
+            assert!(
+                in_r > 185 && in_g > 235 && in_b > 220,
+                "{} should turn strong inbound winds pale cyan/white, got {in_r},{in_g},{in_b}",
+                table.name()
+            );
+
+            let outbound = table.sample(36.0);
+            let [out_r, out_g, out_b, _] = outbound.to_array();
+            assert!(
+                out_r > 240 && out_g > 190 && out_b > 140,
+                "{} should turn strong outbound winds cream/orange-white, got {out_r},{out_g},{out_b}",
+                table.name()
+            );
+        }
     }
 
     #[test]

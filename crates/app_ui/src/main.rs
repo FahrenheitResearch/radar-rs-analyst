@@ -56,6 +56,8 @@ const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.0;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 90;
 const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
+const LIVE_COMPLETE_TILT_MIN_RADIALS: usize = 360;
+const LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG: f32 = 350.0;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
@@ -2063,6 +2065,7 @@ impl ViewerApp {
             Some(decoded.timings),
             false,
             Some(source_path),
+            decoded.status,
             ctx,
         );
     }
@@ -2205,6 +2208,7 @@ impl ViewerApp {
             frame.timings,
             record_final_decode,
             Some(frame.path),
+            frame.status,
             ctx,
         );
         self.status = self.selected_frame_status_text();
@@ -2216,10 +2220,13 @@ impl ViewerApp {
         load_timing: Option<LoadTimings>,
         record_final_decode: bool,
         source_path: Option<PathBuf>,
+        frame_status: FrameStatus,
         ctx: &egui::Context,
     ) {
         let previous_cut = self.selected_cut;
         let previous_product = self.selected_product.clone();
+        let require_complete_live_cut =
+            frame_status == FrameStatus::LivePartial && !self.display_live_chunk_updates;
         let (selected_cut, selected_product) = selection_for_installed_volume(
             self.volume.as_deref(),
             self.selected_cut,
@@ -2227,6 +2234,7 @@ impl ViewerApp {
             volume.as_ref(),
             !self.history_playing,
             self.display_live_chunk_updates,
+            require_complete_live_cut,
         );
         if let Some(index) = self
             .sites
@@ -8630,7 +8638,39 @@ fn live_partial_has_complete_low_level_tilt(volume: &RadarVolume) -> bool {
 }
 
 fn is_complete_live_low_level_tilt(cut: &ElevationCut) -> bool {
-    is_live_low_level_tilt(cut) && cut.radials.len() >= LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS
+    is_live_low_level_tilt(cut)
+        && cut.radials.len() >= LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS
+        && live_tilt_azimuth_coverage_deg(cut) >= LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG
+}
+
+fn is_complete_live_tilt(cut: &ElevationCut) -> bool {
+    cut.radials.len() >= LIVE_COMPLETE_TILT_MIN_RADIALS
+        && live_tilt_azimuth_coverage_deg(cut) >= LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG
+}
+
+fn live_tilt_azimuth_coverage_deg(cut: &ElevationCut) -> f32 {
+    let mut azimuths = cut
+        .radials
+        .iter()
+        .map(|radial| radial.azimuth_deg.rem_euclid(360.0))
+        .filter(|azimuth| azimuth.is_finite())
+        .collect::<Vec<_>>();
+    if azimuths.len() < 2 {
+        return 0.0;
+    }
+    azimuths.sort_by(|left, right| left.total_cmp(right));
+    azimuths.dedup_by(|left, right| (*left - *right).abs() < 0.05);
+    if azimuths.len() < 2 {
+        return 0.0;
+    }
+
+    let mut max_gap = 0.0_f32;
+    for pair in azimuths.windows(2) {
+        max_gap = max_gap.max(pair[1] - pair[0]);
+    }
+    let wrap_gap = azimuths[0] + 360.0 - azimuths[azimuths.len() - 1];
+    max_gap = max_gap.max(wrap_gap);
+    360.0 - max_gap
 }
 
 fn is_live_low_level_tilt(cut: &ElevationCut) -> bool {
@@ -8736,6 +8776,7 @@ fn selection_for_installed_volume(
     volume: &RadarVolume,
     allow_low_level_auto_advance: bool,
     allow_incomplete_live_chunk_advance: bool,
+    require_complete_live_cut: bool,
 ) -> (usize, DisplayProduct) {
     let same_site = previous_volume.is_some_and(|previous| previous.site.id == volume.site.id);
     if same_site
@@ -8750,14 +8791,28 @@ fn selection_for_installed_volume(
     {
         return (next_cut, previous_product.clone());
     }
-    if same_site && is_displayable_on_cut(volume, previous_cut, previous_product) {
+    if same_site
+        && is_displayable_on_live_candidate_cut(
+            volume,
+            previous_cut,
+            previous_product,
+            require_complete_live_cut,
+        )
+    {
         return (previous_cut, previous_product.clone());
     }
-    if same_site && let Some(cut) = best_cut_for_product(volume, previous_cut, previous_product) {
+    if same_site
+        && let Some(cut) = best_cut_for_product_with_live_filter(
+            volume,
+            previous_cut,
+            previous_product,
+            require_complete_live_cut,
+        )
+    {
         return (cut, previous_product.clone());
     }
 
-    default_selection_for_volume(volume)
+    default_selection_for_volume_with_live_filter(volume, require_complete_live_cut)
 }
 
 fn latest_newer_low_level_cut(
@@ -8810,26 +8865,91 @@ fn should_defer_live_partial_selection_for_active_product(
         return false;
     }
 
-    !volume_has_displayable_product(candidate.volume.as_ref(), selected_product)
+    !volume_has_displayable_product_with_live_filter(
+        candidate.volume.as_ref(),
+        selected_product,
+        true,
+    )
 }
 
 fn volume_has_displayable_product(volume: &RadarVolume, product: &DisplayProduct) -> bool {
-    (0..volume.cuts.len()).any(|cut_index| is_displayable_on_cut(volume, cut_index, product))
+    volume_has_displayable_product_with_live_filter(volume, product, false)
 }
 
-fn default_selection_for_volume(volume: &RadarVolume) -> (usize, DisplayProduct) {
+fn volume_has_displayable_product_with_live_filter(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> bool {
+    (0..volume.cuts.len()).any(|cut_index| {
+        is_displayable_on_live_candidate_cut(volume, cut_index, product, require_complete_live_cut)
+    })
+}
+
+fn default_selection_for_volume_with_live_filter(
+    volume: &RadarVolume,
+    require_complete_live_cut: bool,
+) -> (usize, DisplayProduct) {
     let reflectivity = DisplayProduct::Moment(MomentType::Reflectivity);
-    if is_displayable_on_cut(volume, 0, &reflectivity) {
+    if is_displayable_on_live_candidate_cut(volume, 0, &reflectivity, require_complete_live_cut) {
         return (0, reflectivity);
     }
 
     for cut_index in 0..volume.cuts.len() {
+        let Some(cut) = volume.cuts.get(cut_index) else {
+            continue;
+        };
+        if require_complete_live_cut && !is_complete_live_tilt(cut) {
+            continue;
+        }
         if let Some(product) = displayable_products(volume, cut_index).first().cloned() {
             return (cut_index, product);
         }
     }
 
     (0, reflectivity)
+}
+
+fn best_cut_for_product_with_live_filter(
+    volume: &RadarVolume,
+    current_cut: usize,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> Option<usize> {
+    let current_elevation = volume.cuts.get(current_cut).map(|cut| cut.elevation_deg);
+    volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            is_displayable_on_live_candidate_cut(volume, *index, product, require_complete_live_cut)
+        })
+        .min_by(|(left_index, left_cut), (right_index, right_cut)| {
+            let left_delta = current_elevation
+                .map(|elevation| (left_cut.elevation_deg - elevation).abs())
+                .unwrap_or(*left_index as f32);
+            let right_delta = current_elevation
+                .map(|elevation| (right_cut.elevation_deg - elevation).abs())
+                .unwrap_or(*right_index as f32);
+            left_delta.total_cmp(&right_delta)
+        })
+        .map(|(index, _)| index)
+}
+
+fn is_displayable_on_live_candidate_cut(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> bool {
+    if !is_displayable_on_cut(volume, cut_index, product) {
+        return false;
+    }
+    !require_complete_live_cut
+        || volume
+            .cuts
+            .get(cut_index)
+            .is_some_and(is_complete_live_tilt)
 }
 
 fn should_clear_display_for_latest_load(
@@ -9639,6 +9759,7 @@ mod tests {
                 &next,
                 true,
                 false,
+                false,
             ),
             (1, DisplayProduct::Moment(MomentType::Velocity))
         );
@@ -9649,6 +9770,7 @@ mod tests {
                 &DisplayProduct::StormRelativeVelocity,
                 &next,
                 true,
+                false,
                 false,
             ),
             (1, DisplayProduct::StormRelativeVelocity)
@@ -9665,11 +9787,19 @@ mod tests {
         );
 
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, false),
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, false, false),
             (3, product.clone())
         );
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &next, false, false),
+            selection_for_installed_volume(
+                Some(&previous),
+                0,
+                &product,
+                &next,
+                false,
+                false,
+                false,
+            ),
             (0, product)
         );
     }
@@ -9684,11 +9814,27 @@ mod tests {
             test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (1.8, 180_000)], 720);
 
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &short_lag, true, false),
+            selection_for_installed_volume(
+                Some(&previous),
+                0,
+                &product,
+                &short_lag,
+                true,
+                false,
+                false,
+            ),
             (0, product.clone())
         );
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &high_tilt, true, false),
+            selection_for_installed_volume(
+                Some(&previous),
+                0,
+                &product,
+                &high_tilt,
+                true,
+                false,
+                false,
+            ),
             (0, product)
         );
     }
@@ -9705,7 +9851,7 @@ mod tests {
 
         assert!(live_partial_has_complete_low_level_tilt(&next));
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, false),
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, false, false),
             (0, product)
         );
     }
@@ -9721,7 +9867,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, true),
+            selection_for_installed_volume(Some(&previous), 0, &product, &next, true, true, false),
             (2, product)
         );
     }
@@ -9730,11 +9876,27 @@ mod tests {
     fn live_partial_complete_low_level_tilt_gate_rejects_chunk_only_volume() {
         let chunk_only = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 240);
         let tail_chunk = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 719);
+        let mut sector_chunk = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        set_cut_azimuth_span(&mut sector_chunk, 0, 20.0, 175.0);
         let full_low = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
 
         assert!(!live_partial_has_complete_low_level_tilt(&chunk_only));
         assert!(!live_partial_has_complete_low_level_tilt(&tail_chunk));
+        assert!(!live_partial_has_complete_low_level_tilt(&sector_chunk));
         assert!(live_partial_has_complete_low_level_tilt(&full_low));
+    }
+
+    #[test]
+    fn live_partial_selection_skips_sector_chunk_cut_when_chunks_are_off() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let mut volume =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.6, 180_000)], 720);
+        set_cut_azimuth_span(&mut volume, 0, 20.0, 175.0);
+
+        assert_eq!(
+            selection_for_installed_volume(None, 0, &product, &volume, true, false, true),
+            (1, product)
+        );
     }
 
     #[test]
@@ -9750,6 +9912,7 @@ mod tests {
                 &DisplayProduct::Moment(MomentType::Velocity),
                 &next,
                 true,
+                false,
                 false,
             ),
             (0, DisplayProduct::Moment(MomentType::Reflectivity))
@@ -9984,6 +10147,7 @@ mod tests {
             None,
             false,
             None,
+            FrameStatus::Local,
             &ctx,
         );
 
@@ -11207,6 +11371,21 @@ mod tests {
             volume.cuts.push(cut);
         }
         volume
+    }
+
+    fn set_cut_azimuth_span(
+        volume: &mut RadarVolume,
+        cut_index: usize,
+        start_deg: f32,
+        span_deg: f32,
+    ) {
+        let Some(cut) = volume.cuts.get_mut(cut_index) else {
+            return;
+        };
+        let radial_count = cut.radials.len().max(1) as f32;
+        for (index, radial) in cut.radials.iter_mut().enumerate() {
+            radial.azimuth_deg = start_deg + span_deg * (index as f32 / radial_count);
+        }
     }
 
     fn test_aliased_velocity_volume() -> RadarVolume {
