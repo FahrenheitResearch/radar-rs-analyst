@@ -314,6 +314,26 @@ impl ColorTable {
         hasher.finish()
     }
 
+    pub fn mirrored_values(&self, name: impl Into<String>) -> Self {
+        let stops = self
+            .stops
+            .iter()
+            .map(|stop| ColorStop {
+                value: -stop.value,
+                color: stop.color,
+            })
+            .collect::<Vec<_>>();
+        Self::from_parts(
+            name.into(),
+            self.product.clone(),
+            self.units.clone(),
+            self.range_folded,
+            self.sample_mode.mirrored_values(),
+            stops,
+        )
+        .expect("mirrored table preserves valid stops")
+    }
+
     fn from_parts(
         name: String,
         product: Option<String>,
@@ -376,6 +396,16 @@ impl SampleMode {
             Self::QuantizedInterpolated { step, origin } => Self::QuantizedInterpolated {
                 step: step * scale,
                 origin: origin * scale,
+            },
+            Self::Interpolated | Self::Stepped => self,
+        }
+    }
+
+    fn mirrored_values(self) -> Self {
+        match self {
+            Self::QuantizedInterpolated { step, origin } => Self::QuantizedInterpolated {
+                step,
+                origin: -origin,
             },
             Self::Interpolated | Self::Stepped => self,
         }
@@ -1700,6 +1730,17 @@ mod tests {
         assert_eq!(table.sample(0.0), Rgba8::opaque(120, 120, 120));
         assert_eq!(table.sample(1.0), Rgba8::opaque(255, 0, 0));
         assert_eq!(table.range_folded_rgba(), Rgba8::opaque(180, 80, 255));
+    }
+
+    #[test]
+    fn mirrored_velocity_table_samples_opposite_polarity_colors() {
+        let table = sign_check_velocity_table();
+        let mirrored = table.mirrored_values("Mirrored Sign Check VEL");
+
+        assert_eq!(mirrored.sample(1.0), table.sample(-1.0));
+        assert_eq!(mirrored.sample(-1.0), table.sample(1.0));
+        assert_eq!(mirrored.sample(0.0), table.sample(0.0));
+        assert_eq!(mirrored.range_folded_rgba(), table.range_folded_rgba());
     }
 
     #[test]

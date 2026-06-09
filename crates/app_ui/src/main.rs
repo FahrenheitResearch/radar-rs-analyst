@@ -308,6 +308,7 @@ struct ViewerApp {
     history_playing: bool,
     last_history_step: Option<Instant>,
     color_tables: ColorTableSet,
+    flip_velocity_color_polarity: bool,
     color_table_target: ColorTableFamily,
     color_table_path_text: String,
     color_table_status: String,
@@ -1707,6 +1708,7 @@ impl ViewerApp {
             history_playing: false,
             last_history_step: None,
             color_tables: ColorTableSet::default(),
+            flip_velocity_color_polarity: false,
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
             color_table_status:
@@ -2924,9 +2926,9 @@ impl ViewerApp {
         let Some((viewport_options, viewport_key)) = self.viewport_raster_options(ctx, rect) else {
             return;
         };
-        let color_table_signature = self
-            .color_tables
-            .signature_for_family(self.selected_product.color_family());
+        let color_tables = self.render_color_tables_for_product(&self.selected_product);
+        let color_table_signature =
+            color_tables.signature_for_family(self.selected_product.color_family());
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             cut: self.selected_cut,
@@ -2949,7 +2951,7 @@ impl ViewerApp {
                 volume,
                 cut: self.selected_cut,
                 product: self.selected_product.clone(),
-                color_tables: self.color_tables.clone(),
+                color_tables,
                 storm_motion: self.current_storm_motion(),
                 viewport_options,
                 radar_range_km: self
@@ -2958,6 +2960,19 @@ impl ViewerApp {
             },
             ctx,
         );
+    }
+
+    fn render_color_tables_for_product(&self, product: &DisplayProduct) -> ColorTableSet {
+        let mut color_tables = self.color_tables.clone();
+        if self.flip_velocity_color_polarity && product.color_family() == ColorTableFamily::Velocity
+        {
+            let current = color_tables.for_family(ColorTableFamily::Velocity);
+            color_tables.set_family(
+                ColorTableFamily::Velocity,
+                current.mirrored_values(format!("{} (flipped)", current.name())),
+            );
+        }
+        color_tables
     }
 
     fn request_radar_layer_renders(&mut self, ctx: &egui::Context, rect: egui::Rect) {
@@ -2982,9 +2997,8 @@ impl ViewerApp {
             else {
                 continue;
             };
-            let color_table_signature = self
-                .color_tables
-                .signature_for_family(product.color_family());
+            let color_tables = self.render_color_tables_for_product(&product);
+            let color_table_signature = color_tables.signature_for_family(product.color_family());
             let key = TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
                 cut,
@@ -3007,7 +3021,7 @@ impl ViewerApp {
                     volume,
                     cut,
                     product,
-                    color_tables: self.color_tables.clone(),
+                    color_tables,
                     storm_motion: self.current_storm_motion(),
                     viewport_options,
                     radar_range_km,
@@ -4132,6 +4146,17 @@ impl ViewerApp {
             }
         });
         self.active_product_color_picker(ui, ctx);
+
+        if self.selected_product.color_family() == ColorTableFamily::Velocity {
+            let changed = ui
+                .checkbox(&mut self.flip_velocity_color_polarity, "Flip VEL colors")
+                .on_hover_text("Diagnostic: color positive velocity values with the negative side of the active velocity table, and vice versa")
+                .changed();
+            if changed {
+                self.clear_texture();
+                ctx.request_repaint();
+            }
+        }
 
         if self.selected_product.is_storm_relative_velocity() {
             ui.add_space(8.0);
@@ -11138,6 +11163,7 @@ mod tests {
             history_playing: false,
             last_history_step: None,
             color_tables: ColorTableSet::default(),
+            flip_velocity_color_polarity: false,
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
             color_table_status: String::new(),
