@@ -2883,6 +2883,8 @@ const DEALIAS_SPIKE_NEIGHBOR_ROWS: isize = 3;
 const DEALIAS_SPIKE_NEIGHBOR_GATES: isize = 1;
 const DEALIAS_SPIKE_MIN_SUPPORT: usize = 2;
 const DEALIAS_CONSENSUS_MAX_FOLD: i32 = 4;
+const DEALIAS_RADIAL_CHAIN_MAX_GATE_GAP: usize = 3;
+const DEALIAS_RADIAL_MAX_FOLD: i32 = 3;
 
 fn encode_dealiased_velocity_row(values: &[f32], output: &mut [u16]) {
     debug_assert_eq!(values.len(), output.len());
@@ -2987,6 +2989,12 @@ fn suppress_isolated_dealias_spikes(
     }
 
     let original = corrected.to_vec();
+    let support_context = DealiasSpikeContext {
+        cut,
+        source,
+        corrected: &original,
+        fallback_nyquist,
+    };
     corrected
         .par_chunks_mut(gate_count)
         .enumerate()
@@ -3010,14 +3018,11 @@ fn suppress_isolated_dealias_spikes(
                     continue;
                 };
                 let support = dealias_fold_neighbor_support(
-                    cut,
-                    source,
-                    &original,
+                    &support_context,
                     row,
                     gate,
                     fold,
                     corrected_value,
-                    fallback_nyquist,
                 );
                 if support < DEALIAS_SPIKE_MIN_SUPPORT {
                     *raw = encode_dealiased_velocity(observed);
@@ -3026,16 +3031,21 @@ fn suppress_isolated_dealias_spikes(
         });
 }
 
+struct DealiasSpikeContext<'a> {
+    cut: &'a ElevationCut,
+    source: &'a MomentGrid,
+    corrected: &'a [u16],
+    fallback_nyquist: Option<f32>,
+}
+
 fn dealias_fold_neighbor_support(
-    cut: &ElevationCut,
-    source: &MomentGrid,
-    corrected: &[u16],
+    context: &DealiasSpikeContext<'_>,
     row: usize,
     gate: usize,
     fold: i32,
     corrected_value: f32,
-    fallback_nyquist: Option<f32>,
 ) -> usize {
+    let source = context.source;
     let rows = source.radial_count();
     let gate_count = source.gate_range.gate_count;
     let mut support = 0;
@@ -3049,8 +3059,8 @@ fn dealias_fold_neighbor_support(
         if neighbor_row >= rows {
             continue;
         }
-        let Some(neighbor_nyquist) = row_nyquist_mps(cut, source, neighbor_row)
-            .or(fallback_nyquist)
+        let Some(neighbor_nyquist) = row_nyquist_mps(context.cut, source, neighbor_row)
+            .or(context.fallback_nyquist)
             .filter(|value| value.is_finite() && *value > 0.0)
         else {
             continue;
@@ -3065,9 +3075,9 @@ fn dealias_fold_neighbor_support(
             let Some(neighbor_observed) = source.scaled_value(neighbor_row, neighbor_gate) else {
                 continue;
             };
-            let Some(neighbor_corrected) =
-                decode_dealiased_velocity(corrected[neighbor_row * gate_count + neighbor_gate])
-            else {
+            let Some(neighbor_corrected) = decode_dealiased_velocity(
+                context.corrected[neighbor_row * gate_count + neighbor_gate],
+            ) else {
                 continue;
             };
             if dealias_fold_count(neighbor_observed, neighbor_corrected, neighbor_nyquist)
@@ -3208,12 +3218,13 @@ fn walk_dealias_radial(
         let mut references = [0.0; 3];
         let mut reference_count = 0usize;
         if let Some(last) = last_gate
-            && current_gate.abs_diff(last) <= 3
+            && current_gate.abs_diff(last) <= DEALIAS_RADIAL_CHAIN_MAX_GATE_GAP
             && row_values[last].is_finite()
         {
             references[reference_count] = row_values[last];
             reference_count += 1;
             if let Some(last_two) = last_two_gate
+                && last.abs_diff(last_two) <= DEALIAS_RADIAL_CHAIN_MAX_GATE_GAP
                 && row_values[last_two].is_finite()
             {
                 let slope = row_values[last] - row_values[last_two];
@@ -3228,13 +3239,20 @@ fn walk_dealias_radial(
             references[reference_count] = previous_value;
             reference_count += 1;
         }
-        row_values[current_gate] = if reference_count == 0 {
-            observed
+        if reference_count == 0 {
+            row_values[current_gate] = observed;
+            last_two_gate = None;
         } else {
             let reference = median_small_f32(&mut references, reference_count);
-            unfold_velocity_to_reference(observed, reference, nyquist, reference_count, 8)
-        };
-        last_two_gate = last_gate;
+            row_values[current_gate] = unfold_velocity_to_reference(
+                observed,
+                reference,
+                nyquist,
+                reference_count,
+                DEALIAS_RADIAL_MAX_FOLD,
+            );
+            last_two_gate = last_gate;
+        }
         last_gate = Some(current_gate);
         gate += direction;
     }
@@ -3635,6 +3653,40 @@ mod tests {
             .map(|gate| corrected.scaled_value(0, gate).expect("corrected gate"))
             .collect::<Vec<_>>();
         assert_eq!(values, vec![0.0, 5.0, 9.0, 11.0, 13.0]);
+    }
+
+    #[test]
+    fn velocity_dealias_caps_radial_fold_excursions() {
+        let observed = vec![0.0, 3.0, 106.0];
+        let mut row_values = vec![f32::NAN; observed.len()];
+        row_values[0] = observed[0];
+
+        walk_dealias_radial(&observed, 10.0, None, &mut row_values, 0, 1);
+
+        assert_eq!(row_values, vec![0.0, 3.0, 106.0]);
+    }
+
+    #[test]
+    fn velocity_dealias_resets_stale_radial_slope_after_gap() {
+        let observed = vec![
+            0.0,
+            2.0,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            60.0,
+            78.0,
+        ];
+        let mut row_values = vec![f32::NAN; observed.len()];
+        row_values[0] = observed[0];
+
+        walk_dealias_radial(&observed, 10.0, None, &mut row_values, 0, 1);
+
+        assert_eq!(row_values[8], 60.0);
+        assert_eq!(row_values[9], 78.0);
     }
 
     #[test]

@@ -207,6 +207,7 @@ fn preview_render_head_start(threads: usize) -> Duration {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_load_path_with_optional_preview(
     path: PathBuf,
     label: &str,
@@ -428,6 +429,7 @@ struct AsyncLoadResult {
     update: AsyncLoadUpdate,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AsyncLoadUpdate {
     Preview(DecodedLoad),
     History(DecodedLoadBatch, bool),
@@ -605,6 +607,7 @@ fn history_archive_load_parallelism_for_threads(threads: usize) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_archive_history_object(
     site_id: &str,
     object: data_source::S3Object,
@@ -615,9 +618,11 @@ fn decode_archive_history_object(
     sender: &mpsc::Sender<AsyncLoadResult>,
     preview: bool,
 ) -> Result<Option<DecodedLoad>, String> {
-    let mut timings = LoadTimings::default();
-    timings.lookup_ms = archive_lookup_ms;
-    timings.lookup_cache_hit = archive_lookup_ms.map(|_| false);
+    let mut timings = LoadTimings {
+        lookup_ms: archive_lookup_ms,
+        lookup_cache_hit: archive_lookup_ms.map(|_| false),
+        ..Default::default()
+    };
 
     let fetch_start = Instant::now();
     let downloaded = data_source::download_object(LEVEL2_ARCHIVE_BUCKET, object, site_cache_dir)
@@ -728,6 +733,7 @@ fn load_archive_history_objects_parallel(
     (decoded_frames, first_error)
 }
 
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn spawn_latest_level2_load_worker(
     site: RadarSite,
     mode: LatestLoadMode,
@@ -1380,6 +1386,7 @@ struct RenderWorkerViewportSignature {
 }
 
 impl RenderWorkerViewportSignature {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         volume_ptr: usize,
         cut: usize,

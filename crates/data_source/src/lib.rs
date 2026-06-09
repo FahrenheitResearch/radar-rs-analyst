@@ -428,11 +428,11 @@ pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume>
         return Ok(volume);
     }
 
-    realtime_level2_volume_for_id(&site, volume_id).or_else(|_| {
-        Err(first_error.unwrap_or(DataSourceError::NoObjects {
+    realtime_level2_volume_for_id(&site, volume_id).map_err(|_| {
+        first_error.unwrap_or(DataSourceError::NoObjects {
             bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
             prefix: site_prefix,
-        }))
+        })
     })
 }
 
