@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Instant;
 
@@ -39,13 +39,15 @@ pub struct RenderedPane {
     pub elapsed_ms: f32,
 }
 
+pub struct RenderFailure {
+    pub pane: PaneId,
+    pub stamp: RenderStamp,
+    pub message: String,
+}
+
 pub enum RenderUpdate {
     Completed(RenderedPane),
-    Failed {
-        pane: PaneId,
-        stamp: RenderStamp,
-        message: String,
-    },
+    Failed(RenderFailure),
 }
 
 pub struct RenderService {
@@ -57,13 +59,13 @@ impl RenderService {
     pub fn new(context: egui::Context) -> Self {
         let (request_sender, request_receiver) = latest_lane_channel::<PaneId, RenderRequest>();
         let (result_sender, result_receiver) = mpsc::sync_channel(RESULT_QUEUE_CAPACITY);
-        let _ = thread::Builder::new()
+        let _worker = thread::Builder::new()
             .name("radar-workstation-render".to_owned())
             .spawn(move || {
                 while let Some((_pane, request)) = request_receiver.recv() {
                     let update = match render_request(request) {
                         Ok(rendered) => RenderUpdate::Completed(rendered),
-                        Err(failure) => failure,
+                        Err(failure) => RenderUpdate::Failed(failure),
                     };
                     if result_sender.send(update).is_err() {
                         break;
@@ -87,10 +89,7 @@ impl RenderService {
     }
 
     pub fn try_recv(&self) -> Option<RenderUpdate> {
-        match self.receiver.try_recv() {
-            Ok(update) => Some(update),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.receiver.try_recv().ok()
     }
 
     pub fn queued_panes(&self) -> usize {
@@ -98,7 +97,7 @@ impl RenderService {
     }
 }
 
-fn render_request(request: RenderRequest) -> Result<RenderedPane, RenderUpdate> {
+fn render_request(request: RenderRequest) -> Result<RenderedPane, RenderFailure> {
     let started = Instant::now();
     let raster_view = request.camera.radar_raster_view(request.viewport);
     let options = ViewportRasterOptions {
@@ -125,7 +124,7 @@ fn render_request(request: RenderRequest) -> Result<RenderedPane, RenderUpdate> 
             &request.color_tables,
         )
     }
-    .map_err(|error| RenderUpdate::Failed {
+    .map_err(|error| RenderFailure {
         pane: request.pane,
         stamp: request.stamp,
         message: error.to_string(),
@@ -146,7 +145,7 @@ fn render_request(request: RenderRequest) -> Result<RenderedPane, RenderUpdate> 
     } else {
         cache.render_moment_rgba_into(&request.volume, options, &mut rgba)
     }
-    .map_err(|error| RenderUpdate::Failed {
+    .map_err(|error| RenderFailure {
         pane: request.pane,
         stamp: request.stamp,
         message: error.to_string(),
