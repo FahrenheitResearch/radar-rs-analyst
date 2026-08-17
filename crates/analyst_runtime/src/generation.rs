@@ -67,7 +67,7 @@ pub struct RenderStamp {
 }
 
 impl RenderStamp {
-    pub const fn is_current(self, current: Self) -> bool {
+    pub fn is_current(self, current: Self) -> bool {
         self == current
     }
 }
