@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# `app_ui` is the legacy reference harness. Its drawing code predates Rust
+# 1.97's `float_literal_f32_fallback` lint and is not the new workstation
+# composition root. Keep the compatibility allowance isolated to this crate;
+# all new workstation/runtime crates continue to build under `-D warnings`.
+[lints.rust]
+float_literal_f32_fallback = "allow"
+
 [dependencies]
 chrono.workspace = true
 color_tables = { path = "../color_tables" }
