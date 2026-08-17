@@ -1,6 +1,4 @@
-use analyst_runtime::{
-    Camera2D, PaneId, PaneLayout, ScreenPoint, ViewportMetrics, WorldPoint,
-};
+use analyst_runtime::{Camera2D, PaneId, PaneLayout, ScreenPoint, ViewportMetrics, WorldPoint};
 use eframe::egui;
 
 const PANE_GAP: f32 = 3.0;
@@ -125,7 +123,14 @@ pub fn draw_pane(
         paint_transformed_texture(&painter, rect, updated_camera, viewport, texture);
     }
     draw_range_rings(&painter, rect, updated_camera, viewport);
-    draw_cursor_readout(ui, &painter, rect, updated_camera, viewport, response.hovered());
+    draw_cursor_readout(
+        ui,
+        &painter,
+        rect,
+        updated_camera,
+        viewport,
+        response.hovered(),
+    );
     draw_header(&painter, rect, title, status);
     draw_border(&painter, rect, active);
 
@@ -182,7 +187,10 @@ fn draw_range_rings(
 ) {
     let radar = camera.world_to_screen(WorldPoint::ORIGIN, viewport);
     let center = egui::pos2(rect.left() + radar.x, rect.top() + radar.y);
-    let stroke = egui::Stroke::new(0.8, egui::Color32::from_rgba_unmultiplied(170, 190, 205, 88));
+    let stroke = egui::Stroke::new(
+        0.8,
+        egui::Color32::from_rgba_unmultiplied(170, 190, 205, 88),
+    );
     for range_km in RANGE_RINGS_KM {
         let radius = (*range_km as f32 / camera.sanitized().km_per_point).abs();
         if radius > 4.0 && radius < rect.width().max(rect.height()) * 2.0 {
@@ -212,7 +220,11 @@ fn draw_cursor_readout(
     let local = ScreenPoint::new(pointer.x - rect.left(), pointer.y - rect.top());
     let world = camera.screen_to_world(local, viewport);
     let range_km = world.east_km.hypot(world.north_km);
-    let azimuth_deg = world.east_km.atan2(world.north_km).to_degrees().rem_euclid(360.0);
+    let azimuth_deg = world
+        .east_km
+        .atan2(world.north_km)
+        .to_degrees()
+        .rem_euclid(360.0);
     let text = format!("{range_km:.1} km  {azimuth_deg:05.1}°");
     painter.text(
         egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
@@ -223,15 +235,13 @@ fn draw_cursor_readout(
     );
 }
 
-fn draw_header(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    title: &str,
-    status: &str,
-) {
+fn draw_header(painter: &egui::Painter, rect: egui::Rect, title: &str, status: &str) {
     let header = egui::Rect::from_min_max(
         rect.min,
-        egui::pos2(rect.right(), (rect.top() + HEADER_HEIGHT).min(rect.bottom())),
+        egui::pos2(
+            rect.right(),
+            (rect.top() + HEADER_HEIGHT).min(rect.bottom()),
+        ),
     );
     painter.rect_filled(
         header,
