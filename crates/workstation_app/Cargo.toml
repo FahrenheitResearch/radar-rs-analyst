@@ -1,0 +1,18 @@
+[package]
+name = "workstation_app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+analyst_runtime = { path = "../analyst_runtime" }
+chrono.workspace = true
+color_tables = { path = "../color_tables" }
+eframe.workspace = true
+nexrad_io = { path = "../nexrad_io" }
+radar_core = { path = "../radar_core" }
+render2d = { path = "../render2d" }
+
+[[bin]]
+name = "radar-workstation"
+path = "src/main.rs"
