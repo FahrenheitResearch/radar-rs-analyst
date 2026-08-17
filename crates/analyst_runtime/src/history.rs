@@ -327,9 +327,7 @@ impl VolumeHistory {
 
         if self.frames.is_empty() {
             self.selected = None;
-        } else if self.follow_live
-            || self.selected.is_none_or(|index| index >= self.frames.len())
-        {
+        } else if self.follow_live || self.selected.is_none_or(|index| index >= self.frames.len()) {
             self.selected = Some(self.frames.len() - 1);
         }
         evicted
