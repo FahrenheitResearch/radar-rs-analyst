@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
@@ -47,7 +47,7 @@ impl LoadService {
     pub fn new(context: egui::Context) -> Self {
         let (request_sender, request_receiver) = latest_lane_channel::<u8, LoadRequest>();
         let (result_sender, result_receiver) = mpsc::sync_channel(RESULT_QUEUE_CAPACITY);
-        thread::Builder::new()
+        let _worker = thread::Builder::new()
             .name("radar-workstation-load".to_owned())
             .spawn(move || {
                 while let Some((_lane, request)) = request_receiver.recv() {
@@ -77,11 +77,7 @@ impl LoadService {
     }
 }
 
-fn process_request(
-    request: LoadRequest,
-    sender: &SyncSender<LoadUpdate>,
-    context: &egui::Context,
-) {
+fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, context: &egui::Context) {
     let generation = request.generation;
     let path = request.path;
     let _ = sender.send(LoadUpdate::Started {
@@ -93,16 +89,7 @@ fn process_request(
     let started = Instant::now();
     let result = std::fs::read(&path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))
-        .and_then(|raw| {
-            decode_with_previews(
-                &raw,
-                generation,
-                &path,
-                started,
-                sender,
-                context,
-            )
-        });
+        .and_then(|raw| decode_with_previews(&raw, generation, &path, started, sender, context));
 
     match result {
         Ok(mut volume) => {
@@ -129,7 +116,7 @@ fn process_request(
 fn decode_with_previews(
     raw: &[u8],
     generation: Generation,
-    path: &PathBuf,
+    path: &Path,
     started: Instant,
     sender: &SyncSender<LoadUpdate>,
     context: &egui::Context,
@@ -138,7 +125,7 @@ fn decode_with_previews(
         preview.metadata.source_path = Some(path.display().to_string());
         let update = LoadUpdate::Volume(LoadedVolume {
             generation,
-            path: path.clone(),
+            path: path.to_path_buf(),
             stage: FrameStage::Preview,
             volume: Arc::new(preview),
             elapsed_ms: started.elapsed().as_secs_f32() * 1_000.0,
