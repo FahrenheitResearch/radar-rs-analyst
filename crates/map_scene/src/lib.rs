@@ -11,7 +11,11 @@ pub mod build;
 pub mod dataset;
 pub mod generated;
 pub mod geometry;
+pub mod gpu;
+pub mod labels;
 pub mod projection;
+pub mod residency;
+pub mod scene;
 pub mod style;
 
 pub use build::{
@@ -22,5 +26,8 @@ pub use dataset::{
     GeoLineFeature, GeoPolygonFeature, LabelCandidate, LabelClass, MapDataset, MapLayer,
 };
 pub use geometry::{GeometryStats, MapDraw, MapGeometry, MapVertex, ProjectedLabel};
+pub use labels::{MAX_LABELS_PLACED, PlacedLabel, PlacementMetrics, place_labels};
 pub use projection::{PROJECTION_ALGORITHM_VERSION, ProjectionId, RadarProjection};
+pub use residency::{Admission, GeometryResidency, ResidencyMetrics};
+pub use scene::{MapSceneController, SceneMetrics};
 pub use style::{LayerColor, LayerStyle, MapStyle};

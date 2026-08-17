@@ -8,6 +8,9 @@ const ALLOWED_DIRECT_DEPENDENCIES: &[&str] = &[
     "color_tables",
     "data_source",
     "eframe",
+    // The map scene owns the graphics backend; the workstation depends on it
+    // rather than on wgpu, bytemuck or any GIS crate directly.
+    "map_scene",
     "nexrad_io",
     "radar_core",
     "render2d",

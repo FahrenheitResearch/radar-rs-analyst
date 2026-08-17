@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use analyst_runtime::{Camera2D, PaneId, PaneLayout, ScreenPoint, ViewportMetrics, WorldPoint};
 use eframe::egui;
+use map_scene::gpu::MapPaintCallback;
+use map_scene::{MapGeometry, RadarProjection};
 
 const PANE_GAP: f32 = 3.0;
 const HEADER_HEIGHT: f32 = 26.0;
@@ -9,6 +13,15 @@ pub struct PaneTexture<'a> {
     pub handle: &'a egui::TextureHandle,
     pub camera: Camera2D,
     pub viewport: ViewportMetrics,
+}
+
+/// The retained map underlay for one pane, if the scene has geometry built for
+/// the pane's current LOD. `projection` also drives the cursor's lat/lon, so
+/// the readout uses the same transform the map was built with.
+#[derive(Clone, Default)]
+pub struct PaneMap {
+    pub geometry: Option<Arc<MapGeometry>>,
+    pub projection: Option<RadarProjection>,
 }
 
 pub struct PaneInteraction {
@@ -74,6 +87,7 @@ pub fn draw_pane(
     active: bool,
     camera: Camera2D,
     texture: Option<PaneTexture<'_>>,
+    map: &PaneMap,
     title: &str,
     status: &str,
 ) -> PaneInteraction {
@@ -119,9 +133,13 @@ pub fn draw_pane(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(6, 9, 13));
 
+    // Map underlay first: the radar draws over it.
+    paint_map(&painter, rect, pane, updated_camera, viewport, map);
+
     if let Some(texture) = texture {
         paint_transformed_texture(&painter, rect, updated_camera, viewport, texture);
     }
+    draw_map_labels(&painter, rect, updated_camera, viewport, map);
     draw_range_rings(&painter, rect, updated_camera, viewport);
     draw_cursor_readout(
         ui,
@@ -130,6 +148,7 @@ pub fn draw_pane(
         updated_camera,
         viewport,
         response.hovered(),
+        map.projection.as_ref(),
     );
     draw_header(&painter, rect, title, status);
     draw_border(&painter, rect, active);
@@ -140,6 +159,42 @@ pub fn draw_pane(
         camera_changed,
         viewport,
     }
+}
+
+/// Queue the retained map for this pane.
+///
+/// The callback carries only a geometry handle and the camera; the vertex and
+/// index buffers behind it are already on the GPU and are not touched here.
+fn paint_map(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    pane: PaneId,
+    camera: Camera2D,
+    viewport: ViewportMetrics,
+    map: &PaneMap,
+) {
+    let Some(geometry) = map.geometry.clone() else {
+        return;
+    };
+    if geometry.is_empty() {
+        return;
+    }
+    let pixels_per_point = viewport.sanitized().pixels_per_point;
+    let callback = MapPaintCallback {
+        pane_index: pane.index(),
+        geometry,
+        camera,
+        viewport,
+        rect_px: [
+            rect.left() * pixels_per_point,
+            rect.top() * pixels_per_point,
+            rect.right() * pixels_per_point,
+            rect.bottom() * pixels_per_point,
+        ],
+    };
+    painter.add(eframe::egui_wgpu::Callback::new_paint_callback(
+        rect, callback,
+    ));
 }
 
 fn paint_transformed_texture(
@@ -179,6 +234,53 @@ fn paint_transformed_texture(
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// Draw the labels that survived bounded placement.
+///
+/// Text is egui's, drawn after the retained geometry. The expensive part —
+/// projecting every candidate — already happened in the build; this only
+/// transforms the survivors and rejects overlaps.
+fn draw_map_labels(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    camera: Camera2D,
+    viewport: ViewportMetrics,
+    map: &PaneMap,
+) {
+    let Some(geometry) = map.geometry.as_ref() else {
+        return;
+    };
+    let (placed, _metrics) =
+        map_scene::place_labels(geometry, camera, viewport, map_scene::MAX_LABELS_PLACED);
+    for label in placed {
+        let position = egui::pos2(
+            rect.left() + label.position.x,
+            rect.top() + label.position.y,
+        );
+        // A dark halo keeps the name readable over bright reflectivity.
+        for offset in [
+            egui::vec2(-1.0, 0.0),
+            egui::vec2(1.0, 0.0),
+            egui::vec2(0.0, -1.0),
+            egui::vec2(0.0, 1.0),
+        ] {
+            painter.text(
+                position + offset,
+                egui::Align2::CENTER_CENTER,
+                label.name,
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+            );
+        }
+        painter.text(
+            position,
+            egui::Align2::CENTER_CENTER,
+            label.name,
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(214, 222, 232),
+        );
+    }
+}
+
 fn draw_range_rings(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -207,6 +309,7 @@ fn draw_cursor_readout(
     camera: Camera2D,
     viewport: ViewportMetrics,
     hovered: bool,
+    projection: Option<&RadarProjection>,
 ) {
     if !hovered {
         return;
@@ -225,7 +328,18 @@ fn draw_cursor_readout(
         .atan2(world.north_km)
         .to_degrees()
         .rem_euclid(360.0);
-    let text = format!("{range_km:.1} km  {azimuth_deg:05.1}°");
+    // Same inverse transform the map was built with, so the readout and the
+    // basemap can never disagree.
+    let text = match projection.map(|projection| projection.world_to_lon_lat(world)) {
+        Some((lon_deg, lat_deg)) => format!(
+            "{range_km:.1} km  {azimuth_deg:05.1}°   {:.4}°{}  {:.4}°{}",
+            lat_deg.abs(),
+            if lat_deg >= 0.0 { "N" } else { "S" },
+            lon_deg.abs(),
+            if lon_deg >= 0.0 { "E" } else { "W" },
+        ),
+        None => format!("{range_km:.1} km  {azimuth_deg:05.1}°"),
+    };
     painter.text(
         egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
         egui::Align2::LEFT_BOTTOM,

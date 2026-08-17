@@ -56,6 +56,27 @@ fn main() -> eframe::Result {
         "Radar Workstation",
         native_options,
         Box::new(move |creation_context| {
+            // Register the map's persistent GPU resources once, before any
+            // pane paints. Without a wgpu render state the map cannot draw at
+            // all, so say so rather than silently falling back to per-frame
+            // CPU geometry.
+            match creation_context.wgpu_render_state.as_ref() {
+                Some(render_state) => {
+                    let resources = map_scene::gpu::MapRenderResources::new(
+                        &render_state.device,
+                        render_state.target_format,
+                    );
+                    render_state
+                        .renderer
+                        .write()
+                        .callback_resources
+                        .insert(resources);
+                }
+                None => eprintln!(
+                    "wgpu map unavailable: no wgpu render state; the basemap will not draw"
+                ),
+            }
+
             Ok(Box::new(app::WorkstationApp::new(
                 creation_context,
                 input_path,

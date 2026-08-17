@@ -136,30 +136,92 @@ fn wrap_delta(delta_deg: f64) -> f64 {
 }
 
 /// Project a feature and split it into runs that lie inside the build region.
-/// Splitting rather than clamping avoids drawing a false straight line across
-/// the pane when a feature leaves and re-enters.
+///
+/// Where a feature crosses the boundary the segment is cut at the boundary
+/// itself. Carrying the outside vertex instead would draw a straight line from
+/// the edge of the region to a point that can be thousands of kilometres away,
+/// which appears as a spurious line ruled straight across the pane.
 fn project_and_clip(line: &GeoLineFeature, projection: &RadarProjection) -> Vec<Vec<[f64; 2]>> {
     let mut runs = Vec::new();
     let mut current: Vec<[f64; 2]> = Vec::new();
+    let mut previous: Option<([f64; 2], bool)> = None;
+
     for (lon, lat) in line.points {
-        let world = projection.lon_lat_to_world(f64::from(*lon), f64::from(*lat));
-        let inside = world.east_km.abs() <= BUILD_HALF_EXTENT_KM
-            && world.north_km.abs() <= BUILD_HALF_EXTENT_KM;
-        if inside {
-            current.push([world.east_km, world.north_km]);
-        } else {
-            // Keep the first point outside so the line reaches the edge rather
-            // than stopping short of it.
-            if !current.is_empty() {
-                current.push([world.east_km, world.north_km]);
+        // A point the geodesic cannot resolve breaks the run rather than
+        // contributing a fabricated position.
+        let Some(world) = projection.try_lon_lat_to_world(f64::from(*lon), f64::from(*lat)) else {
+            if current.len() >= 2 {
                 runs.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
             }
+            previous = None;
+            continue;
+        };
+        let point = [world.east_km, world.north_km];
+        let inside = is_inside(point);
+
+        match (previous, inside) {
+            (_, true) => {
+                if let Some((previous_point, false)) = previous {
+                    // Entering: start at the boundary crossing.
+                    if let Some(crossing) = clip_to_region(point, previous_point) {
+                        current.push(crossing);
+                    }
+                }
+                current.push(point);
+            }
+            (Some((previous_point, true)), false) => {
+                // Leaving: finish at the boundary crossing.
+                if let Some(crossing) = clip_to_region(previous_point, point) {
+                    current.push(crossing);
+                }
+                if current.len() >= 2 {
+                    runs.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+            _ => {}
         }
+        previous = Some((point, inside));
     }
+
     if current.len() >= 2 {
         runs.push(current);
     }
     runs
+}
+
+fn is_inside(point: [f64; 2]) -> bool {
+    point[0].abs() <= BUILD_HALF_EXTENT_KM && point[1].abs() <= BUILD_HALF_EXTENT_KM
+}
+
+/// Walk from `inside` towards `outside` and return the last point still inside
+/// the region. Bisection keeps this exact enough for a 1000 km boundary that is
+/// never on screen, without special-casing which edge was crossed.
+fn clip_to_region(inside: [f64; 2], outside: [f64; 2]) -> Option<[f64; 2]> {
+    if !is_inside(inside) || is_inside(outside) {
+        return None;
+    }
+    let mut low = 0.0_f64;
+    let mut high = 1.0_f64;
+    for _ in 0..24 {
+        let mid = (low + high) * 0.5;
+        let candidate = [
+            inside[0] + (outside[0] - inside[0]) * mid,
+            inside[1] + (outside[1] - inside[1]) * mid,
+        ];
+        if is_inside(candidate) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    Some([
+        inside[0] + (outside[0] - inside[0]) * low,
+        inside[1] + (outside[1] - inside[1]) * low,
+    ])
 }
 
 /// Ramer-Douglas-Peucker, iterative so a pathological feature cannot blow the
@@ -363,6 +425,42 @@ mod tests {
         let geometry = build_geometry(&request(LodBucket(12)));
         assert!(geometry.is_empty());
         assert!(geometry.draws.is_empty());
+    }
+
+    #[test]
+    fn a_feature_leaving_the_region_is_cut_at_the_boundary() {
+        // A line running from beside the radar out to the far side of the
+        // world. Every retained point must stay inside the build region: a
+        // single distant vertex would rule a false line across the display.
+        static LONG: &[(f32, f32)] = &[(-97.3, 35.3), (-97.0, 35.5), (2.35, 48.85), (30.0, 50.0)];
+        let projection = RadarProjection::new(35.3333, -97.2778);
+        let feature = line(MapLayer::County, LONG);
+        let runs = project_and_clip(&feature, &projection);
+
+        assert!(!runs.is_empty(), "the nearby portion should survive");
+        for run in &runs {
+            for point in run {
+                assert!(
+                    is_inside(*point),
+                    "retained point {point:?} escaped the build region"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_feature_that_re_enters_produces_separate_runs() {
+        // Near, far, near again: two runs, never one line joining them.
+        static RE_ENTERS: &[(f32, f32)] = &[
+            (-97.3, 35.3),
+            (-97.2, 35.4),
+            (2.35, 48.85),
+            (-97.1, 35.2),
+            (-97.0, 35.25),
+        ];
+        let projection = RadarProjection::new(35.3333, -97.2778);
+        let runs = project_and_clip(&line(MapLayer::County, RE_ENTERS), &projection);
+        assert_eq!(runs.len(), 2, "expected the excursion to split the feature");
     }
 
     #[test]

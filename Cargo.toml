@@ -10,6 +10,7 @@ repository = "https://github.com/FahrenheitResearch/radar-rs-analyst"
 
 [workspace.dependencies]
 byteorder = "1.5"
+bytemuck = { version = "1.25", features = ["derive"] }
 bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 eframe = "0.34.3"

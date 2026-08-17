@@ -10,11 +10,12 @@ use analyst_runtime::{
 use chrono::SecondsFormat;
 use color_tables::ColorTableSet;
 use eframe::egui;
+use map_scene::MapSceneController;
 use radar_core::RadarVolume;
 
 use crate::live_service::{LiveService, LiveUpdate, default_live_cache_dir};
 use crate::load_service::{LoadRequest, LoadService, LoadUpdate, LoadedVolume};
-use crate::pane_canvas::{PaneTexture, draw_pane, pane_rects};
+use crate::pane_canvas::{PaneMap, PaneTexture, draw_pane, pane_rects};
 use crate::product::DisplayProduct;
 use crate::render_service::{RenderRequest, RenderService, RenderUpdate, RenderedPane};
 
@@ -61,6 +62,7 @@ pub struct WorkstationApp {
     status: String,
     load_ms: Option<f32>,
     last_playback_step: Instant,
+    map_scene: MapSceneController,
     live_service: LiveService,
     live_cache_dir: PathBuf,
     site_text: String,
@@ -84,7 +86,11 @@ impl WorkstationApp {
             history: VolumeHistory::default(),
             load_service: LoadService::new(context.clone()),
             render_service: RenderService::new(context.clone()),
-            live_service: LiveService::new(context),
+            live_service: LiveService::new(context.clone()),
+            map_scene: {
+                let repaint_context = context.clone();
+                MapSceneController::new(move || repaint_context.request_repaint())
+            },
             session_clock: GenerationClock::default(),
             frame_clock: GenerationClock::default(),
             pane_clocks: [GenerationClock::default(); analyst_runtime::MAX_PANES],
@@ -268,6 +274,17 @@ impl WorkstationApp {
         if loaded.generation != self.session_clock.current() {
             return;
         }
+        // Anchor the map at the radar this volume came from. Re-anchoring is a
+        // no-op when the site is unchanged, so ordinary frame installs are
+        // free; a genuine site change invalidates every retained generation.
+        if let (Some(latitude), Some(longitude)) = (
+            loaded.volume.site.latitude_deg,
+            loaded.volume.site.longitude_deg,
+        ) {
+            self.map_scene
+                .set_radar_anchor(f64::from(latitude), f64::from(longitude));
+        }
+
         let before = self.current_frame_signature();
         let stage = loaded.stage;
         let report = self.history.install(VolumeFrame::new(
@@ -522,6 +539,14 @@ impl WorkstationApp {
                 .and_then(|volume| self.resolve_cut_index(pane, volume));
             let title = pane_title(volume.as_deref(), pane, product, cut_index);
             let status = self.panes[pane.index()].status.clone();
+            // Ask the scene for this pane's LOD. Once resident this is a cache
+            // lookup; it queues a build only when the bucket is new.
+            let pane_map = PaneMap {
+                geometry: self
+                    .map_scene
+                    .geometry_for_pane(pane.index(), camera.sanitized().km_per_point),
+                projection: self.map_scene.projection(),
+            };
             let interaction = {
                 let texture =
                     self.panes[pane.index()]
@@ -539,6 +564,7 @@ impl WorkstationApp {
                     pane == self.workspace.active_pane,
                     camera,
                     texture,
+                    &pane_map,
                     &title,
                     &status,
                 )
@@ -856,6 +882,7 @@ impl eframe::App for WorkstationApp {
         self.handle_dropped_files(&context);
         self.poll_live_results();
         self.poll_load_results();
+        self.map_scene.poll();
         self.poll_render_results(&context);
         self.advance_playback(&context);
 

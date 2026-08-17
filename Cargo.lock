@@ -2023,6 +2023,8 @@ name = "map_scene"
 version = "0.2.0"
 dependencies = [
  "analyst_runtime",
+ "bytemuck",
+ "eframe",
  "radar_core",
 ]
 
@@ -4858,6 +4860,7 @@ dependencies = [
  "color_tables",
  "data_source",
  "eframe",
+ "map_scene",
  "nexrad_io",
  "radar_core",
  "render2d",

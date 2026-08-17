@@ -6,4 +6,8 @@ license.workspace = true
 
 [dependencies]
 analyst_runtime = { path = "../analyst_runtime" }
+bytemuck = { workspace = true }
+# `eframe` is the graphics backend here: it re-exports `egui_wgpu` and `wgpu`,
+# so the workstation never depends on either of them directly.
+eframe.workspace = true
 radar_core = { path = "../radar_core" }

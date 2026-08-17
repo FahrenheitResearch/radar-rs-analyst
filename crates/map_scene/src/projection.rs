@@ -88,19 +88,26 @@ impl RadarProjection {
         }
     }
 
-    /// Project geographic coordinates into radar-local world kilometres.
-    pub fn lon_lat_to_world(&self, lon_deg: f64, lat_deg: f64) -> WorldPoint {
-        let Some((distance_m, azimuth_rad)) = self.inverse_geodesic(lon_deg, lat_deg) else {
-            // Non-convergent, i.e. effectively antipodal. Such a point is far
-            // outside any build region; park it at the origin rather than
-            // returning a NaN that would poison a vertex buffer.
-            return WorldPoint::ORIGIN;
-        };
+    /// Project geographic coordinates into radar-local world kilometres,
+    /// or `None` where the geodesic does not converge (effectively antipodal
+    /// points). Geometry builders must drop those rather than substitute a
+    /// position, since any substitute draws a line to somewhere real.
+    pub fn try_lon_lat_to_world(&self, lon_deg: f64, lat_deg: f64) -> Option<WorldPoint> {
+        let (distance_m, azimuth_rad) = self.inverse_geodesic(lon_deg, lat_deg)?;
         let distance_km = distance_m / 1_000.0;
-        WorldPoint {
+        Some(WorldPoint {
             east_km: distance_km * azimuth_rad.sin(),
             north_km: distance_km * azimuth_rad.cos(),
-        }
+        })
+    }
+
+    /// Project geographic coordinates into radar-local world kilometres.
+    ///
+    /// Non-convergent points collapse to the origin. Use
+    /// [`Self::try_lon_lat_to_world`] anywhere that distinction matters.
+    pub fn lon_lat_to_world(&self, lon_deg: f64, lat_deg: f64) -> WorldPoint {
+        self.try_lon_lat_to_world(lon_deg, lat_deg)
+            .unwrap_or(WorldPoint::ORIGIN)
     }
 
     /// Inverse of [`Self::lon_lat_to_world`], returning `(lon_deg, lat_deg)`.
