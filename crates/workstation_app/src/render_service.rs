@@ -39,15 +39,19 @@ pub struct RenderedPane {
     pub elapsed_ms: f32,
 }
 
-pub struct RenderFailure {
-    pub pane: PaneId,
-    pub stamp: RenderStamp,
-    pub message: String,
+struct RenderFailure {
+    pane: PaneId,
+    stamp: RenderStamp,
+    message: String,
 }
 
 pub enum RenderUpdate {
     Completed(RenderedPane),
-    Failed(RenderFailure),
+    Failed {
+        pane: PaneId,
+        stamp: RenderStamp,
+        message: String,
+    },
 }
 
 pub struct RenderService {
@@ -65,7 +69,11 @@ impl RenderService {
                 while let Some((_pane, request)) = request_receiver.recv() {
                     let update = match render_request(request) {
                         Ok(rendered) => RenderUpdate::Completed(rendered),
-                        Err(failure) => RenderUpdate::Failed(failure),
+                        Err(failure) => RenderUpdate::Failed {
+                            pane: failure.pane,
+                            stamp: failure.stamp,
+                            message: failure.message,
+                        },
                     };
                     if result_sender.send(update).is_err() {
                         break;
