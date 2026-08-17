@@ -1,5 +1,5 @@
 use std::array;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,6 @@ struct PaneRuntime {
     pending_stamp: Option<RenderStamp>,
     viewport: Option<ViewportMetrics>,
     status: String,
-    render_ms: Option<f32>,
 }
 
 struct InstalledTexture {
@@ -53,7 +52,6 @@ pub struct WorkstationApp {
     panes: [PaneRuntime; analyst_runtime::MAX_PANES],
     color_tables: Arc<ColorTableSet>,
     source_path_text: String,
-    source_path: Option<PathBuf>,
     status: String,
     load_ms: Option<f32>,
     last_playback_step: Instant,
@@ -82,7 +80,6 @@ impl WorkstationApp {
             panes: array::from_fn(|_| PaneRuntime::default()),
             color_tables: Arc::new(ColorTableSet::default()),
             source_path_text,
-            source_path: None,
             status: "Drop a Level II file here or enter a path above".to_owned(),
             load_ms: None,
             last_playback_step: Instant::now(),
@@ -98,7 +95,6 @@ impl WorkstationApp {
         self.frame_clock.bump();
         self.history.clear();
         self.source_path_text = path.display().to_string();
-        self.source_path = Some(path.clone());
         self.status = format!("Loading {}", path.display());
         self.load_ms = None;
         self.clear_all_panes();
@@ -205,9 +201,7 @@ impl WorkstationApp {
         });
         if can_update {
             if let Some(texture) = &mut runtime.texture {
-                texture
-                    .handle
-                    .set(image, egui::TextureOptions::NEAREST);
+                texture.handle.set(image, egui::TextureOptions::NEAREST);
                 texture.stamp = rendered.stamp;
                 texture.camera = rendered.camera;
                 texture.viewport = rendered.viewport;
@@ -236,7 +230,6 @@ impl WorkstationApp {
             });
         }
         runtime.pending_stamp = None;
-        runtime.render_ms = Some(rendered.elapsed_ms);
         runtime.status = format!("{:.1} ms", rendered.elapsed_ms);
     }
 
@@ -306,11 +299,7 @@ impl WorkstationApp {
                         PaneLayout::TwoHorizontal,
                         PaneLayout::Four,
                     ] {
-                        ui.selectable_value(
-                            &mut selected_layout,
-                            layout,
-                            layout_label(layout),
-                        );
+                        ui.selectable_value(&mut selected_layout, layout, layout_label(layout));
                     }
                 });
 
@@ -376,14 +365,15 @@ impl WorkstationApp {
             let title = pane_title(volume.as_deref(), pane, product, cut_index);
             let status = self.panes[pane.index()].status.clone();
             let interaction = {
-                let texture = self.panes[pane.index()]
-                    .texture
-                    .as_ref()
-                    .map(|texture| PaneTexture {
-                        handle: &texture.handle,
-                        camera: texture.camera,
-                        viewport: texture.viewport,
-                    });
+                let texture =
+                    self.panes[pane.index()]
+                        .texture
+                        .as_ref()
+                        .map(|texture| PaneTexture {
+                            handle: &texture.handle,
+                            camera: texture.camera,
+                            viewport: texture.viewport,
+                        });
                 draw_pane(
                     ui,
                     pane,
@@ -454,10 +444,9 @@ impl WorkstationApp {
             }
 
             if frame_count > 1 {
-                let response = ui.add(
-                    egui::Slider::new(&mut selected, 0..=frame_count - 1)
-                        .show_value(false)
-                        .desired_width(220.0),
+                let response = ui.add_sized(
+                    [220.0, ui.spacing().interact_size.y],
+                    egui::Slider::new(&mut selected, 0..=frame_count - 1).show_value(false),
                 );
                 if response.changed() {
                     choose_frame = Some(selected);
@@ -581,7 +570,6 @@ impl WorkstationApp {
             runtime.texture = None;
             runtime.pending_stamp = None;
             runtime.status.clear();
-            runtime.render_ms = None;
         }
     }
 
@@ -638,7 +626,11 @@ impl WorkstationApp {
     }
 
     fn change_active_tilt(&mut self, delta: isize) {
-        let Some(volume) = self.history.current().map(|frame| Arc::clone(&frame.volume)) else {
+        let Some(volume) = self
+            .history
+            .current()
+            .map(|frame| Arc::clone(&frame.volume))
+        else {
             return;
         };
         let active = self.workspace.active_pane;
@@ -763,17 +755,9 @@ fn color_image_from_rgba(width: u32, height: u32, rgba: &[u8]) -> egui::ColorIma
     assert_eq!(rgba.len(), expected, "invalid renderer RGBA buffer length");
     let pixels = rgba
         .chunks_exact(4)
-        .map(|pixel| {
-            egui::Color32::from_rgba_unmultiplied(pixel[0], pixel[1], pixel[2], pixel[3])
-        })
+        .map(|pixel| egui::Color32::from_rgba_unmultiplied(pixel[0], pixel[1], pixel[2], pixel[3]))
         .collect();
     egui::ColorImage::new([width as usize, height as usize], pixels)
-}
-
-#[allow(dead_code)]
-fn path_label(path: Option<&Path>) -> String {
-    path.map(|path| path.display().to_string())
-        .unwrap_or_else(|| "No source".to_owned())
 }
 
 #[cfg(test)]
