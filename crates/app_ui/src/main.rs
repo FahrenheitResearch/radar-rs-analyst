@@ -17,7 +17,10 @@ use render2d::{
 };
 use serde::Deserialize;
 
-mod basemap_data;
+// The generated basemap tables moved to `map_scene`, their canonical owner.
+// This alias keeps the legacy reference harness compiling against the same
+// data instead of a second nine-megabyte copy.
+use map_scene::generated::basemap_data;
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
