@@ -31,10 +31,7 @@ impl WorldPoint {
     };
 
     pub const fn new(east_km: f64, north_km: f64) -> Self {
-        Self {
-            east_km,
-            north_km,
-        }
+        Self { east_km, north_km }
     }
 }
 
@@ -145,17 +142,12 @@ impl Camera2D {
 
     /// Zoom about a screen point while preserving the world coordinate under
     /// that point. `factor > 1` zooms in.
-    pub fn zoom_about(
-        &mut self,
-        factor: f32,
-        anchor: ScreenPoint,
-        viewport: ViewportMetrics,
-    ) {
+    pub fn zoom_about(&mut self, factor: f32, anchor: ScreenPoint, viewport: ViewportMetrics) {
         let before = self.screen_to_world(anchor, viewport);
         let current = self.sanitized();
         let factor = finite_positive(factor, 1.0);
-        self.km_per_point = (current.km_per_point / factor)
-            .clamp(MIN_KM_PER_POINT, MAX_KM_PER_POINT);
+        self.km_per_point =
+            (current.km_per_point / factor).clamp(MIN_KM_PER_POINT, MAX_KM_PER_POINT);
         self.center_east_km = current.center_east_km;
         self.center_north_km = current.center_north_km;
         self.rotation_rad = current.rotation_rad;
