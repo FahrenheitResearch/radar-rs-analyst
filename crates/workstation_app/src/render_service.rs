@@ -10,9 +10,7 @@ use analyst_runtime::{
 use color_tables::ColorTableSet;
 use eframe::egui;
 use radar_core::RadarVolume;
-use render2d::{
-    StormMotion, ViewportMomentCache, ViewportRasterOptions, viewport_rgba_buffer_len,
-};
+use render2d::{StormMotion, ViewportMomentCache, ViewportRasterOptions, viewport_rgba_buffer_len};
 
 use crate::product::DisplayProduct;
 
