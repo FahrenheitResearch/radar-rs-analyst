@@ -4,7 +4,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Instant;
 
-use analyst_runtime::{FrameStage, Generation, LatestLaneSender, latest_lane_channel};
+use analyst_runtime::{
+    FrameOrigin, FrameStage, Generation, LatestLaneSender, latest_lane_channel,
+};
 use eframe::egui;
 use radar_core::RadarVolume;
 
@@ -15,11 +17,16 @@ const RESULT_QUEUE_CAPACITY: usize = 8;
 pub struct LoadRequest {
     pub generation: Generation,
     pub path: PathBuf,
+    pub origin: FrameOrigin,
+    pub final_stage: FrameStage,
+    pub source_label: String,
 }
 
 pub struct LoadedVolume {
     pub generation: Generation,
     pub path: PathBuf,
+    pub origin: FrameOrigin,
+    pub source_label: String,
     pub stage: FrameStage,
     pub volume: Arc<RadarVolume>,
     pub elapsed_ms: f32,
@@ -29,11 +36,13 @@ pub enum LoadUpdate {
     Started {
         generation: Generation,
         path: PathBuf,
+        source_label: String,
     },
     Volume(LoadedVolume),
     Failed {
         generation: Generation,
         path: PathBuf,
+        source_label: String,
         message: String,
     },
 }
@@ -77,16 +86,31 @@ impl LoadService {
 fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, context: &egui::Context) {
     let generation = request.generation;
     let path = request.path;
+    let origin = request.origin;
+    let final_stage = request.final_stage;
+    let source_label = request.source_label;
     let _ = sender.send(LoadUpdate::Started {
         generation,
         path: path.clone(),
+        source_label: source_label.clone(),
     });
     context.request_repaint();
 
     let started = Instant::now();
     let result = std::fs::read(&path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))
-        .and_then(|raw| decode_with_previews(&raw, generation, &path, started, sender, context));
+        .and_then(|raw| {
+            decode_with_previews(
+                &raw,
+                generation,
+                &path,
+                origin,
+                &source_label,
+                started,
+                sender,
+                context,
+            )
+        });
 
     match result {
         Ok(mut volume) => {
@@ -94,7 +118,9 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
             let _ = sender.send(LoadUpdate::Volume(LoadedVolume {
                 generation,
                 path,
-                stage: FrameStage::Complete,
+                origin,
+                source_label,
+                stage: final_stage,
                 volume: Arc::new(volume),
                 elapsed_ms: started.elapsed().as_secs_f32() * 1_000.0,
             }));
@@ -103,6 +129,7 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
             let _ = sender.send(LoadUpdate::Failed {
                 generation,
                 path,
+                source_label,
                 message,
             });
         }
@@ -110,10 +137,13 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
     context.request_repaint();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_with_previews(
     raw: &[u8],
     generation: Generation,
     path: &Path,
+    origin: FrameOrigin,
+    source_label: &str,
     started: Instant,
     sender: &SyncSender<LoadUpdate>,
     context: &egui::Context,
@@ -123,6 +153,8 @@ fn decode_with_previews(
         let update = LoadUpdate::Volume(LoadedVolume {
             generation,
             path: path.to_path_buf(),
+            origin,
+            source_label: source_label.to_owned(),
             stage: FrameStage::Preview,
             volume: Arc::new(preview),
             elapsed_ms: started.elapsed().as_secs_f32() * 1_000.0,
