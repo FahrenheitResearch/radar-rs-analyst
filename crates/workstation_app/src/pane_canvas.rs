@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use analyst_runtime::{Camera2D, PaneId, PaneLayout, ScreenPoint, ViewportMetrics, WorldPoint};
+use color_tables::hazards::{HAZARD_FILL_ALPHA, HAZARD_STROKE_WIDTH};
 use eframe::egui;
 use map_scene::gpu::MapPaintCallback;
 use map_scene::{MapGeometry, RadarProjection};
+
+use crate::hazards::PlacedHazard;
 
 const PANE_GAP: f32 = 3.0;
 const HEADER_HEIGHT: f32 = 26.0;
@@ -27,6 +30,8 @@ pub struct PaneMap {
     pub sites: Arc<[PlacedSite]>,
     /// The site currently being displayed, drawn as selected.
     pub active_site: Option<String>,
+    /// Warning polygons in force, already projected, least severe first.
+    pub hazards: Arc<[PlacedHazard]>,
 }
 
 /// A radar site at a known world position, ready to draw and hit-test.
@@ -161,6 +166,9 @@ pub fn draw_pane(
         paint_transformed_texture(&painter, rect, updated_camera, viewport, texture);
     }
     draw_map_labels(&painter, rect, updated_camera, viewport, map);
+    // Warnings over the labels: a tornado box must never be the thing a county
+    // name is drawn on top of.
+    draw_hazards(&painter, rect, updated_camera, viewport, map);
     let clicked_site = draw_radar_sites(
         ui,
         &painter,
@@ -191,6 +199,162 @@ pub fn draw_pane(
         viewport,
         clicked_site,
     }
+}
+
+/// Draw the warning polygons that reach this pane.
+///
+/// Positions arrive already projected, so this only applies the camera
+/// transform and culls. Hazards are handed over least severe first, so the
+/// worst one is painted last and its outline wins where two overlap.
+fn draw_hazards(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    camera: Camera2D,
+    viewport: ViewportMetrics,
+    map: &PaneMap,
+) {
+    for hazard in map.hazards.iter() {
+        let points: Vec<egui::Pos2> = hazard
+            .points
+            .iter()
+            .map(|world| {
+                let screen = camera.world_to_screen(*world, viewport);
+                egui::pos2(rect.left() + screen.x, rect.top() + screen.y)
+            })
+            .collect();
+        if points.len() < 3 {
+            continue;
+        }
+
+        // Cull on the PROJECTED bounds rather than on latitude and longitude:
+        // at a continental zoom the two differ enough that a lat/lon test drops
+        // polygons that are in fact on screen.
+        let mut bounds = egui::Rect::NOTHING;
+        for point in &points {
+            bounds = bounds.union(egui::Rect::from_min_max(*point, *point));
+        }
+        if !rect.intersects(bounds) {
+            continue;
+        }
+
+        let color = hazard.color;
+        let fill = egui::Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            HAZARD_FILL_ALPHA,
+        );
+        let width = if hazard.emphatic {
+            HAZARD_STROKE_WIDTH * 1.8
+        } else {
+            HAZARD_STROKE_WIDTH
+        };
+
+        if !hazard.triangles.is_empty() {
+            painter.add(egui::Shape::mesh(fill_mesh(
+                &points,
+                &hazard.triangles,
+                fill,
+            )));
+        }
+        // The outline is a CLOSED line rather than the polygon's own stroke: a
+        // warning polygon is frequently concave, and a stroke applied to a
+        // triangulated shape cuts across the notch.
+        let mut outline = points.clone();
+        outline.push(points[0]);
+        painter.add(egui::Shape::line(outline, egui::Stroke::new(width, color)));
+
+        draw_hazard_motion(painter, &points, hazard, width);
+        draw_hazard_tag(painter, &points, hazard);
+    }
+}
+
+/// Build the fill from the triangles worked out at placement time.
+///
+/// The camera is a translate and a scale, so a triangulation computed in world
+/// kilometres stays valid in screen points -- which is why this pass only
+/// transforms vertices and never re-triangulates.
+fn fill_mesh(points: &[egui::Pos2], triangles: &[[u32; 3]], fill: egui::Color32) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
+    for point in points {
+        mesh.colored_vertex(*point, fill);
+    }
+    for [a, b, c] in triangles {
+        mesh.add_triangle(*a, *b, *c);
+    }
+    mesh
+}
+
+/// Storm motion, drawn from the centroid toward where the storm is GOING.
+///
+/// The bulletin reports the direction the storm comes FROM, so the vector is
+/// that bearing plus 180 degrees.
+fn draw_hazard_motion(
+    painter: &egui::Painter,
+    points: &[egui::Pos2],
+    hazard: &PlacedHazard,
+    width: f32,
+) {
+    let Some((from_degrees, knots)) = hazard.motion else {
+        return;
+    };
+    let count = points.len() as f32;
+    let centroid = egui::pos2(
+        points.iter().map(|point| point.x).sum::<f32>() / count,
+        points.iter().map(|point| point.y).sum::<f32>() / count,
+    );
+    let heading = (f32::from(from_degrees) + 180.0).to_radians();
+    // Length scales with speed but is capped: a 60 kt arrow that reaches
+    // across the county says nothing extra.
+    let length = (f32::from(knots) * 0.9).clamp(14.0, 54.0);
+    let tip = egui::pos2(
+        centroid.x + heading.sin() * length,
+        centroid.y - heading.cos() * length,
+    );
+    let stroke = egui::Stroke::new(width, hazard.color);
+    painter.line_segment([centroid, tip], stroke);
+    for side in [-1.0_f32, 1.0] {
+        let barb = heading + side * 150.0_f32.to_radians();
+        painter.line_segment(
+            [
+                tip,
+                egui::pos2(tip.x + barb.sin() * 7.0, tip.y - barb.cos() * 7.0),
+            ],
+            stroke,
+        );
+    }
+}
+
+/// The short tag, at the NORTHERNMOST vertex -- the top of the polygon on
+/// screen, which is where there is reliably room outside the shape.
+fn draw_hazard_tag(painter: &egui::Painter, points: &[egui::Pos2], hazard: &PlacedHazard) {
+    if hazard.tag.is_empty() {
+        return;
+    }
+    let top = points
+        .iter()
+        .copied()
+        .min_by(|a, b| a.y.total_cmp(&b.y))
+        .unwrap_or(points[0]);
+    let at = egui::pos2(top.x, top.y - 7.0);
+    // A one-pixel dark halo, because a warning tag lands on radar as often as
+    // on the basemap and has to read on both.
+    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+        painter.text(
+            egui::pos2(at.x + dx, at.y + dy),
+            egui::Align2::CENTER_BOTTOM,
+            &hazard.tag,
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_rgb(6, 9, 13),
+        );
+    }
+    painter.text(
+        at,
+        egui::Align2::CENTER_BOTTOM,
+        &hazard.tag,
+        egui::FontId::monospace(10.0),
+        hazard.color,
+    );
 }
 
 /// Draw radar site markers and report one if it was clicked.

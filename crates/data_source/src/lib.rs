@@ -1,5 +1,7 @@
 //! Public radar data-source helpers.
 
+pub mod warnings;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;

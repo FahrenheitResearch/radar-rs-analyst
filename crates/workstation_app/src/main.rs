@@ -3,12 +3,18 @@ use std::path::PathBuf;
 use eframe::egui;
 
 mod app;
+mod hazards;
 mod live_service;
 mod load_service;
 mod pane_canvas;
 mod product;
 mod render_service;
 mod sites_service;
+mod warnings_service;
+
+/// Overrides where warnings come from, for a daemon that is not on this
+/// machine. A base URL selects it; `off` pins the public feed.
+const WARNINGS_URL_ENV: &str = "RADAR_WORKSTATION_WARNINGS_URL";
 
 /// Startup intent parsed from the command line: a Level II file to open or a
 /// site to go live on, plus an optional starting camera.
@@ -23,10 +29,13 @@ struct Startup {
     live_site: Option<String>,
     zoom_km_per_point: Option<f32>,
     center_km: Option<(f64, f64)>,
+    /// Warnings source, as written on the command line. `None` falls back to
+    /// [`WARNINGS_URL_ENV`] and then to the default.
+    warnings_url: Option<String>,
 }
 
 /// `radar-workstation [<level2-file>] [--live <SITE>] [--zoom <km-per-point>]
-/// [--center <east_km,north_km>]`
+/// [--center <east_km,north_km>] [--warnings-url <base-url|off>]`
 fn parse_startup<I: Iterator<Item = String>>(args: I) -> Startup {
     let mut startup = Startup::default();
     let mut pending: Option<String> = None;
@@ -51,6 +60,7 @@ fn parse_startup<I: Iterator<Item = String>>(args: I) -> Startup {
 fn apply_option(startup: &mut Startup, option: &str, value: &str) {
     match option {
         "--live" => startup.live_site = Some(value.to_owned()),
+        "--warnings-url" => startup.warnings_url = Some(value.to_owned()),
         "--zoom" => startup.zoom_km_per_point = value.parse().ok(),
         "--center" => {
             if let Some((east, north)) = value.split_once(',')
@@ -63,13 +73,24 @@ fn apply_option(startup: &mut Startup, option: &str, value: &str) {
     }
 }
 
+/// Resolve where warnings come from: the command line first, then the
+/// environment, then the default.
+fn warnings_source(from_command_line: Option<String>) -> data_source::warnings::WarningsSource {
+    from_command_line
+        .or_else(|| std::env::var(WARNINGS_URL_ENV).ok())
+        .map(|value| data_source::warnings::WarningsSource::parse(&value))
+        .unwrap_or_default()
+}
+
 fn main() -> eframe::Result {
     let Startup {
         input_path,
         live_site,
         zoom_km_per_point,
         center_km,
+        warnings_url,
     } = parse_startup(std::env::args().skip(1));
+    let warnings_source = warnings_source(warnings_url);
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
@@ -102,7 +123,8 @@ fn main() -> eframe::Result {
                 ),
             }
 
-            let mut app = app::WorkstationApp::new(creation_context, input_path, live_site);
+            let mut app =
+                app::WorkstationApp::new(creation_context, input_path, live_site, warnings_source);
             app.set_initial_camera(zoom_km_per_point, center_km);
             Ok(Box::new(app))
         }),

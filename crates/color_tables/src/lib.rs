@@ -1,5 +1,7 @@
 //! Fast color table parsing and sampling for radar renderers.
 
+pub mod hazards;
+
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};

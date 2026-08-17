@@ -13,12 +13,23 @@ use eframe::egui;
 use map_scene::MapSceneController;
 use radar_core::RadarVolume;
 
+use data_source::warnings::{WarningRecord, WarningsSource, WarningsState};
+
+use crate::hazards::{PlacedHazard, place_hazards};
 use crate::live_service::{LiveService, LiveUpdate, default_live_cache_dir};
 use crate::load_service::{LoadRequest, LoadService, LoadUpdate, LoadedVolume};
 use crate::pane_canvas::{PaneMap, PaneTexture, PlacedSite, draw_pane, pane_rects};
 use crate::product::DisplayProduct;
 use crate::render_service::{RenderRequest, RenderService, RenderUpdate, RenderedPane};
 use crate::sites_service::{LocatedSite, SitesService};
+use crate::warnings_service::WarningsService;
+
+/// How often placed hazards are rebuilt so expiries take effect.
+///
+/// Placement filters by "now", so it goes stale on its own even when nothing
+/// arrives. A warning ends on a whole minute, so checking twice a minute is
+/// enough to never leave an expired polygon on screen for long.
+const HAZARD_REPLACEMENT_INTERVAL: Duration = Duration::from_secs(30);
 
 enum LiveAction {
     Start(String),
@@ -78,6 +89,13 @@ pub struct WorkstationApp {
     site_text: String,
     live_site: Option<String>,
     live_status: String,
+    warnings_service: WarningsService,
+    warnings: Vec<WarningRecord>,
+    warnings_state: WarningsState,
+    show_warnings: bool,
+    placed_hazards: Arc<[PlacedHazard]>,
+    placed_hazards_projection: Option<map_scene::ProjectionId>,
+    placed_hazards_at: Option<Instant>,
 }
 
 impl WorkstationApp {
@@ -85,6 +103,7 @@ impl WorkstationApp {
         creation_context: &eframe::CreationContext<'_>,
         input_path: Option<PathBuf>,
         live_site: Option<String>,
+        warnings_source: WarningsSource,
     ) -> Self {
         let context = creation_context.egui_ctx.clone();
         let source_path_text = input_path
@@ -113,7 +132,7 @@ impl WorkstationApp {
             load_ms: None,
             last_playback_step: Instant::now(),
             showing_placeholder_map: false,
-            sites_service: SitesService::new(context),
+            sites_service: SitesService::new(context.clone()),
             sites: Vec::new(),
             placed_sites: Vec::new().into(),
             placed_sites_projection: None,
@@ -121,6 +140,13 @@ impl WorkstationApp {
             site_text: String::new(),
             live_site: None,
             live_status: String::new(),
+            warnings_service: WarningsService::new(context, warnings_source),
+            warnings: Vec::new(),
+            warnings_state: WarningsState::Unknown,
+            show_warnings: true,
+            placed_hazards: Vec::new().into(),
+            placed_hazards_projection: None,
+            placed_hazards_at: None,
         };
         if let Some(path) = input_path {
             app.begin_load(path);
@@ -287,6 +313,61 @@ impl WorkstationApp {
             .collect::<Vec<_>>()
             .into();
         self.placed_sites_projection = Some(projection.id());
+    }
+
+    /// Hover text for the warnings chip.
+    ///
+    /// The chip's own number is every alert in force, and most of those are
+    /// county-coded products that carry no polygon at all -- 442 active against
+    /// 148 with geometry, measured on 2026-08-17. Saying how many are actually
+    /// drawn stops the chip reading as a claim about the picture.
+    fn warnings_hover(&self) -> String {
+        let detail = self.warnings_state.detail();
+        if self.show_warnings {
+            format!("{detail} · {} drawn here", self.placed_hazards.len())
+        } else {
+            format!("{detail} · hidden")
+        }
+    }
+
+    fn poll_warnings(&mut self) {
+        while let Some(update) = self.warnings_service.try_recv() {
+            self.warnings_state = update.state;
+            // A failed poll leaves the previous records alone: blanking the map
+            // on one bad round trip would be a worse lie than a stale polygon,
+            // and the chip already says the feed is offline.
+            if let Some(records) = update.records {
+                self.warnings = records;
+                self.placed_hazards_at = None;
+            }
+        }
+    }
+
+    /// Project the warnings in force into world kilometres.
+    ///
+    /// Rebuilt when the anchor changes, when new records arrive, and on a slow
+    /// timer so an expiry takes effect without waiting for the next poll.
+    fn refresh_placed_hazards(&mut self) {
+        if !self.show_warnings {
+            if !self.placed_hazards.is_empty() {
+                self.placed_hazards = Vec::new().into();
+                self.placed_hazards_at = None;
+            }
+            return;
+        }
+        let Some(projection) = self.map_scene.projection() else {
+            return;
+        };
+        let stale = self
+            .placed_hazards_at
+            .is_none_or(|at| at.elapsed() >= HAZARD_REPLACEMENT_INTERVAL);
+        if !stale && self.placed_hazards_projection == Some(projection.id()) {
+            return;
+        }
+        let now = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        self.placed_hazards = place_hazards(&self.warnings, &now, &projection).into();
+        self.placed_hazards_projection = Some(projection.id());
+        self.placed_hazards_at = Some(Instant::now());
     }
 
     fn poll_live_results(&mut self) {
@@ -542,6 +623,7 @@ impl WorkstationApp {
             .iter()
             .all(|pane| self.workspace.pane(*pane).links.camera == Some(0));
         let mut toggle_camera_links = false;
+        let mut toggle_warnings = false;
 
         ui.horizontal_wrapped(|ui| {
             ui.strong("Radar Workstation");
@@ -571,6 +653,20 @@ impl WorkstationApp {
             }
             if !self.live_status.is_empty() {
                 ui.label(&self.live_status);
+            }
+
+            ui.separator();
+            // Its own chip, so an analyst can tell "no warnings out" from "we
+            // are not receiving warnings".
+            let chip = match self.warnings_state.active() {
+                Some(active) => format!("{} · {active}", self.warnings_state.label()),
+                None => self.warnings_state.label().to_owned(),
+            };
+            let response = ui
+                .selectable_label(self.show_warnings, chip)
+                .on_hover_text(self.warnings_hover());
+            if response.clicked() {
+                toggle_warnings = true;
             }
 
             ui.separator();
@@ -633,6 +729,17 @@ impl WorkstationApp {
         if tilt_delta != 0 {
             self.change_active_tilt(tilt_delta);
         }
+        if toggle_warnings {
+            self.show_warnings = !self.show_warnings;
+            // Force placement now rather than at the next cadence, so the map
+            // answers the click on this frame.
+            self.placed_hazards_at = None;
+            self.placed_hazards_projection = None;
+            self.refresh_placed_hazards();
+            if self.show_warnings {
+                self.warnings_service.refresh();
+            }
+        }
         if toggle_camera_links {
             let new_group = (!cameras_linked).then_some(0);
             for pane in self.workspace.visible_panes() {
@@ -663,6 +770,7 @@ impl WorkstationApp {
                 projection: self.map_scene.projection(),
                 sites: Arc::clone(&self.placed_sites),
                 active_site: self.live_site.clone(),
+                hazards: Arc::clone(&self.placed_hazards),
             };
             let interaction = {
                 let texture =
@@ -1005,8 +1113,10 @@ impl eframe::App for WorkstationApp {
         self.poll_live_results();
         self.poll_load_results();
         self.poll_site_directory();
+        self.poll_warnings();
         self.map_scene.poll();
         self.refresh_placed_sites();
+        self.refresh_placed_hazards();
         self.poll_render_results(&context);
         self.advance_playback(&context);
 
