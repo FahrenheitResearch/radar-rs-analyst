@@ -130,7 +130,12 @@ impl DisplayProduct {
         if volume.cuts.is_empty() {
             return None;
         }
-        let mut index = current.min(volume.cuts.len() - 1) as isize;
+        let current = current.min(volume.cuts.len() - 1);
+        if delta == 0 {
+            return self.is_available_in_cut(volume, current).then_some(current);
+        }
+
+        let mut index = current as isize;
         loop {
             index = index.saturating_add(delta);
             if index < 0 || index >= volume.cuts.len() as isize {
