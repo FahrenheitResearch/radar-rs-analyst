@@ -25,6 +25,6 @@ pub use view::{
     MIN_KM_PER_POINT, RasterView, ScreenPoint, ViewportMetrics, WorldPoint,
 };
 pub use workspace::{
-    MAX_PANES, PaneId, PaneIntent, PaneLayout, PaneLinkGroups, SmoothingMode,
-    StormMotionIntent, TiltSelection, WorkspaceState,
+    MAX_PANES, PaneId, PaneIntent, PaneLayout, PaneLinkGroups, SmoothingMode, StormMotionIntent,
+    TiltSelection, WorkspaceState,
 };
