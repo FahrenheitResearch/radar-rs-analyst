@@ -188,7 +188,7 @@ fn draw_range_rings(
     let radar = camera.world_to_screen(WorldPoint::ORIGIN, viewport);
     let center = egui::pos2(rect.left() + radar.x, rect.top() + radar.y);
     let stroke = egui::Stroke::new(
-        0.8,
+        0.8_f32,
         egui::Color32::from_rgba_unmultiplied(170, 190, 205, 88),
     );
     for range_km in RANGE_RINGS_KM {
@@ -270,7 +270,7 @@ fn draw_border(painter: &egui::Painter, rect: egui::Rect, active: bool) {
     } else {
         egui::Color32::from_rgb(45, 57, 67)
     };
-    let width = if active { 2.0 } else { 1.0 };
+    let width = if active { 2.0_f32 } else { 1.0_f32 };
     let stroke = egui::Stroke::new(width, color);
     painter.line_segment([rect.left_top(), rect.right_top()], stroke);
     painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
