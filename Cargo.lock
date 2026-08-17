@@ -147,6 +147,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "analyst_runtime"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "radar_core",
+ "serde",
+]
+
+[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4829,6 +4838,20 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "workstation_app"
+version = "0.2.0"
+dependencies = [
+ "analyst_runtime",
+ "chrono",
+ "color_tables",
+ "data_source",
+ "eframe",
+ "nexrad_io",
+ "radar_core",
+ "render2d",
 ]
 
 [[package]]

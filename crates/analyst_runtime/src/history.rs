@@ -325,11 +325,11 @@ impl VolumeHistory {
             });
         }
 
+        // Snap to the newest frame when following the live edge, and also when
+        // eviction left the selection unset or past the end.
         if self.frames.is_empty() {
             self.selected = None;
-        } else if self.follow_live {
-            self.selected = Some(self.frames.len() - 1);
-        } else if self.selected.is_none_or(|index| index >= self.frames.len()) {
+        } else if self.follow_live || self.selected.is_none_or(|index| index >= self.frames.len()) {
             self.selected = Some(self.frames.len() - 1);
         }
         evicted
