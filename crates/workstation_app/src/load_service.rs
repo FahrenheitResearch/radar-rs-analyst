@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Instant;
 
@@ -70,10 +70,7 @@ impl LoadService {
     }
 
     pub fn try_recv(&self) -> Option<LoadUpdate> {
-        match self.receiver.try_recv() {
-            Ok(update) => Some(update),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.receiver.try_recv().ok()
     }
 }
 
