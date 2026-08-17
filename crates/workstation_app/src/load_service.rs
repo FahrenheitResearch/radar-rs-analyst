@@ -4,9 +4,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Instant;
 
-use analyst_runtime::{
-    FrameOrigin, FrameStage, Generation, LatestLaneSender, latest_lane_channel,
-};
+use analyst_runtime::{FrameOrigin, FrameStage, Generation, LatestLaneSender, latest_lane_channel};
 use eframe::egui;
 use radar_core::RadarVolume;
 
@@ -22,9 +20,11 @@ pub struct LoadRequest {
     pub source_label: String,
 }
 
+/// The decoded file itself is preserved on `volume.metadata.source_path`;
+/// `source_label` carries the display identity (a file path, or a live
+/// site and volume time).
 pub struct LoadedVolume {
     pub generation: Generation,
-    pub path: PathBuf,
     pub origin: FrameOrigin,
     pub source_label: String,
     pub stage: FrameStage,
@@ -35,13 +35,11 @@ pub struct LoadedVolume {
 pub enum LoadUpdate {
     Started {
         generation: Generation,
-        path: PathBuf,
         source_label: String,
     },
     Volume(LoadedVolume),
     Failed {
         generation: Generation,
-        path: PathBuf,
         source_label: String,
         message: String,
     },
@@ -91,7 +89,6 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
     let source_label = request.source_label;
     let _ = sender.send(LoadUpdate::Started {
         generation,
-        path: path.clone(),
         source_label: source_label.clone(),
     });
     context.request_repaint();
@@ -117,7 +114,6 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
             volume.metadata.source_path = Some(path.display().to_string());
             let _ = sender.send(LoadUpdate::Volume(LoadedVolume {
                 generation,
-                path,
                 origin,
                 source_label,
                 stage: final_stage,
@@ -128,7 +124,6 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
         Err(message) => {
             let _ = sender.send(LoadUpdate::Failed {
                 generation,
-                path,
                 source_label,
                 message,
             });
@@ -152,7 +147,6 @@ fn decode_with_previews(
         preview.metadata.source_path = Some(path.display().to_string());
         let update = LoadUpdate::Volume(LoadedVolume {
             generation,
-            path: path.to_path_buf(),
             origin,
             source_label: source_label.to_owned(),
             stage: FrameStage::Preview,

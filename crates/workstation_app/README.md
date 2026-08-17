@@ -18,6 +18,12 @@ Open a local Level II file by dropping it onto the window, entering its path in 
 cargo run --release -p workstation_app --bin radar-workstation -- /path/to/KRTX-volume
 ```
 
+Start a live session directly from the command line:
+
+```text
+cargo run --release -p workstation_app --bin radar-workstation -- --live KTLX
+```
+
 For public real-time Level II, enter a four-character radar identifier such as `KRTX` and select **Start live**. The source worker installs decode previews, growing partial volumes, and the immutable completed replacement under the same history identity.
 
 ## Implemented in the current stacked branch

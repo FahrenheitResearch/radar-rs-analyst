@@ -12,10 +12,16 @@ use color_tables::ColorTableSet;
 use eframe::egui;
 use radar_core::RadarVolume;
 
+use crate::live_service::{LiveService, LiveUpdate, default_live_cache_dir};
 use crate::load_service::{LoadRequest, LoadService, LoadUpdate, LoadedVolume};
 use crate::pane_canvas::{PaneTexture, draw_pane, pane_rects};
 use crate::product::DisplayProduct;
 use crate::render_service::{RenderRequest, RenderService, RenderUpdate, RenderedPane};
+
+enum LiveAction {
+    Start(String),
+    Stop,
+}
 
 const MAX_LOAD_RESULTS_PER_FRAME: usize = 4;
 const MAX_RENDER_RESULTS_PER_FRAME: usize = 4;
@@ -55,12 +61,18 @@ pub struct WorkstationApp {
     status: String,
     load_ms: Option<f32>,
     last_playback_step: Instant,
+    live_service: LiveService,
+    live_cache_dir: PathBuf,
+    site_text: String,
+    live_site: Option<String>,
+    live_status: String,
 }
 
 impl WorkstationApp {
     pub fn new(
         creation_context: &eframe::CreationContext<'_>,
         input_path: Option<PathBuf>,
+        live_site: Option<String>,
     ) -> Self {
         let context = creation_context.egui_ctx.clone();
         let source_path_text = input_path
@@ -71,7 +83,8 @@ impl WorkstationApp {
             workspace: WorkspaceState::default(),
             history: VolumeHistory::default(),
             load_service: LoadService::new(context.clone()),
-            render_service: RenderService::new(context),
+            render_service: RenderService::new(context.clone()),
+            live_service: LiveService::new(context),
             session_clock: GenerationClock::default(),
             frame_clock: GenerationClock::default(),
             pane_clocks: [GenerationClock::default(); analyst_runtime::MAX_PANES],
@@ -83,14 +96,27 @@ impl WorkstationApp {
             status: "Drop a Level II file here or enter a path above".to_owned(),
             load_ms: None,
             last_playback_step: Instant::now(),
+            live_cache_dir: default_live_cache_dir(),
+            site_text: String::new(),
+            live_site: None,
+            live_status: String::new(),
         };
         if let Some(path) = input_path {
             app.begin_load(path);
+        }
+        if let Some(site) = live_site {
+            app.site_text = site.trim().to_uppercase();
+            app.start_live(site);
         }
         app
     }
 
     fn begin_load(&mut self, path: PathBuf) {
+        if self.live_site.is_some() {
+            self.live_service.stop();
+            self.live_site = None;
+            self.live_status.clear();
+        }
         let generation = self.session_clock.bump();
         self.frame_clock.bump();
         self.history.clear();
@@ -98,8 +124,114 @@ impl WorkstationApp {
         self.status = format!("Loading {}", path.display());
         self.load_ms = None;
         self.clear_all_panes();
-        if let Err(request) = self.load_service.request(LoadRequest { generation, path }) {
+        let source_label = path.display().to_string();
+        if let Err(request) = self.load_service.request(LoadRequest {
+            generation,
+            path,
+            origin: FrameOrigin::Local,
+            final_stage: FrameStage::Complete,
+            source_label,
+        }) {
             self.status = format!("load worker is closed: {}", request.path.display());
+        }
+    }
+
+    /// Start a live session for `site`. The generation bump invalidates every
+    /// in-flight local or previous-site result before the new session installs.
+    fn start_live(&mut self, site: String) {
+        let generation = self.session_clock.bump();
+        self.frame_clock.bump();
+        self.history.clear();
+        self.load_ms = None;
+        self.clear_all_panes();
+        let label = site.trim().to_uppercase();
+        match self
+            .live_service
+            .start(generation, site, self.live_cache_dir.clone())
+        {
+            Ok(()) => {
+                let site = label;
+                self.status = format!("Starting live {site}");
+                self.live_status = "connecting".to_owned();
+                self.live_site = Some(site);
+            }
+            Err(message) => {
+                self.status = message;
+                self.live_status.clear();
+                self.live_site = None;
+            }
+        }
+    }
+
+    /// Stop the live session. The generation bump means a download that is
+    /// already in flight cannot install after the user has stopped.
+    fn stop_live(&mut self) {
+        self.live_service.stop();
+        self.session_clock.bump();
+        self.live_site = None;
+        self.live_status.clear();
+        self.status = "Live session stopped".to_owned();
+    }
+
+    fn poll_live_results(&mut self) {
+        for _ in 0..MAX_LOAD_RESULTS_PER_FRAME {
+            let Some(update) = self.live_service.try_recv() else {
+                break;
+            };
+            match update {
+                LiveUpdate::Started { generation, site } => {
+                    if generation == self.session_clock.current() {
+                        self.status = format!("Live {site}");
+                        self.live_status = "waiting for volume".to_owned();
+                    }
+                }
+                LiveUpdate::VolumeReady {
+                    generation,
+                    site,
+                    path,
+                    stage,
+                    volume_time,
+                    chunk_count,
+                    total_size,
+                    cache_hit,
+                } => {
+                    if generation != self.session_clock.current() {
+                        continue;
+                    }
+                    self.live_status = format!(
+                        "{} chunk(s) · {:.1} MiB · {}",
+                        chunk_count,
+                        total_size as f64 / (1_024.0 * 1_024.0),
+                        if cache_hit { "cached" } else { "downloaded" }
+                    );
+                    let source_label = format!(
+                        "{site} {}",
+                        volume_time.to_rfc3339_opts(SecondsFormat::Secs, true)
+                    );
+                    if let Err(request) = self.load_service.request(LoadRequest {
+                        generation,
+                        path,
+                        origin: FrameOrigin::Live,
+                        final_stage: stage,
+                        source_label,
+                    }) {
+                        self.status = format!("load worker is closed: {}", request.path.display());
+                    }
+                }
+                LiveUpdate::Failed {
+                    generation,
+                    site,
+                    message,
+                } => {
+                    if generation == self.session_clock.current() {
+                        self.status = format!("{site}: {message}");
+                        self.live_status = "error".to_owned();
+                    }
+                }
+                LiveUpdate::Stopped => {
+                    self.live_status.clear();
+                }
+            }
         }
     }
 
@@ -109,19 +241,22 @@ impl WorkstationApp {
                 break;
             };
             match update {
-                LoadUpdate::Started { generation, path } => {
+                LoadUpdate::Started {
+                    generation,
+                    source_label,
+                } => {
                     if generation == self.session_clock.current() {
-                        self.status = format!("Decoding {}", path.display());
+                        self.status = format!("Decoding {source_label}");
                     }
                 }
                 LoadUpdate::Volume(loaded) => self.install_loaded_volume(loaded),
                 LoadUpdate::Failed {
                     generation,
-                    path,
+                    source_label,
                     message,
                 } => {
                     if generation == self.session_clock.current() {
-                        self.status = format!("{}: {message}", path.display());
+                        self.status = format!("{source_label}: {message}");
                         self.clear_all_panes();
                     }
                 }
@@ -134,13 +269,12 @@ impl WorkstationApp {
             return;
         }
         let before = self.current_frame_signature();
-        let source_label = loaded.path.display().to_string();
         let stage = loaded.stage;
         let report = self.history.install(VolumeFrame::new(
             loaded.volume,
-            FrameOrigin::Local,
+            loaded.origin,
             stage,
-            source_label,
+            loaded.source_label,
         ));
         self.load_ms = Some(loaded.elapsed_ms);
         let after = self.current_frame_signature();
@@ -267,6 +401,7 @@ impl WorkstationApp {
         let active = self.workspace.active_pane;
         let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
         let mut requested_load = None;
+        let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
         let mut selected_product = current_product;
         let mut tilt_delta = 0_isize;
@@ -286,6 +421,24 @@ impl WorkstationApp {
             );
             if ui.button("Load").clicked() && !self.source_path_text.trim().is_empty() {
                 requested_load = Some(PathBuf::from(self.source_path_text.trim()));
+            }
+
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.site_text)
+                    .desired_width(56.0)
+                    .char_limit(4)
+                    .hint_text("KRTX"),
+            );
+            if self.live_site.is_some() {
+                if ui.button("Stop live").clicked() {
+                    live_action = Some(LiveAction::Stop);
+                }
+            } else if ui.button("Start live").clicked() && !self.site_text.trim().is_empty() {
+                live_action = Some(LiveAction::Start(self.site_text.trim().to_owned()));
+            }
+            if !self.live_status.is_empty() {
+                ui.label(&self.live_status);
             }
 
             ui.separator();
@@ -330,6 +483,11 @@ impl WorkstationApp {
 
         if let Some(path) = requested_load {
             self.begin_load(path);
+        }
+        match live_action {
+            Some(LiveAction::Start(site)) => self.start_live(site),
+            Some(LiveAction::Stop) => self.stop_live(),
+            None => {}
         }
         if selected_layout != self.workspace.layout {
             self.workspace.set_layout(selected_layout);
@@ -696,6 +854,7 @@ impl eframe::App for WorkstationApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         self.handle_dropped_files(&context);
+        self.poll_live_results();
         self.poll_load_results();
         self.poll_render_results(&context);
         self.advance_playback(&context);

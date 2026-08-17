@@ -3,7 +3,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
 
-use analyst_runtime::{FrameStage, Generation, LatestLaneReceiver, LatestLaneSender, latest_lane_channel};
+use analyst_runtime::{
+    FrameStage, Generation, LatestLaneReceiver, LatestLaneSender, latest_lane_channel,
+};
 use chrono::{DateTime, Utc};
 use data_source::RealtimeLevel2Volume;
 use eframe::egui;
