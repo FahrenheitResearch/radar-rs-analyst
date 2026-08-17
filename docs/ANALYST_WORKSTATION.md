@@ -1,10 +1,10 @@
-# Radar Workstation: GR2Analyst-Class Product Contract
+# Radar Workstation: Analyst Workstation Product Contract
 
 Status: **accepted foundation contract**
 
 This repository is the clean successor to BowEcho for professional Level II radar analysis. BowEcho remains the broad weather-workstation and experimentation repository. Radar Workstation is deliberately narrower: every dependency, screen, background job, cache, and product must serve radar analysis.
 
-The goal is not a smaller BowEcho window. The goal is a new, maintainable native Rust application that competes directly with GR2Analyst while preserving the fastest and most reliable radar code already developed in BowEcho and radar-rs-analyst.
+The goal is not a smaller BowEcho window. The goal is a new, maintainable native Rust application that meets the complete professional Level II analyst-workstation feature floor while preserving the fastest and most reliable radar code already developed in BowEcho and radar-rs-analyst.
 
 ## 1. Product identity
 
@@ -46,7 +46,7 @@ The following do not belong in this application unless this contract is delibera
 
 A useful radar-adjacent feature is not automatically a core feature. It must fit an existing product, overlay, tool, or data-source interface and have an explicit memory, scheduling, and UI owner.
 
-## 3. Competitive feature contract
+## 3. Complete feature contract
 
 The following is the complete product target. Milestones control implementation order; they do not weaken the end-state contract.
 
@@ -380,8 +380,8 @@ Advanced controls should be discoverable without occupying the radar canvas cont
 
 - Migration/import tools, crash/logging polish, updater/packaging, accessibility, complete hotkey editor, corpus/visual regression suite, and performance certification.
 
-## 13. Definition of direct-competitor complete
+## 13. Definition of analyst-workstation complete
 
-Radar Workstation reaches the stated target when a user can perform the established GR2Analyst workflows—live and archive Level II viewing, every tilt and dual-pol moment, high-resolution derived products, user-defined products, maximum-value trails, warnings/LSRs, cross-sections, and lit/isosurface volume analysis—without leaving the application, while also meeting the runtime, memory, truth, and maintainability gates above.
+Radar Workstation reaches the stated target when a user can perform the established professional Level II analysis workflows—live and archive viewing, every tilt and dual-pol moment, high-resolution derived products, user-defined products, maximum-value trails, warnings/LSRs, cross-sections, and lit/isosurface volume analysis—without leaving the application, while also meeting the runtime, memory, truth, and maintainability gates above.
 
 Until then, milestones and release notes must describe exactly which parts of the contract are implemented. Marketing labels must not imply parity that the tested feature matrix does not yet support.

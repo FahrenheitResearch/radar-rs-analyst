@@ -2,7 +2,7 @@
 
 `radar-workstation` is the clean native Rust/egui successor for professional Level II radar analysis. It is intentionally separate from BowEcho and from the legacy `app_ui` reference harness.
 
-The complete product and architecture contract is in [`../../docs/GR2A_WORKSTATION.md`](../../docs/GR2A_WORKSTATION.md).
+The complete product and architecture contract is in [`../../docs/ANALYST_WORKSTATION.md`](../../docs/ANALYST_WORKSTATION.md).
 
 ## Run
 
@@ -42,7 +42,7 @@ For public real-time Level II, enter a four-character radar identifier such as `
 
 ## Not yet represented as complete
 
-This branch is the working shell and source foundation, not a claim of full GR2Analyst parity. The accepted contract still requires the retained GPU map/overlay scene, archive browser and backfill, warning/LSR/placefile support, analyst measurements, volume-derived and temporal products, cross-sections, user-defined products, and lit/isosurface 3D analysis.
+This branch is the working shell and source foundation, not a claim that the complete Analyst Workstation contract is implemented. The accepted contract still requires the retained GPU map/overlay scene, archive browser and backfill, warning/LSR/placefile support, analyst measurements, volume-derived and temporal products, cross-sections, user-defined products, and lit/isosurface 3D analysis.
 
 ## Architectural rules
 
