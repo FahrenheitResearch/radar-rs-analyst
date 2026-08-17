@@ -18,6 +18,17 @@ Open a local Level II file by dropping it onto the window, entering its path in 
 cargo run --release -p workstation_app --bin radar-workstation -- /path/to/KRTX-volume
 ```
 
+Start at a stated camera, so a particular view is reproducible without
+driving the window by hand:
+
+```text
+cargo run --release -p workstation_app --bin radar-workstation -- \
+    <level2-file> --zoom 0.12 --center -60,45
+```
+
+`--zoom` is kilometres per point; `--center` is `east_km,north_km` from the
+radar.
+
 Start a live session directly from the command line:
 
 ```text

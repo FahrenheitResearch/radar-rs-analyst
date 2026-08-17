@@ -9,42 +9,66 @@ mod pane_canvas;
 mod product;
 mod render_service;
 
-/// Startup intent parsed from the command line: either a Level II file to
-/// open, or a four-character site to start a live session for.
+/// Startup intent parsed from the command line: a Level II file to open or a
+/// site to go live on, plus an optional starting camera.
+///
+/// The camera options exist so a given view is reproducible from the command
+/// line. Driving this window with synthetic mouse input is unreliable — Windows
+/// refuses foreground changes from a background process — so a stated camera is
+/// the only honest way to capture a specific pan or zoom.
+#[derive(Default)]
 struct Startup {
     input_path: Option<PathBuf>,
     live_site: Option<String>,
+    zoom_km_per_point: Option<f32>,
+    center_km: Option<(f64, f64)>,
 }
 
-/// `radar-workstation [<level2-file>] [--live <SITE>]`
+/// `radar-workstation [<level2-file>] [--live <SITE>] [--zoom <km-per-point>]
+/// [--center <east_km,north_km>]`
 fn parse_startup<I: Iterator<Item = String>>(args: I) -> Startup {
-    let mut input_path = None;
-    let mut live_site = None;
-    let mut pending_live = false;
+    let mut startup = Startup::default();
+    let mut pending: Option<String> = None;
+
     for arg in args {
-        if pending_live {
-            live_site = Some(arg);
-            pending_live = false;
-        } else if arg == "--live" {
-            pending_live = true;
-        } else if let Some(site) = arg.strip_prefix("--live=") {
-            live_site = Some(site.to_owned());
-        } else if !arg.starts_with("--") && input_path.is_none() {
-            input_path = Some(PathBuf::from(arg));
+        if let Some(option) = pending.take() {
+            apply_option(&mut startup, &option, &arg);
+            continue;
+        }
+        match arg.split_once('=') {
+            Some((option, value)) if option.starts_with("--") => {
+                apply_option(&mut startup, option, value);
+            }
+            _ if arg.starts_with("--") => pending = Some(arg),
+            _ if startup.input_path.is_none() => startup.input_path = Some(PathBuf::from(arg)),
+            _ => {}
         }
     }
-    Startup {
-        input_path,
-        live_site,
+    startup
+}
+
+fn apply_option(startup: &mut Startup, option: &str, value: &str) {
+    match option {
+        "--live" => startup.live_site = Some(value.to_owned()),
+        "--zoom" => startup.zoom_km_per_point = value.parse().ok(),
+        "--center" => {
+            if let Some((east, north)) = value.split_once(',')
+                && let (Ok(east), Ok(north)) = (east.trim().parse(), north.trim().parse())
+            {
+                startup.center_km = Some((east, north));
+            }
+        }
+        _ => {}
     }
 }
 
 fn main() -> eframe::Result {
-    let startup = parse_startup(std::env::args().skip(1));
     let Startup {
         input_path,
         live_site,
-    } = startup;
+        zoom_km_per_point,
+        center_km,
+    } = parse_startup(std::env::args().skip(1));
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
@@ -77,11 +101,9 @@ fn main() -> eframe::Result {
                 ),
             }
 
-            Ok(Box::new(app::WorkstationApp::new(
-                creation_context,
-                input_path,
-                live_site,
-            )))
+            let mut app = app::WorkstationApp::new(creation_context, input_path, live_site);
+            app.set_initial_camera(zoom_km_per_point, center_km);
+            Ok(Box::new(app))
         }),
     )
 }

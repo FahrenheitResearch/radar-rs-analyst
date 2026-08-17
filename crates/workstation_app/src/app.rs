@@ -117,6 +117,35 @@ impl WorkstationApp {
         app
     }
 
+    /// Apply a camera stated at startup to every pane, so a particular pan or
+    /// zoom can be reproduced without driving the window by hand.
+    pub fn set_initial_camera(
+        &mut self,
+        zoom_km_per_point: Option<f32>,
+        center_km: Option<(f64, f64)>,
+    ) {
+        if zoom_km_per_point.is_none() && center_km.is_none() {
+            return;
+        }
+        let mut panes = Vec::with_capacity(analyst_runtime::MAX_PANES);
+        for index in 0..analyst_runtime::MAX_PANES {
+            let Some(pane) = PaneId::new(index as u8) else {
+                continue;
+            };
+            let camera = &mut self.workspace.pane_mut(pane).camera;
+            if let Some(km_per_point) = zoom_km_per_point {
+                camera.km_per_point = km_per_point;
+            }
+            if let Some((east_km, north_km)) = center_km {
+                camera.center_east_km = east_km;
+                camera.center_north_km = north_km;
+            }
+            *camera = camera.sanitized();
+            panes.push(pane);
+        }
+        self.invalidate_view_panes(&panes);
+    }
+
     fn begin_load(&mut self, path: PathBuf) {
         if self.live_site.is_some() {
             self.live_service.stop();
