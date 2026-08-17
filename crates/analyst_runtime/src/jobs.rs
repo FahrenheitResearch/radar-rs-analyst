@@ -10,6 +10,7 @@ pub enum SubmitOutcome<T> {
 }
 
 /// Error returned when the worker side has already closed.
+#[derive(Eq, PartialEq)]
 pub struct SendClosed<T>(pub T);
 
 impl<T> fmt::Debug for SendClosed<T> {
@@ -202,10 +203,7 @@ mod tests {
         let (sender, receiver) = latest_lane_channel();
         assert_eq!(sender.submit(0_u8, "a1"), Ok(SubmitOutcome::Enqueued));
         assert_eq!(sender.submit(1_u8, "b1"), Ok(SubmitOutcome::Enqueued));
-        assert_eq!(
-            sender.submit(0_u8, "a2"),
-            Ok(SubmitOutcome::Replaced("a1"))
-        );
+        assert_eq!(sender.submit(0_u8, "a2"), Ok(SubmitOutcome::Replaced("a1")));
 
         assert_eq!(receiver.try_recv(), Some((1, "b1")));
         assert_eq!(receiver.try_recv(), Some((0, "a2")));
