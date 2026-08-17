@@ -342,18 +342,18 @@ impl VolumeHistory {
 /// and are not included here.
 pub fn estimate_radar_volume_bytes(volume: &RadarVolume) -> usize {
     let mut bytes = size_of::<RadarVolume>();
-    bytes = add_string_capacity(bytes, &volume.site.id);
+    bytes = add_capacity(bytes, volume.site.id.capacity());
     if let Some(name) = &volume.site.name {
-        bytes = add_string_capacity(bytes, name);
+        bytes = add_capacity(bytes, name.capacity());
     }
     if let Some(value) = &volume.metadata.source_path {
-        bytes = add_string_capacity(bytes, value);
+        bytes = add_capacity(bytes, value.capacity());
     }
     if let Some(value) = &volume.metadata.archive_version {
-        bytes = add_string_capacity(bytes, value);
+        bytes = add_capacity(bytes, value.capacity());
     }
     if let Some(value) = &volume.metadata.compression {
-        bytes = add_string_capacity(bytes, value);
+        bytes = add_capacity(bytes, value.capacity());
     }
 
     bytes = bytes.saturating_add(
@@ -363,17 +363,13 @@ pub fn estimate_radar_volume_bytes(volume: &RadarVolume) -> usize {
             .saturating_mul(size_of::<ElevationCut>()),
     );
     for cut in &volume.cuts {
-        bytes = bytes.saturating_add(
-            cut.radials
-                .capacity()
-                .saturating_mul(size_of::<Radial>()),
-        );
+        bytes = bytes.saturating_add(cut.radials.capacity().saturating_mul(size_of::<Radial>()));
         for (moment, grid) in &cut.moments {
             bytes = bytes
                 .saturating_add(size_of::<(MomentType, MomentGrid)>())
                 .saturating_add(APPROX_BTREE_NODE_LINK_BYTES);
             if let MomentType::Unknown(name) = moment {
-                bytes = add_string_capacity(bytes, name);
+                bytes = add_capacity(bytes, name.capacity());
             }
             bytes = bytes.saturating_add(
                 grid.radial_indices
@@ -382,28 +378,24 @@ pub fn estimate_radar_volume_bytes(volume: &RadarVolume) -> usize {
             );
             bytes = bytes.saturating_add(match &grid.storage {
                 MomentStorage::U8(values) => values.capacity(),
-                MomentStorage::U16(values) => {
-                    values.capacity().saturating_mul(size_of::<u16>())
-                }
-                MomentStorage::F32(values) => {
-                    values.capacity().saturating_mul(size_of::<f32>())
-                }
+                MomentStorage::U16(values) => values.capacity().saturating_mul(size_of::<u16>()),
+                MomentStorage::F32(values) => values.capacity().saturating_mul(size_of::<f32>()),
             });
             if let MomentType::Unknown(name) = &grid.moment {
-                bytes = add_string_capacity(bytes, name);
+                bytes = add_capacity(bytes, name.capacity());
             }
         }
     }
     bytes.max(1)
 }
 
-fn add_string_capacity(bytes: usize, value: &String) -> usize {
-    bytes.saturating_add(value.capacity())
+fn add_capacity(bytes: usize, capacity: usize) -> usize {
+    bytes.saturating_add(capacity)
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
     use radar_core::{GateRange, RadarSite};
 
     use super::*;
@@ -411,8 +403,7 @@ mod tests {
     fn volume(minute: u32, gates: usize) -> Arc<RadarVolume> {
         let mut volume = RadarVolume::new(
             RadarSite::new("KTLX"),
-            Utc.with_ymd_and_hms(2026, 5, 20, 1, minute, 0)
-                .unwrap(),
+            Utc.with_ymd_and_hms(2026, 5, 20, 1, minute, 0).unwrap(),
         );
         let mut cut = ElevationCut::new(0.5, Some(1));
         let mut grid = MomentGrid::new_u8(
@@ -443,16 +434,22 @@ mod tests {
     fn complete_replaces_partial_and_downgrade_is_ignored() {
         let mut history = VolumeHistory::default();
         assert_eq!(
-            history.install(frame(0, FrameStage::Partial, 10)).disposition,
+            history
+                .install(frame(0, FrameStage::Partial, 10))
+                .disposition,
             InstallDisposition::Inserted
         );
         assert_eq!(
-            history.install(frame(0, FrameStage::Complete, 12)).disposition,
+            history
+                .install(frame(0, FrameStage::Complete, 12))
+                .disposition,
             InstallDisposition::Replaced
         );
         assert_eq!(history.current().unwrap().stage, FrameStage::Complete);
         assert_eq!(
-            history.install(frame(0, FrameStage::Preview, 8)).disposition,
+            history
+                .install(frame(0, FrameStage::Preview, 8))
+                .disposition,
             InstallDisposition::IgnoredStageDowngrade
         );
         assert_eq!(history.current().unwrap().stage, FrameStage::Complete);
