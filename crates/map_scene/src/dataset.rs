@@ -12,20 +12,29 @@ use crate::generated::basemap_data as generated;
 
 /// Draw layers, ordered from least to most detailed. The discriminant is the
 /// paint order within the map underlay.
+///
+/// US boundaries are split by level because the source generalises each level
+/// independently: the same coastline exists in the country, state and county
+/// tables with slightly different vertices. Drawing two of them together
+/// renders one shoreline as a pair of offset lines, so the style shows exactly
+/// one US level at any scale. Foreign administrative boundaries have no
+/// county-level counterpart and so never double.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MapLayer {
     Country,
-    StateProvince,
+    ForeignAdmin,
+    State,
     County,
 }
 
 impl MapLayer {
-    pub const ALL: [Self; 3] = [Self::Country, Self::StateProvince, Self::County];
+    pub const ALL: [Self; 4] = [Self::Country, Self::ForeignAdmin, Self::State, Self::County];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Country => "country",
-            Self::StateProvince => "state",
+            Self::ForeignAdmin => "admin",
+            Self::State => "state",
             Self::County => "county",
         }
     }
@@ -91,22 +100,22 @@ impl MapDataset {
         );
         push_lines(
             &mut lines,
-            MapLayer::StateProvince,
+            MapLayer::State,
             generated::BASEMAP_US_STATE_LINES,
         );
         push_lines(
             &mut lines,
-            MapLayer::StateProvince,
+            MapLayer::ForeignAdmin,
             generated::BASEMAP_CANADA_ADMIN_LINES,
         );
         push_lines(
             &mut lines,
-            MapLayer::StateProvince,
+            MapLayer::ForeignAdmin,
             generated::BASEMAP_MEXICO_ADMIN_LINES,
         );
         push_lines(
             &mut lines,
-            MapLayer::StateProvince,
+            MapLayer::ForeignAdmin,
             generated::BASEMAP_JAPAN_ADMIN_LINES,
         );
         push_lines(

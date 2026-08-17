@@ -123,6 +123,22 @@ impl MapSceneController {
         self.style
     }
 
+    /// Geographic centre of the contiguous United States, used to show a map
+    /// before any radar has said where it is.
+    pub const DEFAULT_ANCHOR: (f64, f64) = (39.83, -98.58);
+
+    /// Anchor at [`Self::DEFAULT_ANCHOR`] so the application opens on a map
+    /// rather than an empty pane. A real volume replaces this.
+    pub fn set_default_anchor(&mut self) -> bool {
+        self.set_radar_anchor(Self::DEFAULT_ANCHOR.0, Self::DEFAULT_ANCHOR.1)
+    }
+
+    /// Whether the current anchor is the placeholder rather than a radar.
+    pub fn is_default_anchor(&self) -> bool {
+        self.projection.map(|projection| projection.id())
+            == Some(RadarProjection::new(Self::DEFAULT_ANCHOR.0, Self::DEFAULT_ANCHOR.1).id())
+    }
+
     /// Point the scene at a radar site. Re-anchoring bumps the projection
     /// generation, which makes every previously retained generation
     /// unreachable; nothing built for the old site can be drawn afterwards.

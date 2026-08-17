@@ -19,8 +19,8 @@ pub mod scene;
 pub mod style;
 
 pub use build::{
-    BUILD_HALF_EXTENT_KM, LOD_REFERENCE_KM_PER_POINT, MapBuildRequest, bucket_for_scale,
-    build_geometry,
+    LOD_REFERENCE_KM_PER_POINT, MAX_BUILD_HALF_EXTENT_KM, MIN_BUILD_HALF_EXTENT_KM,
+    MapBuildRequest, bucket_for_scale, build_geometry, build_half_extent_km,
 };
 pub use dataset::{
     GeoLineFeature, GeoPolygonFeature, LabelCandidate, LabelClass, MapDataset, MapLayer,

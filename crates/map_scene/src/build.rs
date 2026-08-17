@@ -12,13 +12,28 @@ use crate::geometry::{GeometryStats, MapDraw, MapGeometry, MapVertex, ProjectedL
 use crate::projection::RadarProjection;
 use crate::style::MapStyle;
 
-/// Half of the square, radar-centred region that is projected and retained.
+/// Smallest half-extent of the retained region, in kilometres. Comfortably
+/// exceeds the 460 km Level II footprint so context remains when the analyst
+/// pans off the radar.
+pub const MIN_BUILD_HALF_EXTENT_KM: f64 = 1_000.0;
+/// Largest half-extent. Beyond this the whole visible earth is covered and
+/// growing further only adds work.
+pub const MAX_BUILD_HALF_EXTENT_KM: f64 = 20_000.0;
+/// Half-extents of viewport width to cover at a given scale.
+const COVERAGE_POINTS: f64 = 4_000.0;
+
+/// Half of the square, anchor-centred region that is projected and retained,
+/// for one LOD bucket.
 ///
-/// This is a coverage bound, not a camera key: it is the same region whatever
-/// the camera is doing, so panning inside it never triggers a rebuild. It
-/// comfortably exceeds the 460 km Level II footprint so context remains when
-/// the analyst pans off the radar.
-pub const BUILD_HALF_EXTENT_KM: f64 = 1_000.0;
+/// This is a coverage bound, not a camera key. It is a function of the bucket
+/// alone, never of where the camera is pointing, so panning inside the region
+/// still never triggers a rebuild. It grows with the bucket because a coarse
+/// view sees much more ground: a fixed region left the continent-scale view
+/// showing a square island of map surrounded by nothing.
+pub fn build_half_extent_km(lod: LodBucket) -> f64 {
+    let km_per_point = f64::from(lod.center_scale(LOD_REFERENCE_KM_PER_POINT));
+    (km_per_point * COVERAGE_POINTS).clamp(MIN_BUILD_HALF_EXTENT_KM, MAX_BUILD_HALF_EXTENT_KM)
+}
 
 /// Simplification tolerance in screen pixels. Points that would land within
 /// this distance of the retained line at the bucket's scale are dropped.
@@ -40,6 +55,7 @@ pub struct MapBuildRequest {
 pub fn build_geometry(request: &MapBuildRequest) -> MapGeometry {
     let km_per_point = f64::from(request.key.lod.center_scale(LOD_REFERENCE_KM_PER_POINT));
     let tolerance_km = km_per_point * SIMPLIFY_TOLERANCE_PX;
+    let half_extent_km = build_half_extent_km(request.key.lod);
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -63,11 +79,11 @@ pub fn build_geometry(request: &MapBuildRequest) -> MapGeometry {
             .filter(|line| line.layer == layer)
         {
             stats.source_points += line.points.len();
-            if !bbox_intersects_build_region(line, &request.projection) {
+            if !bbox_intersects_build_region(line, &request.projection, half_extent_km) {
                 stats.features_culled += 1;
                 continue;
             }
-            let projected = project_and_clip(line, &request.projection);
+            let projected = project_and_clip(line, &request.projection, half_extent_km);
             for run in projected {
                 let simplified = simplify(&run, tolerance_km);
                 if simplified.len() < 2 {
@@ -95,17 +111,24 @@ pub fn build_geometry(request: &MapBuildRequest) -> MapGeometry {
         }
     }
 
-    let labels = project_labels(request);
+    let labels = project_labels(request, half_extent_km);
     MapGeometry::new(request.key, vertices, indices, draws, labels, stats)
 }
 
 /// Reject features whose geographic bounding box cannot reach the build
 /// region. This is a coarse degrees-based test; exact clipping happens after
 /// projection.
-fn bbox_intersects_build_region(line: &GeoLineFeature, projection: &RadarProjection) -> bool {
+fn bbox_intersects_build_region(
+    line: &GeoLineFeature,
+    projection: &RadarProjection,
+    half_extent_km: f64,
+) -> bool {
     let [min_lon, min_lat, max_lon, max_lat] = line.bbox.map(f64::from);
     // Latitude is the cheap, always-valid axis: one degree is ~111 km.
-    let margin_deg = BUILD_HALF_EXTENT_KM / 111.0 * std::f64::consts::SQRT_2;
+    let margin_deg = half_extent_km / 111.0 * std::f64::consts::SQRT_2;
+    if margin_deg >= 180.0 {
+        return true;
+    }
     let lat = projection.radar_lat_deg();
     if min_lat > lat + margin_deg || max_lat < lat - margin_deg {
         return false;
@@ -141,7 +164,11 @@ fn wrap_delta(delta_deg: f64) -> f64 {
 /// itself. Carrying the outside vertex instead would draw a straight line from
 /// the edge of the region to a point that can be thousands of kilometres away,
 /// which appears as a spurious line ruled straight across the pane.
-fn project_and_clip(line: &GeoLineFeature, projection: &RadarProjection) -> Vec<Vec<[f64; 2]>> {
+fn project_and_clip(
+    line: &GeoLineFeature,
+    projection: &RadarProjection,
+    half_extent_km: f64,
+) -> Vec<Vec<[f64; 2]>> {
     let mut runs = Vec::new();
     let mut current: Vec<[f64; 2]> = Vec::new();
     let mut previous: Option<([f64; 2], bool)> = None;
@@ -159,13 +186,13 @@ fn project_and_clip(line: &GeoLineFeature, projection: &RadarProjection) -> Vec<
             continue;
         };
         let point = [world.east_km, world.north_km];
-        let inside = is_inside(point);
+        let inside = is_inside(point, half_extent_km);
 
         match (previous, inside) {
             (_, true) => {
                 if let Some((previous_point, false)) = previous {
                     // Entering: start at the boundary crossing.
-                    if let Some(crossing) = clip_to_region(point, previous_point) {
+                    if let Some(crossing) = clip_to_region(point, previous_point, half_extent_km) {
                         current.push(crossing);
                     }
                 }
@@ -173,7 +200,7 @@ fn project_and_clip(line: &GeoLineFeature, projection: &RadarProjection) -> Vec<
             }
             (Some((previous_point, true)), false) => {
                 // Leaving: finish at the boundary crossing.
-                if let Some(crossing) = clip_to_region(previous_point, point) {
+                if let Some(crossing) = clip_to_region(previous_point, point, half_extent_km) {
                     current.push(crossing);
                 }
                 if current.len() >= 2 {
@@ -193,15 +220,15 @@ fn project_and_clip(line: &GeoLineFeature, projection: &RadarProjection) -> Vec<
     runs
 }
 
-fn is_inside(point: [f64; 2]) -> bool {
-    point[0].abs() <= BUILD_HALF_EXTENT_KM && point[1].abs() <= BUILD_HALF_EXTENT_KM
+fn is_inside(point: [f64; 2], half_extent_km: f64) -> bool {
+    point[0].abs() <= half_extent_km && point[1].abs() <= half_extent_km
 }
 
 /// Walk from `inside` towards `outside` and return the last point still inside
 /// the region. Bisection keeps this exact enough for a 1000 km boundary that is
 /// never on screen, without special-casing which edge was crossed.
-fn clip_to_region(inside: [f64; 2], outside: [f64; 2]) -> Option<[f64; 2]> {
-    if !is_inside(inside) || is_inside(outside) {
+fn clip_to_region(inside: [f64; 2], outside: [f64; 2], half_extent_km: f64) -> Option<[f64; 2]> {
+    if !is_inside(inside, half_extent_km) || is_inside(outside, half_extent_km) {
         return None;
     }
     let mut low = 0.0_f64;
@@ -212,7 +239,7 @@ fn clip_to_region(inside: [f64; 2], outside: [f64; 2]) -> Option<[f64; 2]> {
             inside[0] + (outside[0] - inside[0]) * mid,
             inside[1] + (outside[1] - inside[1]) * mid,
         ];
-        if is_inside(candidate) {
+        if is_inside(candidate, half_extent_km) {
             low = mid;
         } else {
             high = mid;
@@ -307,7 +334,7 @@ fn tessellate_polyline(
     }
 }
 
-fn project_labels(request: &MapBuildRequest) -> Vec<ProjectedLabel> {
+fn project_labels(request: &MapBuildRequest, half_extent_km: f64) -> Vec<ProjectedLabel> {
     request
         .dataset
         .labels
@@ -316,8 +343,7 @@ fn project_labels(request: &MapBuildRequest) -> Vec<ProjectedLabel> {
             let world = request
                 .projection
                 .lon_lat_to_world(f64::from(label.lon), f64::from(label.lat));
-            let inside = world.east_km.abs() <= BUILD_HALF_EXTENT_KM
-                && world.north_km.abs() <= BUILD_HALF_EXTENT_KM;
+            let inside = is_inside([world.east_km, world.north_km], half_extent_km);
             inside.then_some(ProjectedLabel {
                 class: label.class,
                 name: label.name,
@@ -435,13 +461,14 @@ mod tests {
         static LONG: &[(f32, f32)] = &[(-97.3, 35.3), (-97.0, 35.5), (2.35, 48.85), (30.0, 50.0)];
         let projection = RadarProjection::new(35.3333, -97.2778);
         let feature = line(MapLayer::County, LONG);
-        let runs = project_and_clip(&feature, &projection);
+        let half_extent = build_half_extent_km(LodBucket(-4));
+        let runs = project_and_clip(&feature, &projection, half_extent);
 
         assert!(!runs.is_empty(), "the nearby portion should survive");
         for run in &runs {
             for point in run {
                 assert!(
-                    is_inside(*point),
+                    is_inside(*point, half_extent),
                     "retained point {point:?} escaped the build region"
                 );
             }
@@ -459,7 +486,11 @@ mod tests {
             (-97.0, 35.25),
         ];
         let projection = RadarProjection::new(35.3333, -97.2778);
-        let runs = project_and_clip(&line(MapLayer::County, RE_ENTERS), &projection);
+        let runs = project_and_clip(
+            &line(MapLayer::County, RE_ENTERS),
+            &projection,
+            build_half_extent_km(LodBucket(-4)),
+        );
         assert_eq!(runs.len(), 2, "expected the excursion to split the feature");
     }
 

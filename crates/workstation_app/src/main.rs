@@ -8,6 +8,7 @@ mod load_service;
 mod pane_canvas;
 mod product;
 mod render_service;
+mod sites_service;
 
 /// Startup intent parsed from the command line: a Level II file to open or a
 /// site to go live on, plus an optional starting camera.

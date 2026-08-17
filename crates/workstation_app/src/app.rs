@@ -15,14 +15,19 @@ use radar_core::RadarVolume;
 
 use crate::live_service::{LiveService, LiveUpdate, default_live_cache_dir};
 use crate::load_service::{LoadRequest, LoadService, LoadUpdate, LoadedVolume};
-use crate::pane_canvas::{PaneMap, PaneTexture, draw_pane, pane_rects};
+use crate::pane_canvas::{PaneMap, PaneTexture, PlacedSite, draw_pane, pane_rects};
 use crate::product::DisplayProduct;
 use crate::render_service::{RenderRequest, RenderService, RenderUpdate, RenderedPane};
+use crate::sites_service::{LocatedSite, SitesService};
 
 enum LiveAction {
     Start(String),
     Stop,
 }
+
+/// Opening overview scale: wide enough to show the country before a radar
+/// volume says where to look.
+const PLACEHOLDER_KM_PER_POINT: f32 = 4.0;
 
 const MAX_LOAD_RESULTS_PER_FRAME: usize = 4;
 const MAX_RENDER_RESULTS_PER_FRAME: usize = 4;
@@ -63,6 +68,11 @@ pub struct WorkstationApp {
     load_ms: Option<f32>,
     last_playback_step: Instant,
     map_scene: MapSceneController,
+    showing_placeholder_map: bool,
+    sites_service: SitesService,
+    sites: Vec<LocatedSite>,
+    placed_sites: Arc<[PlacedSite]>,
+    placed_sites_projection: Option<map_scene::ProjectionId>,
     live_service: LiveService,
     live_cache_dir: PathBuf,
     site_text: String,
@@ -102,6 +112,11 @@ impl WorkstationApp {
             status: "Drop a Level II file here or enter a path above".to_owned(),
             load_ms: None,
             last_playback_step: Instant::now(),
+            showing_placeholder_map: false,
+            sites_service: SitesService::new(context),
+            sites: Vec::new(),
+            placed_sites: Vec::new().into(),
+            placed_sites_projection: None,
             live_cache_dir: default_live_cache_dir(),
             site_text: String::new(),
             live_site: None,
@@ -114,7 +129,37 @@ impl WorkstationApp {
             app.site_text = site.trim().to_uppercase();
             app.start_live(site);
         }
+        // Open on a map instead of an empty pane. The placeholder anchor is
+        // replaced, and the camera returned to radar scale, by the first real
+        // volume that arrives.
+        if app.history.is_empty() {
+            app.map_scene.set_default_anchor();
+            app.showing_placeholder_map = true;
+            app.apply_camera_to_all_panes(|camera| {
+                camera.km_per_point = PLACEHOLDER_KM_PER_POINT;
+                camera.center_east_km = 0.0;
+                camera.center_north_km = 0.0;
+            });
+        }
         app
+    }
+
+    /// Apply a change to every pane's camera and invalidate their views.
+    fn apply_camera_to_all_panes(
+        &mut self,
+        mut change: impl FnMut(&mut analyst_runtime::Camera2D),
+    ) {
+        let mut panes = Vec::with_capacity(analyst_runtime::MAX_PANES);
+        for index in 0..analyst_runtime::MAX_PANES {
+            let Some(pane) = PaneId::new(index as u8) else {
+                continue;
+            };
+            let camera = &mut self.workspace.pane_mut(pane).camera;
+            change(camera);
+            *camera = camera.sanitized();
+            panes.push(pane);
+        }
+        self.invalidate_view_panes(&panes);
     }
 
     /// Apply a camera stated at startup to every pane, so a particular pan or
@@ -206,6 +251,42 @@ impl WorkstationApp {
         self.live_site = None;
         self.live_status.clear();
         self.status = "Live session stopped".to_owned();
+    }
+
+    fn poll_site_directory(&mut self) {
+        while let Some(sites) = self.sites_service.try_recv() {
+            self.sites = sites;
+            // Force a reprojection against the current anchor.
+            self.placed_sites_projection = None;
+        }
+    }
+
+    /// Project the site directory into world kilometres.
+    ///
+    /// Done once per anchor change rather than per frame: the positions are
+    /// fixed relative to the projection, so the paint pass only has to apply
+    /// the camera transform.
+    fn refresh_placed_sites(&mut self) {
+        let Some(projection) = self.map_scene.projection() else {
+            return;
+        };
+        if self.placed_sites_projection == Some(projection.id()) {
+            return;
+        }
+        self.placed_sites = self
+            .sites
+            .iter()
+            .filter_map(|site| {
+                let world =
+                    projection.try_lon_lat_to_world(site.longitude_deg, site.latitude_deg)?;
+                Some(PlacedSite {
+                    id: site.id.clone(),
+                    world,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        self.placed_sites_projection = Some(projection.id());
     }
 
     fn poll_live_results(&mut self) {
@@ -309,9 +390,14 @@ impl WorkstationApp {
         if let (Some(latitude), Some(longitude)) = (
             loaded.volume.site.latitude_deg,
             loaded.volume.site.longitude_deg,
-        ) {
-            self.map_scene
-                .set_radar_anchor(f64::from(latitude), f64::from(longitude));
+        ) && self
+            .map_scene
+            .set_radar_anchor(f64::from(latitude), f64::from(longitude))
+            && self.showing_placeholder_map
+        {
+            // Leaving the opening overview: return to radar working scale.
+            self.showing_placeholder_map = false;
+            self.apply_camera_to_all_panes(|camera| *camera = analyst_runtime::Camera2D::default());
         }
 
         let before = self.current_frame_signature();
@@ -575,6 +661,8 @@ impl WorkstationApp {
                     .map_scene
                     .geometry_for_pane(pane.index(), camera.sanitized().km_per_point),
                 projection: self.map_scene.projection(),
+                sites: Arc::clone(&self.placed_sites),
+                active_site: self.live_site.clone(),
             };
             let interaction = {
                 let texture =
@@ -599,7 +687,12 @@ impl WorkstationApp {
                 )
             };
 
-            if interaction.clicked {
+            if let Some(site) = interaction.clicked_site {
+                // Clicking a site marker is the quickest way to change radar.
+                self.workspace.set_active(pane);
+                self.site_text = site.to_uppercase();
+                self.start_live(site);
+            } else if interaction.clicked {
                 self.workspace.set_active(pane);
             }
             self.update_viewport(pane, interaction.viewport);
@@ -911,7 +1004,9 @@ impl eframe::App for WorkstationApp {
         self.handle_dropped_files(&context);
         self.poll_live_results();
         self.poll_load_results();
+        self.poll_site_directory();
         self.map_scene.poll();
+        self.refresh_placed_sites();
         self.poll_render_results(&context);
         self.advance_playback(&context);
 

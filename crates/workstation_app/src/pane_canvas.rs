@@ -22,13 +22,34 @@ pub struct PaneTexture<'a> {
 pub struct PaneMap {
     pub geometry: Option<Arc<MapGeometry>>,
     pub projection: Option<RadarProjection>,
+    /// Radar sites already projected into world kilometres, so the paint pass
+    /// only transforms points rather than projecting them.
+    pub sites: Arc<[PlacedSite]>,
+    /// The site currently being displayed, drawn as selected.
+    pub active_site: Option<String>,
 }
+
+/// A radar site at a known world position, ready to draw and hit-test.
+#[derive(Clone, Debug)]
+pub struct PlacedSite {
+    pub id: String,
+    pub world: WorldPoint,
+}
+
+/// Half-size of a site marker in screen points.
+const SITE_MARKER_HALF: f32 = 5.0;
+/// Extra slack around a marker so it is easy to hit with the mouse.
+const SITE_CLICK_SLACK: f32 = 4.0;
+/// Ceiling on markers drawn per pane, so a dense view stays bounded.
+const MAX_SITE_MARKERS: usize = 250;
 
 pub struct PaneInteraction {
     pub clicked: bool,
     pub camera: Camera2D,
     pub camera_changed: bool,
     pub viewport: ViewportMetrics,
+    /// A radar site marker the user clicked, if any.
+    pub clicked_site: Option<String>,
 }
 
 pub fn pane_rects(canvas: egui::Rect, layout: PaneLayout) -> Vec<(PaneId, egui::Rect)> {
@@ -140,6 +161,15 @@ pub fn draw_pane(
         paint_transformed_texture(&painter, rect, updated_camera, viewport, texture);
     }
     draw_map_labels(&painter, rect, updated_camera, viewport, map);
+    let clicked_site = draw_radar_sites(
+        ui,
+        &painter,
+        rect,
+        updated_camera,
+        viewport,
+        map,
+        response.clicked(),
+    );
     draw_range_rings(&painter, rect, updated_camera, viewport);
     draw_cursor_readout(
         ui,
@@ -154,11 +184,105 @@ pub fn draw_pane(
     draw_border(&painter, rect, active);
 
     PaneInteraction {
-        clicked: response.clicked(),
+        // A click that selected a site is consumed by that site.
+        clicked: response.clicked() && clicked_site.is_none(),
         camera: updated_camera,
         camera_changed,
         viewport,
+        clicked_site,
     }
+}
+
+/// Draw radar site markers and report one if it was clicked.
+///
+/// Positions arrive already projected, so this only applies the camera
+/// transform. Markers are drawn as small boxes, which is what makes them an
+/// obvious click target rather than a decoration.
+#[allow(clippy::too_many_arguments)]
+fn draw_radar_sites(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    camera: Camera2D,
+    viewport: ViewportMetrics,
+    map: &PaneMap,
+    clicked: bool,
+) -> Option<String> {
+    if map.sites.is_empty() {
+        return None;
+    }
+    let pointer = ui.input(|input| input.pointer.hover_pos());
+    let mut hit: Option<(String, f32)> = None;
+    let mut drawn = 0_usize;
+
+    for site in map.sites.iter() {
+        if drawn >= MAX_SITE_MARKERS {
+            break;
+        }
+        let screen = camera.world_to_screen(site.world, viewport);
+        let position = egui::pos2(rect.left() + screen.x, rect.top() + screen.y);
+        if !rect.contains(position) {
+            continue;
+        }
+        drawn += 1;
+
+        let active = map.active_site.as_deref() == Some(site.id.as_str());
+        let hovered = pointer.is_some_and(|pointer| {
+            (pointer - position).length() <= SITE_MARKER_HALF + SITE_CLICK_SLACK
+        });
+        if hovered && let Some(pointer) = pointer {
+            let distance = (pointer - position).length();
+            if hit.as_ref().is_none_or(|(_, best)| distance < *best) {
+                hit = Some((site.id.clone(), distance));
+            }
+        }
+
+        let box_rect = egui::Rect::from_center_size(
+            position,
+            egui::vec2(SITE_MARKER_HALF * 2.0, SITE_MARKER_HALF * 2.0),
+        );
+        let (stroke_color, fill) = if active {
+            (
+                egui::Color32::from_rgb(120, 220, 255),
+                egui::Color32::from_rgba_unmultiplied(40, 120, 170, 140),
+            )
+        } else if hovered {
+            (
+                egui::Color32::from_rgb(255, 236, 150),
+                egui::Color32::from_rgba_unmultiplied(120, 100, 40, 150),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(170, 190, 210),
+                egui::Color32::from_rgba_unmultiplied(30, 45, 60, 120),
+            )
+        };
+        painter.rect_filled(box_rect, 1.0, fill);
+        painter.rect_stroke(
+            box_rect,
+            1.0,
+            egui::Stroke::new(if active || hovered { 1.6_f32 } else { 1.0 }, stroke_color),
+            egui::StrokeKind::Middle,
+        );
+
+        // Only label what the analyst can act on, so a continental view is not
+        // buried under two hundred identifiers.
+        if active || hovered || map.sites.len() <= 40 {
+            painter.text(
+                position + egui::vec2(0.0, -SITE_MARKER_HALF - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                &site.id,
+                egui::FontId::monospace(11.0),
+                stroke_color,
+            );
+        }
+    }
+
+    let hovered_site = hit.map(|(id, _)| id);
+    if hovered_site.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if clicked { hovered_site } else { None }
 }
 
 /// Queue the retained map for this pane.
