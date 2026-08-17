@@ -1,0 +1,48 @@
+# Radar Workstation
+
+`radar-workstation` is the clean native Rust/egui successor for professional Level II radar analysis. It is intentionally separate from BowEcho and from the legacy `app_ui` reference harness.
+
+The complete product and architecture contract is in [`../../docs/GR2A_WORKSTATION.md`](../../docs/GR2A_WORKSTATION.md).
+
+## Run
+
+From the repository root:
+
+```text
+cargo run --release -p workstation_app --bin radar-workstation
+```
+
+Open a local Level II file by dropping it onto the window, entering its path in the command bar, or passing it on the command line:
+
+```text
+cargo run --release -p workstation_app --bin radar-workstation -- /path/to/KRTX-volume
+```
+
+For public real-time Level II, enter a four-character radar identifier such as `KRTX` and select **Start live**. The source worker installs decode previews, growing partial volumes, and the immutable completed replacement under the same history identity.
+
+## Implemented in the current stacked branch
+
+- one, two-horizontal, two-vertical, and four-pane layouts;
+- independent active-pane product and tilt selection;
+- optional linked camera groups;
+- REF, VEL, DVEL, SRV, DSRV, SW, ZDR, CC, PHI, and KDP;
+- preview-aware Level II decode using the existing bounded Rust decoder;
+- public real-time Level II discovery, chunk aggregation, atomic caching, and partial-to-complete replacement;
+- immediate pan and zoom by transforming the retained texture while a newest-wins exact raster is generated off-thread;
+- typed generation guards for source, frame, pane, view, and palette state;
+- byte- and count-bounded immutable volume history;
+- ready-gated looping that holds instead of flashing an unavailable frame;
+- radar-only direct dependency and module-size firewalls.
+
+## Not yet represented as complete
+
+This branch is the working shell and source foundation, not a claim of full GR2Analyst parity. The accepted contract still requires the retained GPU map/overlay scene, archive browser and backfill, warning/LSR/placefile support, analyst measurements, volume-derived and temporal products, cross-sections, user-defined products, and lit/isosurface 3D analysis.
+
+## Architectural rules
+
+- `main.rs` is startup only.
+- egui composes state and drains bounded results; it does not download, decode, derive, project, tessellate, or rasterize.
+- source/site changes invalidate the old session before any late result can install.
+- map geometry identity never includes exact camera-center or scale bits.
+- every queue, history, cache, and texture owner is explicitly bounded.
+- BowEcho-only model, satellite, simulation, social, and experimental crates are forbidden as direct dependencies.
