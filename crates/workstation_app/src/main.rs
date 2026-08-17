@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 mod app;
+mod live_service;
 mod load_service;
 mod pane_canvas;
 mod product;
