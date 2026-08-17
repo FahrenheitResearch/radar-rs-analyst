@@ -8,6 +8,7 @@ license.workspace = true
 analyst_runtime = { path = "../analyst_runtime" }
 chrono.workspace = true
 color_tables = { path = "../color_tables" }
+data_source = { path = "../data_source" }
 eframe.workspace = true
 nexrad_io = { path = "../nexrad_io" }
 radar_core = { path = "../radar_core" }
