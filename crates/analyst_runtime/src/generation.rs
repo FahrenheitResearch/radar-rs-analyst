@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 /// installable only when every generation relevant to it still matches the
 /// current state. This is intentionally stronger than comparing labels or raw
 /// pointers, both of which can be reused across site and workspace changes.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct Generation(u64);
 
