@@ -887,13 +887,13 @@ impl WorkstationApp {
             // another menu was wrong.
             let palette_family = crate::product_picker::palette_family(current_product);
             if let Some(family) = palette_family {
-                let installed = self.color_tables.for_family(family).name().to_owned();
+                let installed = self.color_tables.for_family(family).clone();
                 egui::ComboBox::from_id_salt("workstation-palette")
-                    .selected_text(&installed)
+                    .selected_text(installed.name())
                     .width(210.0)
                     .show_ui(ui, |ui| {
-                        for table in color_tables::builtin_tables_for_family(family) {
-                            let chosen = table.name() == installed;
+                        for table in color_tables::palette_offers_for_family(family, &installed) {
+                            let chosen = table.name() == installed.name();
                             if ui.selectable_label(chosen, table.name()).clicked() && !chosen {
                                 Arc::make_mut(&mut self.color_tables).set_family(family, table);
                                 self.palette_clock.bump();
@@ -903,8 +903,8 @@ impl WorkstationApp {
                     })
                     .response
                     .on_hover_text(
-                        "Colour table for this product's family. \"Stepped\" paints hard bands \
-                         at each stop; \"smooth\" interpolates between them.",
+                        "Colour table for this product's family. The last row is the \
+                         selected palette redrawn the other way: smooth or stepped.",
                     );
             }
 

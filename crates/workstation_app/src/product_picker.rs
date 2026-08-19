@@ -23,7 +23,10 @@
 
 use std::collections::BTreeSet;
 
-use color_tables::{ColorTable, ColorTableFamily, ColorTableSet, builtin_tables_for_family};
+use color_tables::{
+    ColorTable, ColorTableFamily, ColorTableSet, builtin_tables_for_family,
+    palette_offers_for_family,
+};
 use eframe::egui;
 use product_engine::registry::DerivedVolumeId;
 use product_engine::{
@@ -78,10 +81,14 @@ pub struct ProductPickerState {
     /// keystroke after opening filters instead of going nowhere.
     focus_filter: bool,
     scroll_to_focus: bool,
-    /// `builtin_tables_for_family` parses its tables from text. Rebuilding
+    /// `palette_offers_for_family` parses its tables from text. Rebuilding
     /// eight of them every frame the picker is open would be parsing colour
-    /// tables at the frame rate, so they are kept until the family changes.
-    palettes: Option<(ColorTableFamily, Vec<ColorTable>)>,
+    /// tables at the frame rate, so they are kept until the family or the
+    /// installed palette changes. The installed palette is part of the key
+    /// because the list is drawn in whichever way that one is drawn, and
+    /// because the last row is that one flipped. Its `name()` carries both the
+    /// palette and the drawing, so it is a complete key on its own.
+    palettes: Option<(ColorTableFamily, String, Vec<ColorTable>)>,
 }
 
 impl ProductPickerState {
@@ -111,17 +118,23 @@ impl ProductPickerState {
         self.focus
     }
 
-    fn palettes_for(&mut self, family: ColorTableFamily) -> &[ColorTable] {
+    fn palettes_for(&mut self, family: ColorTableFamily, installed: &ColorTable) -> &[ColorTable] {
         if self
             .palettes
             .as_ref()
-            .is_none_or(|(cached, _)| *cached != family)
+            .is_none_or(|(cached, cached_name, _)| {
+                *cached != family || cached_name != installed.name()
+            })
         {
-            self.palettes = Some((family, builtin_tables_for_family(family)));
+            self.palettes = Some((
+                family,
+                installed.name().to_owned(),
+                palette_offers_for_family(family, installed),
+            ));
         }
         self.palettes
             .as_ref()
-            .map_or(&[][..], |(_, tables)| tables.as_slice())
+            .map_or(&[][..], |(_, _, tables)| tables.as_slice())
     }
 }
 
@@ -740,20 +753,26 @@ fn palette_section(
         return None;
     };
 
-    let in_use = tables.for_family(family).name().to_owned();
+    let installed = tables.for_family(family);
+    let in_use = installed.name().to_owned();
     let mut chosen = None;
     // Cloned out of the cache: the rows borrow `state` mutably to draw, and a
     // colour table is a few dozen stops.
-    let palettes: Vec<ColorTable> = state.palettes_for(family).to_vec();
-    // Said on the heading rather than left to be inferred from a list of one:
-    // a lone row marked "in use" reads as a broken list.
-    let heading = if palettes.len() < 2 {
+    let palettes: Vec<ColorTable> = state.palettes_for(family, installed).to_vec();
+    // Said on the heading rather than left to be inferred from the list: the
+    // last row is never another palette, it is this one drawn the other way,
+    // and that row is the whole of the smooth/stepped control.
+    let heading = if palettes.len() < 3 {
         format!(
             "PALETTE · {} · no alternatives in this build",
             family.label().to_uppercase()
         )
     } else {
-        format!("PALETTE · {}", family.label().to_uppercase())
+        format!(
+            "PALETTE · {} · last row redraws the selected palette {}",
+            family.label().to_uppercase(),
+            installed.rendering().flipped().label().to_lowercase()
+        )
     };
     label_row(ui, heading);
     for table in palettes {
@@ -1482,24 +1501,34 @@ mod tests {
         // The tables are parsed from text, and the picker asks for them every
         // frame it is open. Same allocation twice means it parsed once.
         let mut state = ProductPickerState::default();
-        let first = state.palettes_for(ColorTableFamily::Velocity);
+        let defaults = ColorTableSet::default();
+        let vel_installed = defaults.for_family(ColorTableFamily::Velocity);
+        let first = state.palettes_for(ColorTableFamily::Velocity, vel_installed);
         // Counted against the family list rather than a literal. A literal here
         // says "there are seven velocity tables", which is not what this test
         // is about and which fails every time a palette is added - so the
-        // failure would arrive on the wrong test with the wrong message.
+        // failure would arrive on the wrong test with the wrong message. The
+        // +1 is the switch row: the installed palette redrawn the other way.
         assert_eq!(
             first.len(),
-            builtin_tables_for_family(ColorTableFamily::Velocity).len(),
+            builtin_tables_for_family(ColorTableFamily::Velocity).len() + 1,
             "the picker dropped or invented a velocity table"
         );
         let address = first.as_ptr();
         assert_eq!(
-            state.palettes_for(ColorTableFamily::Velocity).as_ptr(),
+            state
+                .palettes_for(ColorTableFamily::Velocity, vel_installed)
+                .as_ptr(),
             address
         );
         assert_eq!(
-            state.palettes_for(ColorTableFamily::Reflectivity).len(),
-            builtin_tables_for_family(ColorTableFamily::Reflectivity).len()
+            state
+                .palettes_for(
+                    ColorTableFamily::Reflectivity,
+                    defaults.for_family(ColorTableFamily::Reflectivity)
+                )
+                .len(),
+            builtin_tables_for_family(ColorTableFamily::Reflectivity).len() + 1
         );
     }
 
@@ -1511,7 +1540,7 @@ mod tests {
         picker.idle();
         assert_eq!(
             picker.palette_rows(ColorTableFamily::Reflectivity),
-            builtin_tables_for_family(ColorTableFamily::Reflectivity).len()
+            builtin_tables_for_family(ColorTableFamily::Reflectivity).len() + 1
         );
         assert_eq!(
             picker.palette_rows(ColorTableFamily::Velocity),
@@ -1525,7 +1554,7 @@ mod tests {
         assert_eq!(picker.state.focused(), Some(DisplayProduct::Velocity));
         assert_eq!(
             picker.palette_rows(ColorTableFamily::Velocity),
-            builtin_tables_for_family(ColorTableFamily::Velocity).len()
+            builtin_tables_for_family(ColorTableFamily::Velocity).len() + 1
         );
         assert_eq!(
             picker.palette_rows(ColorTableFamily::Reflectivity),
@@ -1667,9 +1696,10 @@ mod tests {
             self.context.read_response(id).is_some()
         }
 
-        /// How many of a family's built-in tables were offered last frame.
+        /// How many of a family's offered tables were drawn last frame,
+        /// including the switch row (the installed palette flipped).
         fn palette_rows(&self, family: ColorTableFamily) -> usize {
-            builtin_tables_for_family(family)
+            palette_offers_for_family(family, ColorTableSet::default().for_family(family))
                 .iter()
                 .filter(|table| self.drawn(palette_row_id(table.name())))
                 .count()

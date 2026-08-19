@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, TimeZone, Utc};
-use color_tables::{ColorTable, ColorTableFamily, ColorTableSet, builtin_tables_for_family};
+use color_tables::{ColorTable, ColorTableFamily, ColorTableSet};
 use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
@@ -4442,16 +4442,19 @@ impl ViewerApp {
 
     fn active_product_color_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let family = self.selected_product.color_family();
-        let current_table = self.color_tables.for_family(family);
+        // Owned clone: the offer list depends on the installed table (it is
+        // drawn the installed way, plus that table flipped as the last row),
+        // and the closure below mutates `self.color_tables`.
+        let current_table = self.color_tables.for_family(family).clone();
         let current_name = current_table.name().to_owned();
-        let current_summary = color_table_summary(current_table);
+        let current_summary = color_table_summary(&current_table);
         ui.add_space(6.0);
         ui.label("Color");
         egui::ComboBox::from_id_salt("active_product_color_preset")
             .selected_text(&current_name)
             .width(220.0)
             .show_ui(ui, |ui| {
-                for table in builtin_tables_for_family(family) {
+                for table in color_tables::palette_offers_for_family(family, &current_table) {
                     let table_name = table.name().to_owned();
                     if ui
                         .selectable_label(table_name == current_name, &table_name)
@@ -4607,18 +4610,23 @@ impl ViewerApp {
             }
         });
 
-        let table = self.color_tables.for_family(self.color_table_target);
+        let table = self
+            .color_tables
+            .for_family(self.color_table_target)
+            .clone();
         ui.label(format!(
             "{}: {}",
             self.color_table_target.label(),
             table.name()
         ));
-        ui.label(color_table_summary(table));
+        ui.label(color_table_summary(&table));
         egui::ComboBox::from_id_salt("color_table_builtin_preset")
             .selected_text("Built-ins")
             .width(220.0)
             .show_ui(ui, |ui| {
-                for table in builtin_tables_for_family(self.color_table_target) {
+                for table in
+                    color_tables::palette_offers_for_family(self.color_table_target, &table)
+                {
                     if ui.selectable_label(false, table.name()).clicked() {
                         let table_name = table.name().to_owned();
                         let summary = color_table_summary(&table);
