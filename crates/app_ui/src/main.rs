@@ -4595,12 +4595,10 @@ impl ViewerApp {
                 .selected_text(self.color_table_target.label())
                 .width(150.0)
                 .show_ui(ui, |ui| {
-                    for family in [
-                        ColorTableFamily::Velocity,
-                        ColorTableFamily::Reflectivity,
-                        ColorTableFamily::SpectrumWidth,
-                        ColorTableFamily::Generic,
-                    ] {
+                    // Enumerated from the crate rather than listed here, so a
+                    // family added to color_tables cannot go missing from the
+                    // picker without anyone noticing.
+                    for family in ColorTableFamily::ALL {
                         ui.selectable_value(&mut self.color_table_target, family, family.label());
                     }
                 });
@@ -6423,7 +6421,14 @@ fn parse_color_table_for_family(
         ColorTableFamily::Reflectivity
         | ColorTableFamily::Velocity
         | ColorTableFamily::SpectrumWidth => ColorTable::parse_stepped(name, text),
-        ColorTableFamily::Generic => ColorTable::parse(name, text),
+        // The dual-pol families ship interpolated defaults - a stepped ZDR or
+        // CC table throws away exactly the gradient those products are read
+        // for - so they parse the way Generic does.
+        ColorTableFamily::DifferentialReflectivity
+        | ColorTableFamily::CorrelationCoefficient
+        | ColorTableFamily::DifferentialPhase
+        | ColorTableFamily::SpecificDifferentialPhase
+        | ColorTableFamily::Generic => ColorTable::parse(name, text),
     }
 }
 
