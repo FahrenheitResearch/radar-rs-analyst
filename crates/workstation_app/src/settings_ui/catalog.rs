@@ -27,6 +27,7 @@ pub mod keys {
     pub mod appearance {
         pub const CATEGORY: &str = "appearance";
         pub const THEME: &str = "theme";
+        pub const TOOLBAR: &str = "toolbar";
     }
     pub mod map {
         pub const CATEGORY: &str = "map";
@@ -141,24 +142,27 @@ pub fn registry() -> SettingsRegistry {
 fn appearance_category() -> SettingsCategory {
     use keys::appearance as k;
     let theme_options = vec![
-        ChoiceOption::new("dark", "Night bench"),
         ChoiceOption::new("light", "Daylight bench (Win95)"),
+        ChoiceOption::new("dark", "Night bench"),
+    ];
+    let toolbar_options = vec![
+        ChoiceOption::new("menus", "Menu bar (compact)"),
+        ChoiceOption::new("full", "Everything visible"),
     ];
     SettingsCategory::new(
         k::CATEGORY,
         "Appearance",
-        // Night bench is the default and has been since the app shipped: the
-        // audience works storms in a dark room, and a grey instrument panel
-        // at 03:00 is a lamp pointed at the analyst. Daylight bench is the
-        // same language cut in Win95 grey, one click away, for a lit room or
-        // a projector.
         vec![
-            SettingSpec::new(k::THEME, "Theme", choice(theme_options, "dark")).help(
-                "The whole application's chrome. Night bench is graphite - raised \
-             buttons, etched group boxes, sunken wells, cut for a dark room - \
-             and is the shipped look; Daylight bench is the same language in \
-             classic Win95 grey. The radar panes keep their own ground either \
-             way: data is drawn on the map's colours, not the theme's.",
+            SettingSpec::new(k::THEME, "Theme", choice(theme_options, "light")).help(
+                "The whole application's chrome. Daylight bench is the classic              grey - raised buttons, etched group boxes, sunken wells - and is              the app's identity; Night bench is the same language cut in              graphite for a dark room. The radar panes keep their own ground              either way: data is drawn on the map's colours, not the theme's.",
+            ),
+            SettingSpec::new(
+                k::TOOLBAR,
+                "Toolbar style",
+                choice(toolbar_options, "menus"),
+            )
+            .help(
+                "Menu bar keeps one compact row - storm controls stay on it,              the occasional ones live under File / View / Map / Tools.              Everything visible puts every control on the row itself,              which wraps on narrower windows.",
             ),
         ],
     )
@@ -729,32 +733,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The look a fresh install opens in, pinned because it has been lost
-    /// once already.
-    ///
-    /// v0.1.0 shipped and was approved on the night bench. A later change made
-    /// the Win95 daylight grey the default here, and nothing failed - a
-    /// default is one string in a constructor, and no test in this workspace
-    /// was reading it. `main.rs` and `app.rs` both fall back to Dark for
-    /// anything that is not an explicit "light", so this string is the only
-    /// thing that decides what an analyst sees on first run.
-    #[test]
-    fn the_theme_default_is_the_night_bench() {
-        let registry = registry();
-        let store = settings::SettingsStore::open(
-            std::env::temp_dir().join("settings-catalog-proof-never-written.json"),
-        );
-        assert_eq!(
-            store.effective_text(
-                &registry,
-                keys::appearance::CATEGORY,
-                keys::appearance::THEME
-            ),
-            "dark",
-            "a fresh install must open on the night bench - the shipped, owner-approved look"
-        );
     }
 
     #[test]

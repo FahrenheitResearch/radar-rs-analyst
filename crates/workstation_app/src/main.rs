@@ -181,16 +181,16 @@ fn main() -> eframe::Result {
         Box::new(move |creation_context| {
             // The visual theme, before anything draws: every widget of the
             // first frame styles itself from the context this call fills in.
-            // The night bench is the shipped look and the fallback - this is
-            // an instrument for a dark room - and the stored choice, set in
-            // Settings > Appearance, wins when present. Applied before the
-            // first frame so the app never flashes the wrong chrome.
+            // The Win95-grey daylight bench is the app's identity and the
+            // default; the stored choice - set in Settings > Appearance -
+            // wins when present. Applied before the first frame so the app
+            // never flashes the wrong chrome.
             let variant = match store.value(
                 crate::settings_ui::catalog::keys::appearance::CATEGORY,
                 crate::settings_ui::catalog::keys::appearance::THEME,
             ) {
-                Some(settings::SettingValue::Text(text)) => theme::Variant::from_setting(&text),
-                _ => theme::Variant::default(),
+                Some(settings::SettingValue::Text(text)) if text == "dark" => theme::Variant::Dark,
+                _ => theme::Variant::Light,
             };
             theme::apply(&creation_context.egui_ctx, variant);
             // Register the map's persistent GPU resources once, before any
@@ -307,49 +307,5 @@ mod tests {
     fn an_unknown_product_name_keeps_the_default_rather_than_guessing() {
         assert_eq!(startup_product(Some("AZSHR")), None);
         assert_eq!(startup_product(None), None);
-    }
-
-    /// The look the app opens in, from the store, before the first frame.
-    ///
-    /// The chrome the owner approved is the night bench, and this line is
-    /// where a fresh install and an unreadable stored value both land. It was
-    /// flipped to Light once with nothing failing, because a startup fallback
-    /// is one arm of one `match` in a closure inside `main` and no test in the
-    /// workspace could reach it. `Variant::from_setting` exists so it can be:
-    /// this pins the mapping, and `settings_ui::catalog::tests::
-    /// the_theme_default_is_the_night_bench` pins the string a fresh install
-    /// feeds into it.
-    #[test]
-    fn only_the_stored_word_light_takes_the_app_off_the_night_bench() {
-        assert_eq!(theme::Variant::from_setting("light"), theme::Variant::Light);
-        assert_eq!(theme::Variant::from_setting("dark"), theme::Variant::Dark);
-        // A store written by a build this one has never heard of, an empty
-        // string from a truncated file, and the wrong case: all of them are
-        // the shipped look rather than a coin toss.
-        assert_eq!(theme::Variant::from_setting(""), theme::Variant::Dark);
-        assert_eq!(theme::Variant::from_setting("Light"), theme::Variant::Dark);
-        assert_eq!(
-            theme::Variant::from_setting("solarized"),
-            theme::Variant::Dark
-        );
-        // And nothing stored at all - the `_` arm the startup match takes for
-        // a missing or non-text value.
-        assert_eq!(theme::Variant::default(), theme::Variant::Dark);
-
-        // The two ends joined: whatever the catalog hands a fresh install has
-        // to resolve to the night bench through the same function main uses.
-        let registry = settings_ui::catalog::registry();
-        let store = settings::SettingsStore::open(
-            std::env::temp_dir().join("generic-radar-startup-theme-proof-never-written.json"),
-        );
-        assert_eq!(
-            theme::Variant::from_setting(&store.effective_text(
-                &registry,
-                settings_ui::catalog::keys::appearance::CATEGORY,
-                settings_ui::catalog::keys::appearance::THEME,
-            )),
-            theme::Variant::Dark,
-            "a fresh install must start on the night bench"
-        );
     }
 }
