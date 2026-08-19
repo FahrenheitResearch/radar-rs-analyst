@@ -30,5 +30,5 @@ image.workspace = true
 naga = "29.0.3"
 
 [[bin]]
-name = "radar-workstation"
+name = "GenericRadar"
 path = "src/main.rs"

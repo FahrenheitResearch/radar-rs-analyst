@@ -1,6 +1,6 @@
 # Radar Workstation
 
-`radar-workstation` is the clean native Rust/egui successor for professional Level II radar analysis. It is intentionally separate from BowEcho and from the legacy `app_ui` reference harness.
+`GenericRadar` is the clean native Rust/egui successor for professional Level II radar analysis. It is intentionally separate from BowEcho and from the legacy `app_ui` reference harness.
 
 The complete product and architecture contract is in [`../../docs/ANALYST_WORKSTATION.md`](../../docs/ANALYST_WORKSTATION.md).
 
@@ -9,20 +9,20 @@ The complete product and architecture contract is in [`../../docs/ANALYST_WORKST
 From the repository root:
 
 ```text
-cargo run --release -p workstation_app --bin radar-workstation
+cargo run --release -p workstation_app --bin GenericRadar
 ```
 
 Open a local Level II file by dropping it onto the window, entering its path in the command bar, or passing it on the command line:
 
 ```text
-cargo run --release -p workstation_app --bin radar-workstation -- /path/to/KRTX-volume
+cargo run --release -p workstation_app --bin GenericRadar -- /path/to/KRTX-volume
 ```
 
 Start at a stated camera, so a particular view is reproducible without
 driving the window by hand:
 
 ```text
-cargo run --release -p workstation_app --bin radar-workstation -- \
+cargo run --release -p workstation_app --bin GenericRadar -- \
     <level2-file> --zoom 0.12 --center -60,45
 ```
 
@@ -32,7 +32,7 @@ radar.
 Start a live session directly from the command line:
 
 ```text
-cargo run --release -p workstation_app --bin radar-workstation -- --live KTLX
+cargo run --release -p workstation_app --bin GenericRadar -- --live KTLX
 ```
 
 For public real-time Level II, enter a four-character radar identifier such as `KRTX` and select **Start live**. The source worker installs decode previews, growing partial volumes, and the immutable completed replacement under the same history identity.

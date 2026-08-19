@@ -759,6 +759,24 @@ impl WorkstationApp {
         }
         for (category, id) in &outcome.changed {
             self.apply_changed_setting(category, id);
+            // The theme needs the context, which `apply_changed_setting`
+            // deliberately does not carry - it is the one setting that
+            // restyles egui itself rather than the app's own state.
+            if (category.as_str(), id.as_str())
+                == (keys::appearance::CATEGORY, keys::appearance::THEME)
+            {
+                let variant = if self.settings_store.effective_text(
+                    &self.settings_registry,
+                    keys::appearance::CATEGORY,
+                    keys::appearance::THEME,
+                ) == "dark"
+                {
+                    crate::theme::Variant::Dark
+                } else {
+                    crate::theme::Variant::Light
+                };
+                crate::theme::apply(context, variant);
+            }
         }
         if !outcome.changed.is_empty() {
             self.recompute_settings_cache();
