@@ -56,6 +56,22 @@ pub type TileKey = (TileProvider, TileId);
 /// quarters the count.
 pub const MAX_TILES_PER_PANE: usize = 256;
 
+/// Ceiling on *draws* for one pane: each visible tile can carry at most one
+/// extra draw — the resident ancestor kept underneath it while it fades in,
+/// which is what turns a tile's arrival into a crossfade instead of a blink.
+/// The GPU layer sizes its per-draw uniform buffer against this.
+pub const MAX_DRAWS_PER_PANE: usize = 2 * MAX_TILES_PER_PANE;
+
+/// Tiles warmed at the next tile zoom when the camera is a notch away from
+/// the boundary that will ask for them. Eight is the centre 2x4 of a pane —
+/// the ground under the cursor during a zoom — and is deliberately one level
+/// and a handful of tiles, never a ring at every level: prefetch exists to
+/// hide the *first* step of a deliberate zoom, and anything larger is a
+/// speculative fetch storm a phone would pay for. Only providers whose terms
+/// permit prefetch at all are ever warmed; see
+/// [`TileProvider::prefetch_permitted`].
+const PREFETCH_TILES: usize = 8;
+
 /// Meshes built on the UI thread in one frame.
 ///
 /// Measured by the core crate: 1500 meshes across five real sites and z5-z16
@@ -294,6 +310,9 @@ pub struct TileMetrics {
     pub fade_clocks_tracked: usize,
     /// Decoded tiles the GPU acknowledged.
     pub tiles_uploaded: u64,
+    /// Next-zoom tiles whose fetch was started ahead of the camera crossing a
+    /// zoom boundary. Always zero for a provider whose terms forbid prefetch.
+    pub tiles_prefetched: u64,
 }
 
 /// One cached mesh and when it was last drawn.
@@ -637,16 +656,55 @@ impl TileSceneController {
             let Some(mesh) = self.mesh_for(*tile, projection, &mut builds, &mut deferred) else {
                 continue;
             };
-            let Some((texture, uv_offset_scale)) = self.texture_for(provider, *tile) else {
+            let Some((texture, uv_offset_scale, levels_up)) = self.texture_for(provider, *tile)
+            else {
                 continue;
             };
-            if texture == *tile {
+            if levels_up == 0 {
                 exact += 1;
             } else {
                 self.metrics.ancestor_substitutions += 1;
             }
             let alpha = self.fade_alpha((provider, texture), now);
             fading |= alpha < 1.0;
+            if alpha < 1.0 {
+                // ANCESTOR HANDOFF. A texture still fading in must CROSSFADE
+                // over whatever coarser picture was covering this ground a
+                // frame ago, so the resident ancestor keeps drawing beneath
+                // it until the fade finishes. Without this underlay a tile's
+                // arrival blinks — ancestor imagery, then bare ground, then
+                // the child fading up from nothing — and on a warm cache,
+                // where a whole zoom level arrives in one frame, the entire
+                // pane flashed to ground at every zoom step (measured by
+                // `tests/tile_quickzoom_proof.rs`: painted fraction 1.000 →
+                // 0.000 → fade). Drawn first, so the fading texture
+                // composites over it.
+                //
+                // The underlay must itself be OPAQUE, which on a fast flick
+                // the nearest ready ancestor is not: three zoom steps inside
+                // one fade length leave the intermediate level mid-fade, and
+                // an underlay at alpha 0.6 beneath a child at alpha 0.0 lets
+                // 40% of bare ground through both (measured by the harness's
+                // fast-flick gesture: worst per-tile ground bleed 0.275 at
+                // the z10→z11 flip while a fully settled z9 sat resident on
+                // the GPU). So the walk prefers the nearest ancestor whose
+                // fade has FINISHED and only settles for a fading one when
+                // nothing settled is resident at all.
+                if let Some((under, under_uv, _)) = underlay_beneath(
+                    *tile,
+                    levels_up + 1,
+                    |t| self.store.state(provider, t),
+                    |t| self.fade_settled((provider, t), now),
+                ) {
+                    let under_alpha = self.fade_alpha((provider, under), now);
+                    draws.push(TileDraw {
+                        mesh: Arc::clone(&mesh),
+                        texture: under,
+                        uv_offset_scale: under_uv,
+                        alpha: under_alpha,
+                    });
+                }
+            }
             draws.push(TileDraw {
                 mesh,
                 texture,
@@ -654,6 +712,15 @@ impl TileSceneController {
                 alpha,
             });
         }
+        self.prefetch_toward_next_zoom(
+            provider,
+            lod,
+            zoom,
+            camera,
+            &view,
+            projection.radar_lat_deg(),
+            viewport.pixels_per_point,
+        );
 
         if deferred || fading {
             // More work lands next frame; ask for one rather than waiting on
@@ -769,46 +836,115 @@ impl TileSceneController {
         }
     }
 
-    /// Which texture draws this tile, and the UV window inside it.
+    /// Which texture draws this tile, the UV window inside it, and how many
+    /// levels above the tile that texture sits (0 = the tile's own).
     ///
     /// Requests the exact tile, then falls back up the pyramid. The 404 case
     /// is neither hypothetical nor regional: the USGS shaded-relief service is
     /// missing z9 over KTLX and z9-z11 over KRTX, so a pane there answers 404
     /// on *every* tile and an ancestor is the only thing that draws at all.
     ///
-    /// An ancestor is requested only when the exact tile is permanently
+    /// The walk continues past an ancestor that is merely queued or in
+    /// flight, because on a quick multi-step zoom that is the common shape:
+    /// the *intermediate* zoom's fetches are milliseconds old and Pending,
+    /// while the zoom the user came FROM is resident two levels up. Stopping
+    /// at the first in-flight ancestor — the previous shape of this function
+    /// — showed bare ground over imagery the GPU was already holding. The
+    /// walk is [`nearest_ready_ancestor`], a pure lookup: nothing is ever
+    /// *requested* for an ancestor unless the exact tile is permanently
     /// [`TileState::Absent`]. Speculatively fetching ancestors for tiles that
     /// are merely still in flight would multiply every cold pane's traffic,
     /// and for OpenStreetMap it would be the "pre-emptive fetching of tiles
     /// other than those a user is actively viewing" its policy forbids.
-    fn texture_for(&mut self, provider: TileProvider, tile: TileId) -> Option<(TileId, [f32; 4])> {
+    fn texture_for(
+        &mut self,
+        provider: TileProvider,
+        tile: TileId,
+    ) -> Option<(TileId, [f32; 4], u8)> {
         let state = self.store.request(provider, tile);
         self.wanted.insert((provider, tile));
         if state == TileState::Ready {
-            return Some((tile, [0.0, 0.0, 1.0, 1.0]));
+            return Some((tile, [0.0, 0.0, 1.0, 1.0], 0));
         }
-        let permanently_missing = state == TileState::Absent;
-
-        for level in 1..=MAX_ANCESTOR_LEVELS {
-            let ancestor = tile.ancestor(level)?;
-            match self.store.state(provider, ancestor) {
-                TileState::Ready => {
-                    let uv = tile.uv_offset_scale_within(ancestor)?;
-                    return Some((ancestor, uv));
-                }
-                // Walk past a hole: coverage is per tile and not monotonic in
-                // zoom, so the parent of a missing tile is often missing too.
-                TileState::Absent => continue,
-                _ if permanently_missing => {
-                    // One outstanding ancestor at a time. Nothing to draw yet.
-                    self.store.request(provider, ancestor);
-                    self.wanted.insert((provider, ancestor));
-                    return None;
-                }
-                _ => return None,
+        let fallback = self.ready_ancestor(provider, tile, 1);
+        if state == TileState::Absent {
+            // The exact tile will never exist here, so an ancestor is this
+            // ground's *final* picture, not a stopgap — keep one ancestor
+            // fetch alive, and only for a level that would improve on what is
+            // already drawable.
+            let drawable = fallback.map_or(MAX_ANCESTOR_LEVELS + 1, |(_, _, level)| level);
+            if let Some(ancestor) =
+                ancestor_worth_fetching(tile, drawable, |t| self.store.state(provider, t))
+            {
+                self.store.request(provider, ancestor);
+                self.wanted.insert((provider, ancestor));
             }
         }
-        None
+        fallback
+    }
+
+    /// The nearest resident ancestor at or above `from_level` levels up. A
+    /// pure lookup — nothing is requested — shared by the fallback path and
+    /// by the crossfade underlay.
+    fn ready_ancestor(
+        &self,
+        provider: TileProvider,
+        tile: TileId,
+        from_level: u8,
+    ) -> Option<(TileId, [f32; 4], u8)> {
+        nearest_ready_ancestor(tile, from_level, |t| self.store.state(provider, t))
+    }
+
+    /// Warm the next tile zoom's centre tiles when the camera is a notch away
+    /// from the boundary that will ask for them, so a deliberate zoom-in
+    /// lands on imagery that is already decoding rather than on a stretch of
+    /// the previous zoom.
+    ///
+    /// Policy first: the OSMF Standard Tile Layer Usage Policy (s.4) defines
+    /// bulk downloading as "any pre-emptive fetching of tiles other than
+    /// those a user is actively viewing", so this is gated on
+    /// [`TileProvider::prefetch_permitted`] and never runs for OpenStreetMap.
+    /// Where it is permitted it is bounded to [`PREFETCH_TILES`] centre tiles
+    /// of ONE level — never a ring at every level — and the requests go
+    /// through the same `wanted` set as everything else, so the moment the
+    /// camera stops flirting with the boundary the next poll cancels them
+    /// instead of letting them download. That bound is what keeps this sane
+    /// on a phone: at most a handful of extra fetches per gesture, none at
+    /// all while the camera is parked mid-bucket, and nothing here asks for a
+    /// repaint.
+    #[allow(clippy::too_many_arguments)]
+    fn prefetch_toward_next_zoom(
+        &mut self,
+        provider: TileProvider,
+        lod: LodBucket,
+        zoom: u8,
+        camera: Camera2D,
+        view: &ViewportGeo,
+        anchor_lat_deg: f64,
+        pixels_per_point: f32,
+    ) {
+        if !provider.prefetch_permitted() || zoom >= provider.max_zoom() {
+            return;
+        }
+        // Only from the fine half of the bucket — past the centre, one more
+        // wheel notch crosses the boundary — and only when the next bucket
+        // actually maps to a deeper tile zoom. Two half-octave buckets share
+        // each zoom, so half the bucket boundaries change nothing and warm
+        // nothing.
+        let bucket_centre = lod.center_scale(LOD_REFERENCE_KM_PER_POINT);
+        if !(camera.km_per_point > 0.0 && camera.km_per_point < bucket_centre) {
+            return;
+        }
+        if tile_zoom_for(LodBucket(lod.0 - 1), anchor_lat_deg, pixels_per_point) != Some(zoom + 1) {
+            return;
+        }
+        for tile in visible_tiles(zoom + 1, view, PREFETCH_TILES) {
+            if self.store.state(provider, tile) == TileState::Unknown {
+                self.metrics.tiles_prefetched += 1;
+            }
+            self.store.request(provider, tile);
+            self.wanted.insert((provider, tile));
+        }
     }
 
     /// Fold one arrived tile into its provider's brightness estimate.
@@ -844,6 +980,17 @@ impl TileSceneController {
         }
         entry.0 += total / counted as f32;
         entry.1 += 1;
+    }
+
+    /// Whether this texture's fade has finished — a pure read: a tile that
+    /// has never drawn has no clock and is NOT settled (it would start from
+    /// alpha 0), and peeking here must not start one.
+    fn fade_settled(&self, key: TileKey, now: Instant) -> bool {
+        self.first_seen.get(&key).is_some_and(|clock| {
+            now.saturating_duration_since(clock.first_seen)
+                .as_secs_f32()
+                >= FADE_SECONDS
+        })
     }
 
     fn fade_alpha(&mut self, key: TileKey, now: Instant) -> f32 {
@@ -893,6 +1040,88 @@ fn usable_cache(mut config: TileCacheConfig) -> TileCacheConfig {
 /// the pane composites in (see `tile_shader.wgsl` on colour space).
 fn luminance_of(rgb: [f32; 3]) -> f32 {
     0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
+
+/// The nearest ancestor of `tile` that `state` reports [`TileState::Ready`],
+/// searching `from_level..=MAX_ANCESTOR_LEVELS`, with the tile's UV window
+/// inside it and the level it was found at.
+///
+/// Walks past *every* non-ready state — Absent (coverage holes are not
+/// monotonic in zoom, so the parent of a missing tile is often missing too),
+/// but also Pending, Failed and Unknown, because an in-flight parent must not
+/// hide a resident grandparent. During a quick zoom-in that in-flight parent
+/// is the intermediate zoom the camera blew through, and the grandparent is
+/// the picture the user was just looking at.
+fn nearest_ready_ancestor(
+    tile: TileId,
+    from_level: u8,
+    state: impl Fn(TileId) -> TileState,
+) -> Option<(TileId, [f32; 4], u8)> {
+    for level in from_level..=MAX_ANCESTOR_LEVELS {
+        let ancestor = tile.ancestor(level)?;
+        if state(ancestor) == TileState::Ready {
+            let uv = tile.uv_offset_scale_within(ancestor)?;
+            return Some((ancestor, uv, level));
+        }
+    }
+    None
+}
+
+/// The texture to draw BENEATH a tile that is still fading in: the nearest
+/// resident ancestor at or above `from_level` whose own fade has finished,
+/// falling back to the nearest merely-resident one when nothing settled
+/// exists (a translucent floor beats bare ground).
+///
+/// Preferring the settled ancestor is what makes a fast multi-step zoom a
+/// true crossfade. Three zoom steps inside one fade length leave the
+/// intermediate level resident but mid-fade; an underlay that is itself at
+/// alpha 0.6 lets the pane's ground bleed through the whole stack. The
+/// settled level the user came FROM is still resident a level or two higher,
+/// and it — not the newest picture — is what must carry the pane until every
+/// fade above it finishes.
+fn underlay_beneath(
+    tile: TileId,
+    from_level: u8,
+    state: impl Fn(TileId) -> TileState,
+    settled: impl Fn(TileId) -> bool,
+) -> Option<(TileId, [f32; 4], u8)> {
+    nearest_ready_ancestor(tile, from_level, |ancestor| {
+        // Ready but mid-fade reads as not-there-yet on the first pass: it
+        // cannot be an opaque floor.
+        match state(ancestor) {
+            TileState::Ready if settled(ancestor) => TileState::Ready,
+            TileState::Ready => TileState::Pending,
+            other => other,
+        }
+    })
+    .or_else(|| nearest_ready_ancestor(tile, from_level, state))
+}
+
+/// For a tile that is permanently [`TileState::Absent`]: the one ancestor
+/// worth having in flight, or `None` when nothing above it could improve the
+/// picture.
+///
+/// "Improve" means strictly shallower than `drawable_level`, the level whose
+/// texture is already drawing this ground (pass `MAX_ANCESTOR_LEVELS + 1`
+/// when nothing draws at all). The first non-absent candidate wins, so there
+/// is one outstanding ancestor fetch per hole, never a ladder of them.
+fn ancestor_worth_fetching(
+    tile: TileId,
+    drawable_level: u8,
+    state: impl Fn(TileId) -> TileState,
+) -> Option<TileId> {
+    for level in 1..drawable_level.min(MAX_ANCESTOR_LEVELS + 1) {
+        let ancestor = tile.ancestor(level)?;
+        match state(ancestor) {
+            // A hole above a hole: fetching it again would be a doomed
+            // request the provider has already answered.
+            TileState::Absent => continue,
+            // Already drawing or already moving; nothing to start.
+            TileState::Ready => return None,
+            _ => return Some(ancestor),
+        }
+    }
+    None
 }
 
 /// The pane boundary in geographic coordinates.
@@ -1443,6 +1672,275 @@ mod tests {
             "{} tiles from the abandoned view are still being kept alive",
             there.intersection(&here).count()
         );
+    }
+
+    /// The ancestor walk must pass an ancestor that is merely in flight and
+    /// reach one that is resident.
+    ///
+    /// This is the quick-zoom uniformity property: two LOD steps inside a
+    /// second leave the intermediate zoom Pending, and the zoom the user came
+    /// from resident two levels up. The previous walk stopped at the first
+    /// Pending ancestor and drew bare ground over imagery the GPU held.
+    #[test]
+    fn the_ancestor_walk_passes_an_in_flight_parent_to_reach_a_resident_grandparent() {
+        let tile = TileId::new(11, 468, 809).expect("tile");
+        let parent = tile.ancestor(1).expect("parent");
+        let grandparent = tile.ancestor(2).expect("grandparent");
+
+        let mid_zoom_in_flight = |t: TileId| {
+            if t == parent {
+                TileState::Pending
+            } else if t == grandparent {
+                TileState::Ready
+            } else {
+                TileState::Unknown
+            }
+        };
+        let (texture, uv, level) =
+            nearest_ready_ancestor(tile, 1, mid_zoom_in_flight).expect("the grandparent draws");
+        assert_eq!(texture, grandparent);
+        assert_eq!(level, 2);
+        assert_eq!(uv, tile.uv_offset_scale_within(grandparent).expect("uv"));
+
+        // Nothing resident anywhere really is nothing to draw.
+        assert!(nearest_ready_ancestor(tile, 1, |_| TileState::Pending).is_none());
+        // And the walk is bounded: a texture deeper than MAX_ANCESTOR_LEVELS
+        // is a blur, not a picture, so it is never chosen.
+        let only_the_root = |t: TileId| {
+            if t.z < tile.z - MAX_ANCESTOR_LEVELS {
+                TileState::Ready
+            } else {
+                TileState::Unknown
+            }
+        };
+        assert!(nearest_ready_ancestor(tile, 1, only_the_root).is_none());
+
+        // `from_level` starts the walk deeper, which is what the crossfade
+        // underlay uses to find the picture UNDER the one that is fading in.
+        let both_resident = |t: TileId| {
+            if t == parent || t == grandparent {
+                TileState::Ready
+            } else {
+                TileState::Unknown
+            }
+        };
+        assert_eq!(
+            nearest_ready_ancestor(tile, 1, both_resident).map(|(t, _, _)| t),
+            Some(parent)
+        );
+        assert_eq!(
+            nearest_ready_ancestor(tile, 2, both_resident).map(|(t, _, _)| t),
+            Some(grandparent)
+        );
+    }
+
+    /// The underlay beneath a fading tile must be the settled ancestor, not
+    /// the nearest one.
+    ///
+    /// REGRESSION, measured by the harness's fast-flick gesture before this
+    /// choice existed: three zoom steps in ~320 ms leave the intermediate
+    /// level resident but mid-fade, and using it as the underlay let 0.275
+    /// of bare ground bleed through the composite at the z10→z11 flip while
+    /// a fully settled z9 sat resident on the GPU.
+    #[test]
+    fn the_underlay_beneath_a_fading_tile_is_the_settled_ancestor() {
+        let tile = TileId::new(11, 468, 809).expect("tile");
+        let parent = tile.ancestor(1).expect("parent");
+        let grandparent = tile.ancestor(2).expect("grandparent");
+        let both_ready = |t: TileId| {
+            if t == parent || t == grandparent {
+                TileState::Ready
+            } else {
+                TileState::Unknown
+            }
+        };
+
+        // The parent is mid-fade, the grandparent settled: the grandparent
+        // carries the pane.
+        assert_eq!(
+            underlay_beneath(tile, 1, both_ready, |t| t == grandparent).map(|(t, _, _)| t),
+            Some(grandparent)
+        );
+        // Both settled: the nearest wins, as always.
+        assert_eq!(
+            underlay_beneath(tile, 1, both_ready, |_| true).map(|(t, _, _)| t),
+            Some(parent)
+        );
+        // Nothing settled anywhere: a translucent floor beats bare ground, so
+        // the nearest resident ancestor still draws.
+        assert_eq!(
+            underlay_beneath(tile, 1, both_ready, |_| false).map(|(t, _, _)| t),
+            Some(parent)
+        );
+        // Nothing resident at all really is nothing to draw.
+        assert!(underlay_beneath(tile, 1, |_| TileState::Pending, |_| true).is_none());
+    }
+
+    /// A permanently absent tile keeps exactly one ancestor fetch alive, and
+    /// only for a level that would improve on what already draws.
+    #[test]
+    fn a_permanent_hole_keeps_exactly_one_useful_ancestor_fetch_alive() {
+        let tile = TileId::new(11, 468, 809).expect("tile");
+        let parent = tile.ancestor(1).expect("parent");
+        let grandparent = tile.ancestor(2).expect("grandparent");
+
+        // The parent is a hole too (coverage is not monotonic in zoom): the
+        // grandparent is the one worth having in flight.
+        let parent_absent = |t: TileId| {
+            if t == parent {
+                TileState::Absent
+            } else {
+                TileState::Unknown
+            }
+        };
+        assert_eq!(
+            ancestor_worth_fetching(tile, MAX_ANCESTOR_LEVELS + 1, parent_absent),
+            Some(grandparent)
+        );
+        // Something already draws at level 2, and the only thing shallower is
+        // the absent parent: nothing to fetch.
+        assert_eq!(ancestor_worth_fetching(tile, 2, parent_absent), None);
+
+        // The parent is merely in flight: it IS the upgrade to keep alive.
+        let parent_pending = |t: TileId| {
+            if t == parent {
+                TileState::Pending
+            } else {
+                TileState::Unknown
+            }
+        };
+        assert_eq!(
+            ancestor_worth_fetching(tile, 3, parent_pending),
+            Some(parent)
+        );
+    }
+
+    /// Prefetch fires only from the fine half of a bucket that borders a
+    /// deeper tile zoom, warms at most [`PREFETCH_TILES`] tiles of exactly
+    /// one level, and keeps them in `wanted` so a camera that leaves cancels
+    /// them.
+    #[test]
+    fn the_next_zoom_is_warmed_only_near_its_boundary_and_only_a_handful() {
+        let mut controller = controller();
+        controller.set_provider(Some(TileProvider::UsgsImageryTopo));
+        let projection = RadarProjection::new(KTLX.0, KTLX.1);
+        // A bucket whose own centre maps to z9 while the next finer bucket
+        // maps to z10 — the last bucket before the boundary.
+        let lod = (-24..24_i16)
+            .map(LodBucket)
+            .find(|bucket| {
+                tile_zoom_for(*bucket, KTLX.0, 1.0) == Some(9)
+                    && tile_zoom_for(LodBucket(bucket.0 - 1), KTLX.0, 1.0) == Some(10)
+            })
+            .expect("a bucket bordering the z9/z10 boundary");
+        let centre = lod.center_scale(LOD_REFERENCE_KM_PER_POINT);
+        let frame = |controller: &mut TileSceneController, km_per_point: f32| {
+            controller.poll();
+            controller.frame_for_pane(
+                &projection,
+                Generation::new(1),
+                lod,
+                Camera2D {
+                    km_per_point,
+                    ..Camera2D::default()
+                },
+                viewport(),
+                [0.0; 3],
+            );
+        };
+
+        // Coarse half of the bucket: parked, nothing warmed.
+        frame(&mut controller, centre * 1.05);
+        assert!(
+            controller.wanted.iter().all(|(_, tile)| tile.z == 9),
+            "a parked camera warmed tiles it is not near"
+        );
+        assert_eq!(controller.metrics().tiles_prefetched, 0);
+
+        // Fine half, a notch from the boundary: the next zoom's centre is
+        // warmed, bounded, and one level deep only.
+        frame(&mut controller, centre * 0.9);
+        let warmed: Vec<TileId> = controller
+            .wanted
+            .iter()
+            .filter(|(_, tile)| tile.z == 10)
+            .map(|(_, tile)| *tile)
+            .collect();
+        assert!(!warmed.is_empty(), "nothing was warmed at the boundary");
+        assert!(
+            warmed.len() <= PREFETCH_TILES,
+            "{} tiles warmed, which is a speculative fetch storm",
+            warmed.len()
+        );
+        assert_eq!(controller.metrics().tiles_prefetched, warmed.len() as u64);
+        assert!(
+            controller.wanted.iter().all(|(_, tile)| tile.z <= 10),
+            "prefetch reached deeper than one level"
+        );
+        // The warmed tiles are the CENTRE of the next zoom: every one of them
+        // is a child of a tile the pane is looking at now.
+        assert!(
+            warmed.iter().all(|tile| {
+                controller.wanted.contains(&(
+                    TileProvider::UsgsImageryTopo,
+                    tile.ancestor(1).expect("parent"),
+                ))
+            }),
+            "a warmed tile is outside the current view"
+        );
+    }
+
+    /// The OpenStreetMap tile usage policy forbids "any pre-emptive fetching
+    /// of tiles other than those a user is actively viewing", so for that
+    /// provider the boundary must warm NOTHING — with a fully working disk
+    /// cache, at the exact camera that warms USGS.
+    #[test]
+    fn openstreetmap_is_never_prefetched() {
+        let root = std::env::temp_dir().join(format!(
+            "map-scene-osm-prefetch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut controller = TileSceneController::with_config(
+            TileCacheConfig {
+                disk_root: Some(root.clone()),
+                max_disk_bytes: 8 * 1024 * 1024,
+                max_workers: 1,
+                user_agent: "radar-workstation-test/0 (+https://example.invalid)".to_owned(),
+                offline: true,
+            },
+            Arc::new(|| {}),
+        );
+        controller.set_provider(Some(TileProvider::OpenStreetMap));
+        assert!(controller.permits(TileProvider::OpenStreetMap));
+        let projection = RadarProjection::new(KTLX.0, KTLX.1);
+        let lod = (-24..24_i16)
+            .map(LodBucket)
+            .find(|bucket| {
+                tile_zoom_for(*bucket, KTLX.0, 1.0) == Some(9)
+                    && tile_zoom_for(LodBucket(bucket.0 - 1), KTLX.0, 1.0) == Some(10)
+            })
+            .expect("a bucket bordering the z9/z10 boundary");
+        let centre = lod.center_scale(LOD_REFERENCE_KM_PER_POINT);
+        controller.poll();
+        controller.frame_for_pane(
+            &projection,
+            Generation::new(1),
+            lod,
+            Camera2D {
+                km_per_point: centre * 0.9,
+                ..Camera2D::default()
+            },
+            viewport(),
+            [0.0; 3],
+        );
+        assert!(
+            controller.wanted.iter().all(|(_, tile)| tile.z == 9),
+            "the policy-restricted provider was prefetched"
+        );
+        assert_eq!(controller.metrics().tiles_prefetched, 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The mesh sweep must drop the LEAST recently drawn tiles and keep the

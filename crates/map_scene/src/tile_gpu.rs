@@ -33,7 +33,7 @@ use basemap_tiles::{DecodedTile, TileVertex};
 use eframe::egui_wgpu::{self, CallbackTrait, ScreenDescriptor};
 use eframe::wgpu;
 
-use crate::tiles::{MAX_TILES_PER_PANE, TileFrame, TileKey};
+use crate::tiles::{MAX_DRAWS_PER_PANE, TileFrame, TileKey};
 
 /// Per-pane uniform. `repr(C)`, 16-byte aligned, matching the WGSL layout.
 #[repr(C)]
@@ -275,7 +275,7 @@ impl TileRenderResources {
         let draw_stride = draw_uniform_stride(device);
         let draw_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("map_scene tile draw uniform"),
-            size: u64::from(draw_stride) * (MAX_PANES * MAX_TILES_PER_PANE) as u64,
+            size: u64::from(draw_stride) * (MAX_PANES * MAX_DRAWS_PER_PANE) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -477,7 +477,7 @@ impl TileRenderResources {
         let mut uniforms: Vec<u8> = Vec::new();
         let stride = self.draw_stride as usize;
 
-        for draw in frame.draws.iter().take(MAX_TILES_PER_PANE) {
+        for draw in frame.draws.iter().take(MAX_DRAWS_PER_PANE) {
             let key: TileKey = (frame.key.provider, draw.texture);
             if !self.textures.contains_key(&key) {
                 // Nothing to sample yet. The pane shows its own ground here,
@@ -514,7 +514,7 @@ impl TileRenderResources {
         pane.ensure_capacity(device, vertices.len(), indices.len());
         queue.write_buffer(&pane.vertices, 0, bytemuck::cast_slice(&vertices));
         queue.write_buffer(&pane.indices, 0, bytemuck::cast_slice(&indices));
-        let offset = u64::from(self.draw_stride) * (pane_index * MAX_TILES_PER_PANE) as u64;
+        let offset = u64::from(self.draw_stride) * (pane_index * MAX_DRAWS_PER_PANE) as u64;
         queue.write_buffer(&self.draw_uniform, offset, &uniforms);
     }
 
@@ -675,7 +675,7 @@ impl CallbackTrait for TilePaintCallback {
         render_pass.set_bind_group(0, pane_group, &[]);
         render_pass.set_vertex_buffer(0, pane.vertices.slice(..));
         render_pass.set_index_buffer(pane.indices.slice(..), wgpu::IndexFormat::Uint32);
-        let base = (self.pane_index * MAX_TILES_PER_PANE) as u32;
+        let base = (self.pane_index * MAX_DRAWS_PER_PANE) as u32;
         for draw in &pane.draws {
             let Some(resident) = resources.textures.get(&draw.texture) else {
                 continue;
@@ -830,11 +830,11 @@ mod tests {
             assert_eq!(stride % alignment.max(1), 0);
             let mut previous_end = 0_u32;
             for pane in 0..MAX_PANES {
-                let base = (pane * MAX_TILES_PER_PANE) as u32;
+                let base = (pane * MAX_DRAWS_PER_PANE) as u32;
                 let start = stride * base;
                 assert!(start >= previous_end, "pane {pane} overlaps its neighbour");
                 assert_eq!(start % alignment.max(1), 0);
-                previous_end = stride * (base + MAX_TILES_PER_PANE as u32);
+                previous_end = stride * (base + MAX_DRAWS_PER_PANE as u32);
             }
         }
     }

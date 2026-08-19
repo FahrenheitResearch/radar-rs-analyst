@@ -78,7 +78,17 @@ impl Default for TileCacheConfig {
         Self {
             disk_root: default_cache_dir(),
             max_disk_bytes: 512 * 1024 * 1024,
-            max_workers: 4,
+            // Six, measured rather than guessed. Sixteen cold z12 tiles
+            // against the live USGS service (see live_providers.rs,
+            // `the_worker_pool_is_sized_against_a_measured_cold_pane`, three
+            // runs on 2026-08-19): one worker 452-776 ms, four 195-247 ms,
+            // six 184-357 ms, eight 184-186 ms. Sequential is ~3x slower than
+            // any pool; past four the sixteen-tile gain is marginal, but a
+            // full 1500x950-point pane at 2x scale wants 110-196 tiles, where
+            // the extra workers amortise their handshakes. Six is also the
+            // per-host connection count every mainstream browser uses, so it
+            // asks nothing of a provider that the web does not already ask.
+            max_workers: 6,
             user_agent: default_user_agent(),
             offline: false,
         }
@@ -349,9 +359,15 @@ impl TileStore {
     /// a worker has *already* started cannot be recalled — at most
     /// `max_workers` tiles overshoot, and they land in the disk cache rather
     /// than being wasted.
+    ///
+    /// This is also the frame boundary the queue's ordering is built on: the
+    /// requests that follow this call are one batch, fetched centre-out in
+    /// the order the caller made them, ahead of any earlier batch that
+    /// survives cancellation. See [`JobQueue::push`].
     pub fn retain(&mut self, wanted: &HashSet<Key>) {
         let cancelled = {
             let mut queue = self.shared.queue.lock().expect("tile queue");
+            queue.begin_batch();
             queue.retain(wanted)
         };
         for key in cancelled {
@@ -498,7 +514,7 @@ impl TileStore {
         }
         {
             let mut queue = self.shared.queue.lock().expect("tile queue");
-            for dropped in queue.push_newest(key) {
+            for dropped in queue.push(key) {
                 // Same reasoning as `retain`: forgetting a tile is `remove`,
                 // not an `Unknown` entry that outlives the pan that made it.
                 self.states.remove(&dropped);
@@ -573,22 +589,55 @@ impl Drop for TileStore {
 
 #[derive(Default)]
 struct JobQueue {
-    jobs: VecDeque<Key>,
+    /// `(key, batch)`, ordered newest batch first and FIFO *within* a batch.
+    jobs: VecDeque<(Key, u64)>,
     queued: HashSet<Key>,
+    /// The current batch. [`TileStore::retain`] bumps it once per frame, so a
+    /// batch is one frame's requests.
+    batch: u64,
 }
 
 impl JobQueue {
-    /// Push to the front and trim from the back, returning whatever was
-    /// dropped. Newest-first is what keeps a pan responsive: the tiles under
-    /// the cursor now outrank the ones that were under it a second ago.
-    fn push_newest(&mut self, key: Key) -> Vec<Key> {
+    /// Start a new batch. Everything already queued becomes "a previous
+    /// frame's work" and sorts behind whatever the next frame asks for.
+    fn begin_batch(&mut self) {
+        self.batch = self.batch.wrapping_add(1);
+    }
+
+    /// Queue a job, trimming from the back and returning whatever was
+    /// dropped.
+    ///
+    /// Two orderings, both load-bearing, and they pull in opposite directions:
+    ///
+    /// * **Newest batch first** is what keeps a pan responsive: the tiles
+    ///   under the cursor now outrank the ones that were under it a second
+    ///   ago.
+    /// * **FIFO within a batch**, because the caller requests tiles
+    ///   centre-out ([`crate::visible_tiles`] orders them that way precisely
+    ///   so a cold view fills in from where the user is looking). A pure LIFO
+    ///   queue — the previous shape of this structure — silently reversed
+    ///   that within every frame: the centre tile was requested first, pushed
+    ///   deepest, and *fetched last*, so a cold zoom sharpened from the edges
+    ///   inward. Measured on a scripted z9→z11 quick zoom over KTLX before
+    ///   this ordering existed.
+    ///
+    /// The back of the queue is therefore the oldest batch's least-central
+    /// tile, which is also the right thing to drop on overflow.
+    fn push(&mut self, key: Key) -> Vec<Key> {
         if !self.queued.insert(key) {
             return Vec::new();
         }
-        self.jobs.push_front(key);
+        // The current batch is always a prefix of the deque: batches are
+        // pushed in increasing number and popped from the front.
+        let position = self
+            .jobs
+            .iter()
+            .take_while(|(_, batch)| *batch == self.batch)
+            .count();
+        self.jobs.insert(position, (key, self.batch));
         let mut dropped = Vec::new();
         while self.jobs.len() > MAX_QUEUE_DEPTH {
-            if let Some(stale) = self.jobs.pop_back() {
+            if let Some((stale, _)) = self.jobs.pop_back() {
                 self.queued.remove(&stale);
                 dropped.push(stale);
             }
@@ -597,14 +646,14 @@ impl JobQueue {
     }
 
     fn pop_newest(&mut self) -> Option<Key> {
-        let key = self.jobs.pop_front()?;
+        let (key, _) = self.jobs.pop_front()?;
         self.queued.remove(&key);
         Some(key)
     }
 
     fn retain(&mut self, wanted: &HashSet<Key>) -> Vec<Key> {
         let mut cancelled = Vec::new();
-        self.jobs.retain(|key| {
+        self.jobs.retain(|(key, _)| {
             if wanted.contains(key) {
                 true
             } else {
@@ -1215,7 +1264,7 @@ mod tests {
 
         let queue = store.shared.queue.lock().expect("queue");
         assert!(
-            queue.jobs.iter().all(|key| wanted.contains(key)),
+            queue.jobs.iter().all(|(key, _)| wanted.contains(key)),
             "retain left unwanted work in the queue"
         );
         drop(queue);
@@ -1250,7 +1299,7 @@ mod tests {
         {
             let mut queue = store.shared.queue.lock().expect("queue");
             for key in &keys {
-                assert!(queue.push_newest(*key).is_empty(), "the queue overflowed");
+                assert!(queue.push(*key).is_empty(), "the queue overflowed");
                 store.states.insert(*key, TileState::Pending);
             }
         }
@@ -1269,18 +1318,19 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_is_bounded_and_keeps_the_newest_requests() {
+    fn the_queue_is_bounded_and_drops_the_oldest_batchs_least_central_work() {
         let mut queue = JobQueue::default();
         let mut dropped_total = 0;
         for index in 0..(MAX_QUEUE_DEPTH as u32 + 50) {
-            dropped_total += queue
-                .push_newest((TileProvider::UsgsImagery, tile(index)))
-                .len();
+            // A new batch per push: this reproduces the old pure-LIFO shape,
+            // where every push outranks everything before it.
+            queue.begin_batch();
+            dropped_total += queue.push((TileProvider::UsgsImagery, tile(index))).len();
         }
         assert_eq!(queue.jobs.len(), MAX_QUEUE_DEPTH);
         assert_eq!(queue.queued.len(), MAX_QUEUE_DEPTH);
         assert_eq!(dropped_total, 50);
-        // Newest first: the most recent push is at the head.
+        // Newest batch first: the most recent push is at the head.
         assert_eq!(
             queue.pop_newest(),
             Some((TileProvider::UsgsImagery, tile(MAX_QUEUE_DEPTH as u32 + 49)))
@@ -1289,12 +1339,63 @@ mod tests {
         assert!(!queue.queued.contains(&(TileProvider::UsgsImagery, tile(0))));
     }
 
+    /// Within one frame's batch the queue must preserve the caller's order,
+    /// because the caller requests tiles centre-out and the whole point of
+    /// that ordering is that the centre of the view is fetched FIRST.
+    ///
+    /// REGRESSION, measured before it was fixed: the queue used to be a pure
+    /// LIFO, so the centre tile — requested first — was fetched *last*, and a
+    /// cold quick zoom over KTLX sharpened from the pane's edges inward.
+    #[test]
+    fn one_frames_requests_are_fetched_in_the_order_they_were_made() {
+        let mut queue = JobQueue::default();
+        // Frame one asks for three tiles, centre-out.
+        queue.begin_batch();
+        for index in 0..3 {
+            queue.push((TileProvider::UsgsImagery, tile(index)));
+        }
+        // Frame two (a pan, say) asks for three different tiles, centre-out.
+        queue.begin_batch();
+        for index in 10..13 {
+            queue.push((TileProvider::UsgsImagery, tile(index)));
+        }
+        // The newer frame's work comes first, in its own order; then the
+        // older frame's remainder, still in ITS order.
+        let order: Vec<Key> = std::iter::from_fn(|| queue.pop_newest()).collect();
+        let expected: Vec<Key> = [10, 11, 12, 0, 1, 2]
+            .into_iter()
+            .map(|index| (TileProvider::UsgsImagery, tile(index)))
+            .collect();
+        assert_eq!(order, expected);
+    }
+
+    /// Popping mid-batch and then pushing more of the same batch must not
+    /// let the later pushes jump in front of earlier, still-queued ones.
+    #[test]
+    fn a_batch_stays_in_order_even_while_workers_are_draining_it() {
+        let mut queue = JobQueue::default();
+        queue.begin_batch();
+        for index in 0..4 {
+            queue.push((TileProvider::UsgsImagery, tile(index)));
+        }
+        assert_eq!(
+            queue.pop_newest(),
+            Some((TileProvider::UsgsImagery, tile(0)))
+        );
+        queue.push((TileProvider::UsgsImagery, tile(4)));
+        let order: Vec<Key> = std::iter::from_fn(|| queue.pop_newest()).collect();
+        let expected: Vec<Key> = (1..5)
+            .map(|index| (TileProvider::UsgsImagery, tile(index)))
+            .collect();
+        assert_eq!(order, expected);
+    }
+
     #[test]
     fn pushing_a_queued_tile_again_is_a_no_op() {
         let mut queue = JobQueue::default();
         let key = (TileProvider::UsgsTopo, tile(1));
-        assert!(queue.push_newest(key).is_empty());
-        assert!(queue.push_newest(key).is_empty());
+        assert!(queue.push(key).is_empty());
+        assert!(queue.push(key).is_empty());
         assert_eq!(queue.jobs.len(), 1);
     }
 

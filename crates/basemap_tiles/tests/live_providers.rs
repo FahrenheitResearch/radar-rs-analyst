@@ -704,3 +704,72 @@ fn age_every_entry(root: &Path) -> usize {
     walk(root, &mut aged);
     aged
 }
+
+/// The fetch pool, sized by measurement rather than taste: sixteen cold tiles
+/// — one 512-point pane's worth — against the live USGS service under one,
+/// four, six and eight workers.
+///
+/// Each pool size fetches a DIFFERENT sixteen tiles (adjacent 4x4 blocks at
+/// z12 around KTLX) so no run is warmed by the one before it, on a fresh
+/// scratch cache each time. The numbers are printed for the record; the only
+/// assertion is the one that justifies a pool at all — that one worker is
+/// materially slower than several — because absolute times belong to the
+/// network being measured, not to this crate.
+#[test]
+#[ignore = "requires network access to the tile providers"]
+fn the_worker_pool_is_sized_against_a_measured_cold_pane() {
+    let provider = TileProvider::UsgsImageryTopo;
+    let center = TileId::containing(KTLX.0, KTLX.1, 12).expect("KTLX is on the map");
+    let mut wall_clock = Vec::new();
+    for (slot, workers) in [1_usize, 4, 6, 8].into_iter().enumerate() {
+        // A distinct 4x4 block per pool size, offset east so nothing overlaps.
+        let mut keys = Vec::new();
+        for dy in 0..4_u32 {
+            for dx in 0..4_u32 {
+                let x = center.x + 8 * slot as u32 + dx;
+                let tile = TileId::new(12, x, center.y + dy).expect("in range");
+                keys.push((provider, tile));
+            }
+        }
+        let root = scratch(&format!("pool-{workers}"));
+        let mut store = TileStore::new(
+            TileCacheConfig {
+                max_workers: workers,
+                ..config(&root, false)
+            },
+            Arc::new(|| {}),
+        );
+        let started = Instant::now();
+        let decoded = settle(&mut store, &keys, Duration::from_secs(60));
+        let elapsed = started.elapsed();
+        let metrics = store.metrics();
+        println!(
+            "{workers} worker(s): 16 tiles in {} ms ({} downloaded, {} failed)",
+            elapsed.as_millis(),
+            metrics.downloaded,
+            metrics.failed
+        );
+        assert_eq!(
+            metrics.failed, 0,
+            "a fetch failed; the timing is not comparable"
+        );
+        assert!(
+            decoded.len() >= 16,
+            "only {} of 16 tiles decoded",
+            decoded.len()
+        );
+        wall_clock.push((workers, elapsed));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    let one = wall_clock[0].1;
+    let best = wall_clock[1..]
+        .iter()
+        .map(|(_, elapsed)| *elapsed)
+        .min()
+        .expect("measured");
+    assert!(
+        best * 2 < one,
+        "parallel fetching gained less than 2x over sequential ({best:?} vs {one:?}), so the \
+         pool size deserves re-measuring"
+    );
+}
