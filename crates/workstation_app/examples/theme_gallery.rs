@@ -77,7 +77,7 @@ fn gallery_body(ui: &mut egui::Ui, state: &mut GalleryState) {
     // Toolbar strip: the composition helpers.
     bevel::raised_frame(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.strong("Radar Workstation");
+            ui.strong("GenericRadar");
             bevel::etched_separator(ui);
             if bevel::toolbar_button(ui, "Load").clicked() {
                 state.path_text.clear();
