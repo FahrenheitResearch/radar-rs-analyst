@@ -594,6 +594,16 @@ impl TileSceneController {
         let provider = self.provider?;
         self.clock += 1;
         let viewport = viewport.sanitized();
+        // The raster stands down once THIS PANE's map stops being flat. A tile
+        // mesh is built in radar-local kilometres and cached per projection
+        // generation, so it cannot follow the globe morph the vector layer is
+        // drawn under. Asked of the pane rather than of the LOD bucket, so a
+        // small pane - which reaches the globe at a coarser scale - keeps its
+        // imagery for longer.
+        if crate::projection::globe::blend_for_pane(camera.sanitized().km_per_point, viewport) > 0.0
+        {
+            return None;
+        }
         let zoom = tile_zoom_for(lod, projection.radar_lat_deg(), viewport.pixels_per_point)?;
         let zoom = zoom.min(provider.max_zoom());
         if zoom < MIN_TILE_ZOOM {

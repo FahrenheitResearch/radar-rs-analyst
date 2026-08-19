@@ -331,14 +331,22 @@ impl Default for Vol3d {
             fly_y: -2.4,
             fly_z: 1.0,
             fly_speed: 1.2,
-            threshold_dbz: 35.0,
+            // The Storm-structure preset's numbers, as the DEFAULT. At the old
+            // 35 dBZ threshold the reflectivity opacity ramp had almost no
+            // range left to grade and the box opened as a uniform translucent
+            // slab; at 12 dBZ the weak echo becomes the cloud body and the
+            // cores read as solid masses inside it - measured and LOOKED AT on
+            // KMKX 2026-08-18 20:31Z and KUDX 2026-08-19 04:37Z. The owner's
+            // requirement, verbatim: "having my 3d look like a realistic
+            // cloud is important to me."
+            threshold_dbz: 12.0,
             threshold_mode: Vol3dThresholdMode::Above,
             vel_ref_gate_dbz: 15.0,
             vel_couplet_emphasis: 0.35,
             velocity_color_active: false,
-            opacity: 0.55,
-            density: 1.0,
-            shading: 0.65,
+            opacity: 0.28,
+            density: 0.78,
+            shading: 0.9,
             lighting: Vol3dLightingSettings::default(),
             quality: Vol3dQuality::Balanced,
             floor_mode: FloorMode::LowestTilt,

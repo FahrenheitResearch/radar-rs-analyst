@@ -81,7 +81,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 if (transfer <= 0.0) { continue; }
                 let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(lut_coord, 0.5), 0.0);
                 let weight = support_weight(support);
-                let alpha = palette.a * u.opacity * transfer * max(weight, 0.15) * 0.72;
+                // A slice is a plane, not a slab, so there is no path length to
+                // integrate - but the ramp still has to reach it through the
+                // OPTICAL DEPTH and not through a multiplication on the
+                // composited alpha. Multiplying was the first shape of this and
+                // it is unsound: the gain is deliberately above 1, so
+                // `palette.a * opacity * 0.72 * k` passes 1 at a strong core,
+                // `1 - accumulated` goes NEGATIVE, and the next of the three
+                // planes then SUBTRACTS its colour and opacity. Measured on
+                // KUDX 2026-08-19T04:37Z: with a uniform ramp of 20 - strictly
+                // more absorption than a uniform 1 at every voxel - 0.37% of the
+                // frame came back LESS opaque than the flat render, by up to
+                // 0.91 opacity points, which front-to-back compositing cannot
+                // do. This form is bounded in 0..1 by construction, is the
+                // identity at k = 1, and is k * a to first order in a, so the
+                // slice and the march show one transfer function.
+                //
+                // `structure` is the STRUCTURE sample, so in velocity two-box
+                // mode the ramp is still reading reflectivity while `lut_coord`
+                // carries the signed velocity.
+                let plane_alpha = palette.a * u.opacity * transfer * max(weight, 0.15) * 0.72;
+                let alpha = 1.0 - pow(
+                    max(1.0 - plane_alpha, 0.0001),
+                    max(opacity_ramp(structure), 0.0)
+                );
                 var rgb = shaded_rgb(uvw, rd, palette.rgb);
                 if (ua.support_mode > 1.5) { rgb = support_color(support); }
                 color = color + (1.0 - accumulated) * alpha * rgb;
@@ -197,6 +220,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         let support_scale = support_weight(support);
                         var sample_rgb = palette.rgb;
                         var alpha = 0.0;
+                        // Everything that scales how much this sample absorbs
+                        // scales its OPTICAL DEPTH: the length of ray it stands
+                        // for, the density multiplier, the value-driven
+                        // extinction ramp, and the support display weight.
+                        // Only that form composites correctly, because tau adds
+                        // along a ray while alpha does not (Max 1995, eq. 1-4).
+                        // The support weight used to be multiplied onto the
+                        // finished alpha instead, which is why the same volume
+                        // changed brightness whenever the adaptive sampler
+                        // changed rate.
+                        //
+                        // `segment_dt` is the ACTUAL distance back to the
+                        // previous sample, not `base_dt`. `adaptive_strength`
+                        // lets the step reach 2.25x base, and it reaches it in
+                        // flat interiors - which is precisely the inside of a
+                        // core - so charging every sample one base step
+                        // under-attenuated the storm exactly where it was
+                        // meant to be solid. Where there is no previous sample
+                        // (first hit, or the first sample after an empty-space
+                        // skip) one base step is the honest estimate.
+                        let segment_dt = select(base_dt, max(t - previous_t, 0.0), have_previous);
+                        let optical_scale =
+                            segment_dt * 28.0 * max(u.density, 0.05) * support_scale;
                         // Preintegration is disabled for the velocity two-box
                         // path: the table integrates one field, and there the
                         // structure and the colour are different fields.
@@ -218,18 +264,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                                 0.0
                             );
                             sample_rgb = segment.rgb;
+                            // Midpoint rule for the ramp across the segment.
+                            // The table has already integrated the transfer
+                            // function from `previous_structure` to
+                            // `structure`; the ramp is the one factor left
+                            // outside it, and the value halfway along a
+                            // linearly interpolated segment is where a
+                            // second-order quadrature of k(v) is evaluated.
+                            let ramp = opacity_ramp(0.5 * (previous_structure + structure));
                             alpha = 1.0 - pow(
                                 max(1.0 - segment.a, 0.0001),
-                                max((t - previous_t) * 28.0 * u.density, 0.01)
+                                max(optical_scale * ramp, 0.0)
                             );
                         } else {
                             let raw_alpha = palette.a * u.opacity * transfer * emphasis;
+                            // One-sided, to match: `palette`, `transfer` and
+                            // `emphasis` are all evaluated at this sample, so
+                            // the ramp is too. `structure` is the STRUCTURE
+                            // plane, which is reflectivity in velocity two-box
+                            // mode - there the body comes from reflectivity and
+                            // only the colour comes from m/s, so a fast, empty
+                            // gate must not be allowed to turn solid.
+                            let ramp = opacity_ramp(structure);
                             alpha = 1.0 - pow(
                                 max(1.0 - raw_alpha, 0.0001),
-                                base_dt * 28.0 * max(u.density, 0.05)
+                                max(optical_scale * ramp, 0.0)
                             );
                         }
-                        alpha = alpha * support_scale;
                         sample_rgb = shaded_rgb(uvw, rd, sample_rgb);
                         if (ua.support_mode > 1.5 || ua.render_mode > 4.5) {
                             sample_rgb = support_color(support);

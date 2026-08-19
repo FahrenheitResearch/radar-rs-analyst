@@ -159,7 +159,6 @@ pub struct WorkstationApp {
     load_ms: Option<f32>,
     last_playback_step: Instant,
     map_scene: MapSceneController,
-    showing_placeholder_map: bool,
     sites_service: SitesService,
     sites: Vec<LocatedSite>,
     placed_sites: Arc<[PlacedSite]>,
@@ -223,7 +222,6 @@ impl WorkstationApp {
             status: "Drop a Level II file here or enter a path above".to_owned(),
             load_ms: None,
             last_playback_step: Instant::now(),
-            showing_placeholder_map: false,
             sites_service: SitesService::new(context.clone()),
             sites: Vec::new(),
             placed_sites: Vec::new().into(),
@@ -247,37 +245,14 @@ impl WorkstationApp {
             app.site_text = site.trim().to_uppercase();
             app.start_live(site);
         }
-        // Open on a map instead of an empty pane. The placeholder anchor is
-        // replaced, and the camera returned to radar scale, by the first real
-        // volume that arrives.
+        // Open on a map instead of an empty pane. The placeholder anchor, and
+        // this overview scale, are replaced by the first real volume.
         if app.history.is_empty() {
             app.map_scene.set_default_anchor();
-            app.showing_placeholder_map = true;
-            app.apply_camera_to_all_panes(|camera| {
-                camera.km_per_point = PLACEHOLDER_KM_PER_POINT;
-                camera.center_east_km = 0.0;
-                camera.center_north_km = 0.0;
-            });
+            let panes = app.workspace.centre_on_anchor(PLACEHOLDER_KM_PER_POINT);
+            app.invalidate_view_panes(&panes);
         }
         app
-    }
-
-    /// Apply a change to every pane's camera and invalidate their views.
-    fn apply_camera_to_all_panes(
-        &mut self,
-        mut change: impl FnMut(&mut analyst_runtime::Camera2D),
-    ) {
-        let mut panes = Vec::with_capacity(analyst_runtime::MAX_PANES);
-        for index in 0..analyst_runtime::MAX_PANES {
-            let Some(pane) = PaneId::new(index as u8) else {
-                continue;
-            };
-            let camera = &mut self.workspace.pane_mut(pane).camera;
-            change(camera);
-            *camera = camera.sanitized();
-            panes.push(pane);
-        }
-        self.invalidate_view_panes(&panes);
     }
 
     /// Apply a camera stated at startup to every pane, so a particular pan or
@@ -578,19 +553,36 @@ impl WorkstationApp {
             return;
         }
         // Anchor the map at the radar this volume came from. Re-anchoring is a
-        // no-op when the site is unchanged, so ordinary frame installs are
-        // free; a genuine site change invalidates every retained generation.
+        // no-op when the site is unchanged; a genuine site change moves the
+        // ground out from under every camera, so each one is re-derived against
+        // the new antenna instead of being left on kilometres that now name a
+        // different place. See `WorkspaceState::apply_site_change`.
+        let opening = self.map_scene.is_default_anchor();
+        let previous_anchor = self.map_scene.projection();
         if let (Some(latitude), Some(longitude)) = (
             loaded.volume.site.latitude_deg,
             loaded.volume.site.longitude_deg,
         ) && self
             .map_scene
             .set_radar_anchor(f64::from(latitude), f64::from(longitude))
-            && self.showing_placeholder_map
         {
-            // Leaving the opening overview: return to radar working scale.
-            self.showing_placeholder_map = false;
-            self.apply_camera_to_all_panes(|camera| *camera = analyst_runtime::Camera2D::default());
+            let new_anchor = self.map_scene.projection();
+            let changed = if opening {
+                // Nothing on screen is the analyst's unless they said so, and
+                // `--zoom`/`--center` are stated in radar-local kilometres, so
+                // the hand-over changes a scale and reprojects nothing.
+                self.workspace.leave_overview(
+                    PLACEHOLDER_KM_PER_POINT,
+                    analyst_runtime::DEFAULT_KM_PER_POINT,
+                )
+            } else {
+                let viewports = array::from_fn(|index| self.panes[index].viewport);
+                self.workspace.apply_site_change(&viewports, |world| {
+                    let (lon, lat) = previous_anchor?.world_to_lon_lat(world);
+                    new_anchor?.try_lon_lat_to_world(lon, lat)
+                })
+            };
+            self.invalidate_view_panes(&changed);
         }
 
         let before = self.current_frame_signature();

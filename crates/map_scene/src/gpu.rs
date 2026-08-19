@@ -30,7 +30,12 @@ pub struct MapUniform {
     pub world_to_clip: [[f32; 4]; 4],
     pub viewport_px: [f32; 2],
     pub pixels_per_point: f32,
-    pub _pad: f32,
+    /// How far this pane has been carried onto the orthographic globe, from
+    /// `crate::projection::globe::blend_for_pane`. It takes the slot that used
+    /// to be `_pad`, so the block's size and 16-byte alignment are unchanged.
+    /// Zero at every scale an analyst works at, where the shader's morph is an
+    /// early return.
+    pub globe_blend: f32,
 }
 
 /// Vertex as the GPU sees it. The CPU type is already `repr(C)`; this newtype
@@ -280,7 +285,13 @@ impl MapPaintCallback {
             ],
             viewport_px: [width_px, height_px],
             pixels_per_point: viewport.pixels_per_point,
-            _pad: 0.0,
+            // `camera` and `viewport` are the sanitized locals the matrix above
+            // was built from, so the blend the shader morphs by is the same
+            // number the marker and label layers derive from the same two
+            // values. The VIEWPORT is part of it: a globe fits a 900-point
+            // pane at 15.7 km/point and a 450-point pane at 31.5, so a handoff
+            // that ignored the pane would be wrong on one of them.
+            globe_blend: crate::projection::globe::blend_for_pane(camera.km_per_point, viewport),
         }
     }
 }

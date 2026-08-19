@@ -43,6 +43,21 @@ struct AdvancedUniforms {
     _advanced_pad_0: f32,
     _advanced_pad_1: f32,
     _advanced_pad_2: f32,
+
+    // The value-driven opacity ramp, in the shader's NORMALIZED structure
+    // domain. `AdvancedParams` holds the two knees in the engine units of the
+    // structure field - dBZ for reflectivity - and normalises them exactly the
+    // way it normalises `iso_value`, so the ramp is a statement about dBZ and
+    // not about texel numbers. See `opacity_ramp`.
+    opacity_ramp_low: f32,
+    opacity_ramp_high: f32,
+    opacity_ramp_gamma: f32,
+    opacity_ramp_floor: f32,
+
+    opacity_ramp_gain: f32,
+    _advanced_pad_3: f32,
+    _advanced_pad_4: f32,
+    _advanced_pad_5: f32,
 };
 
 @group(0) @binding(13) var<uniform> ua: AdvancedUniforms;
@@ -175,6 +190,92 @@ fn support_weight(value: f32) -> f32 {
     let floor_value = clamp(ua.support_floor, 0.0, 0.95);
     let normalized = smoothstep(floor_value, 1.0, value);
     return pow(max(normalized, 0.0001), max(ua.support_fade, 0.05));
+}
+
+// How much this sample ABSORBS, as a function of the value it carries.
+//
+// The return value multiplies OPTICAL DEPTH, never a composited alpha. Every
+// path here integrates the emission-absorption optical model of Max, N. (1995),
+// "Optical models for direct volume rendering", IEEE TVCG 1(2), 99-108, eq.
+// 1-4, in which transmittance along a ray is exp(-integral sigma ds). Because
+// tau is additive along the ray and alpha is not, a factor placed on tau
+// composites correctly under ANY step length, while the same factor placed on
+// alpha does not: it makes the identical volume darker or lighter as the
+// adaptive sampler changes rate. Making opacity a function of the scalar the
+// volume carries is Levoy, M. (1988), "Display of surfaces from volume data",
+// IEEE CG&A 8(3), 29-37; making the shape of that function something a user
+// steers is Kniss, J., Kindlmann, G. & Hansen, C. (2002), "Multidimensional
+// transfer functions for interactive volume rendering", IEEE TVCG 8(3),
+// 270-285. This is the one-dimensional case of theirs, over one scalar.
+//
+// It is also physics, not only taste. Reflectivity is the sixth moment of the
+// drop-size distribution, Z = integral N(D) D^6 dD, while what a beam of light
+// cannot get through is the second, integral N(D) D^2 dD. For the exponential
+// distribution of Marshall, J. S. & Palmer, W. McK. (1948), "The distribution
+// of raindrops with size", J. Meteor. 5(4), 165-166, both collapse to power
+// laws in rain rate - Z = 200 R^1.6 there, and visible extinction sigma
+// proportional to R^0.65 in Atlas, D. (1953), "Optical extinction by rainfall",
+// J. Meteor. 10(6), 486-488 - so sigma is proportional to Z^0.41. A 60 dBZ core
+// really does stop about two orders of magnitude more light than 20 dBZ
+// drizzle. Painting both at one opacity is exactly what makes a storm read as a
+// flat haze instead of as a cloud with a solid core.
+//
+// The ramp is a normalized power law rather than that exponential because a
+// display has to SATURATE: past opacity 1 there is nothing left to spend, and
+// an operator has to be able to say where the core goes solid. `gamma` moves
+// the curve between flat (1.0) and the physical law; the default is fitted to
+// it in `AdvancedParams::DEFAULT_OPACITY_RAMP_GAMMA`. `opacity_ramp_floor`
+// keeps a thick body of weak echo faintly visible instead of erasing it, and
+// setting it equal to `opacity_ramp_gain` flattens the ramp to a constant,
+// which is the renderer's behaviour before this existed and is how the A/B
+// capture is taken.
+//
+// `opacity_ramp_gain` is the multiplier at and above the high knee, and it is
+// deliberately ABOVE 1. Normalising the ramp to 1 at the core would leave every
+// value below the core more transparent than it used to be and nothing more
+// solid than it used to be, which is the exact opposite of the complaint this
+// answers. With a gain, the opacity slider keeps meaning what it says somewhere
+// in the middle of the ramp - about 45 dBZ at the defaults - while cores gain
+// body and weak echo loses it.
+//
+// No-data never reaches here: `support_value` gates it out first, in every
+// threshold mode, and the floor is applied to values the transfer gate already
+// admitted.
+//
+// The two beam-support inspection presentations are flat, for exactly the
+// reason `support_weight` refuses to fade them: they exist so an operator can
+// look at the reconstruction GEOMETRY - the cone of silence, the wide tilt
+// gaps, the top extrapolation - and grading their opacity by reflectivity
+// would report thin coverage as weak echo and hide the anatomy the mode was
+// selected to show. The gate is here rather than in `apply_support_preset`
+// because the render-mode and support-mode dropdowns reach both modes without
+// going through any preset, so a CPU-side flattening would simply be missed;
+// putting it in the shader also leaves the operator's ramp settings intact
+// across a trip through the inspection mode.
+// The `Below` and `Outside` display thresholds are flat for a related reason:
+// they exist to isolate the WEAK tail of the field, which is precisely the part
+// this ramp is built to push into haze, so grading them by reflectivity empties
+// the mode the operator just selected. Measured on KUDX 2026-08-19T04:37Z at
+// `Below 20 dBZ`: the graded ramp painted 0.00% of the frame where the flat one
+// painted 1.38%. The ramp's argument - a solid core inside a translucent body -
+// presupposes that the core is on screen, and in those two modes it is not the
+// thing being shown. Velocity two-box does not consult `threshold_mode` at all
+// (its gate is `ref_gate`), so it is excluded from this guard rather than
+// silently flattened by whatever the threshold widget was last left on.
+fn opacity_ramp(structure: f32) -> f32 {
+    if (ua.support_mode > 1.5 || ua.render_mode > 4.5) {
+        return 1.0;
+    }
+    if (u.velocity_mode < 0.5 && u.threshold_mode > 0.5) {
+        return 1.0;
+    }
+    let low = clamp(ua.opacity_ramp_low, 0.0, 1.0);
+    let high = max(ua.opacity_ramp_high, low + 0.0005);
+    let gain = max(ua.opacity_ramp_gain, 0.0);
+    let ramp_floor = clamp(ua.opacity_ramp_floor, 0.0, gain);
+    let fraction = clamp((structure - low) / (high - low), 0.0, 1.0);
+    let shaped = pow(fraction, max(ua.opacity_ramp_gamma, 0.05));
+    return ramp_floor + (gain - ramp_floor) * shaped;
 }
 
 fn support_color(value: f32) -> vec3<f32> {

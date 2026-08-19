@@ -256,9 +256,20 @@ pub fn draw_pane(
             .interact_pointer_pos()
             .filter(|pointer| rect.contains(*pointer))
             .zip(map.projection.as_ref())
-            .map(|(pointer, projection)| {
+            .and_then(|(pointer, projection)| {
                 let local = ScreenPoint::new(pointer.x - rect.left(), pointer.y - rect.top());
-                projection.world_to_lon_lat(updated_camera.screen_to_world(local, viewport))
+                // `and_then`, not `map`: a click on the black beyond the globe
+                // has no longitude and must select nothing rather than the
+                // nearest thing the limb happens to touch. `PaneInteraction`
+                // then reports it as an ordinary pane click, which is what a
+                // click on nothing should be.
+                projection.globe_to_lon_lat(
+                    updated_camera.screen_to_world(local, viewport),
+                    map_scene::projection::globe::blend_for_pane(
+                        updated_camera.sanitized().km_per_point,
+                        viewport,
+                    ),
+                )
             })
     } else {
         None
@@ -472,16 +483,27 @@ fn draw_hazards(
     viewport: ViewportMetrics,
     map: &PaneMap,
 ) {
+    let globe_blend =
+        map_scene::projection::globe::blend_for_pane(camera.sanitized().km_per_point, viewport);
     for hazard in map.hazards.iter() {
+        // A polygon is dropped WHOLE if any vertex is behind the limb:
+        // `hazard.triangles` indexes into `points`, so removing one vertex
+        // would corrupt the fill mesh rather than shorten it.
+        let mut behind_limb = false;
         let points: Vec<egui::Pos2> = hazard
             .points
             .iter()
             .map(|world| {
-                let screen = camera.world_to_screen(*world, viewport);
+                let world = map_scene::projection::globe::warp_world(*world, globe_blend)
+                    .unwrap_or_else(|| {
+                        behind_limb = true;
+                        *world
+                    });
+                let screen = camera.world_to_screen(world, viewport);
                 egui::pos2(rect.left() + screen.x, rect.top() + screen.y)
             })
             .collect();
-        if points.len() < 3 {
+        if points.len() < 3 || behind_limb {
             continue;
         }
 
@@ -644,6 +666,10 @@ fn draw_radar_sites(
     if map.sites.is_empty() {
         return None;
     }
+    // Same blend the vertex shader uses, from the same camera AND the same
+    // pane metrics, so a marker and the coastline under it cannot disagree.
+    let globe_blend =
+        map_scene::projection::globe::blend_for_pane(camera.sanitized().km_per_point, viewport);
     let pointer = ui.input(|input| input.pointer.hover_pos());
     let mut hit: Option<(String, f32)> = None;
     let mut drawn = 0_usize;
@@ -652,7 +678,13 @@ fn draw_radar_sites(
         if drawn >= MAX_SITE_MARKERS {
             break;
         }
-        let screen = camera.world_to_screen(site.world, viewport);
+        // A site on the far side of the globe is not drawn at all. It is not
+        // moved to the limb: a marker at a position that is not the site's is
+        // worse than no marker.
+        let Some(world) = map_scene::projection::globe::warp_world(site.world, globe_blend) else {
+            continue;
+        };
+        let screen = camera.world_to_screen(world, viewport);
         let position = egui::pos2(rect.left() + screen.x, rect.top() + screen.y);
         if !rect.contains(position) {
             continue;
@@ -875,8 +907,22 @@ fn draw_map_labels(
     };
     let ink = chrome_color(map.chrome.label_ink);
     let halo = chrome_color(map.chrome.label_halo);
-    let (placed, _metrics) =
-        map_scene::place_labels(geometry, camera, viewport, map_scene::MAX_LABELS_PLACED);
+    // The provider comes off the tile frame this pane is already holding, so
+    // nothing new has to be plumbed through `PaneMap` or `app.rs`. With USGS
+    // Topo or Imagery Topo the raster prints its own place names and this
+    // returns an empty list, which is what stops "Oklahoma City" appearing
+    // twice.
+    let (placed, _metrics) = map_scene::labels::place_labels_for_pane(
+        geometry,
+        camera,
+        viewport,
+        map_scene::MAX_LABELS_PLACED,
+        map_scene::labels::LabelContext::for_pane(
+            camera,
+            viewport,
+            map.tiles.as_ref().map(|frame| frame.key.provider),
+        ),
+    );
     for label in placed {
         let position = egui::pos2(
             rect.left() + label.position.x,
@@ -956,7 +1002,12 @@ fn hovered_world_km(
         return None;
     }
     let local = ScreenPoint::new(pointer.x - rect.left(), pointer.y - rect.top());
-    let world = camera.screen_to_world(local, viewport);
+    // The probe samples the volume in radar-local kilometres, so the globe has
+    // to be undone first or it reads the wrong gate.
+    let world = map_scene::projection::globe::unwarp_world(
+        camera.screen_to_world(local, viewport),
+        map_scene::projection::globe::blend_for_pane(camera.sanitized().km_per_point, viewport),
+    )?;
     Some((world.east_km, world.north_km))
 }
 
@@ -993,7 +1044,15 @@ fn draw_cursor_readout(
         return;
     }
     let local = ScreenPoint::new(pointer.x - rect.left(), pointer.y - rect.top());
-    let world = camera.screen_to_world(local, viewport);
+    // Undo the globe morph BEFORE reading anything off the position. Range and
+    // azimuth are radar-local quantities and must not be measured on the bent
+    // frame; off the globe entirely there is nothing under the cursor.
+    let Some(world) = map_scene::projection::globe::unwarp_world(
+        camera.screen_to_world(local, viewport),
+        map_scene::projection::globe::blend_for_pane(camera.sanitized().km_per_point, viewport),
+    ) else {
+        return;
+    };
     let range_km = world.east_km.hypot(world.north_km);
     let azimuth_deg = world
         .east_km

@@ -54,6 +54,11 @@ pub struct MapBuildRequest {
 /// Project, simplify and tessellate one LOD of the dataset.
 pub fn build_geometry(request: &MapBuildRequest) -> MapGeometry {
     let km_per_point = f64::from(request.key.lod.center_scale(LOD_REFERENCE_KM_PER_POINT));
+    // The tolerance is measured in the radar-local frame even when the pane is
+    // showing the globe. That is sound rather than an approximation left
+    // unchecked: the globe morph is a contraction (`globe::radial_factor` is
+    // proved to stay in `0..=1`), so a point this simplification is willing to
+    // drop can only move LESS on the globe than it does here.
     let tolerance_km = km_per_point * SIMPLIFY_TOLERANCE_PX;
     let half_extent_km = build_half_extent_km(request.key.lod);
 
@@ -334,6 +339,16 @@ fn tessellate_polyline(
     }
 }
 
+/// Project the label candidates that fall inside the retained region.
+///
+/// The FALLIBLE projection, deliberately. `lon_lat_to_world` collapses a
+/// geodesic that does not converge onto the anchor, and the anchor is inside
+/// every region, so the infallible call silently piles every unresolvable
+/// place name onto the radar itself. Measured from KTLX against the shipped
+/// dataset that is zero names today, because the antipode of a radar in the
+/// contiguous United States is empty ocean - but it is zero by luck of
+/// geography, not by construction, and a radar in the western Pacific would
+/// stack Atlantic place names on the antenna.
 fn project_labels(request: &MapBuildRequest, half_extent_km: f64) -> Vec<ProjectedLabel> {
     request
         .dataset
@@ -342,7 +357,7 @@ fn project_labels(request: &MapBuildRequest, half_extent_km: f64) -> Vec<Project
         .filter_map(|label| {
             let world = request
                 .projection
-                .lon_lat_to_world(f64::from(label.lon), f64::from(label.lat));
+                .try_lon_lat_to_world(f64::from(label.lon), f64::from(label.lat))?;
             let inside = is_inside([world.east_km, world.north_km], half_extent_km);
             inside.then_some(ProjectedLabel {
                 class: label.class,
@@ -492,6 +507,70 @@ mod tests {
             build_half_extent_km(LodBucket(-4)),
         );
         assert_eq!(runs.len(), 2, "expected the excursion to split the feature");
+    }
+
+    /// The shipped basemap, from a real anchor, still builds the same square
+    /// retained field at every bucket - including the coarse ones the globe is
+    /// drawn at.
+    ///
+    /// The globe does NOT cull here. It cannot: one vertex buffer is drawn
+    /// across the whole scale range its bucket covers, and the limb moves with
+    /// the live camera scale AND with the size of the pane, so any radius this
+    /// function could pick would be wrong at one end of the bucket or on one
+    /// pane. The far hemisphere is hidden where the limb is actually known -
+    /// at draw time, by `globe::limb_fade` and `globe::warp_world`.
+    #[test]
+    fn the_real_basemap_builds_inside_the_shipped_square_at_every_bucket() {
+        let projection = RadarProjection::new(35.333_049_774_169_92, -97.277_748_107_910_16);
+        let dataset = MapDataset::from_generated(analyst_runtime::Generation::new(1));
+        for bucket in [-6_i16, -4, -2, 0, 2, 4, 6, 8, 12, 13, 14] {
+            let lod = LodBucket(bucket);
+            let geometry = build_geometry(&MapBuildRequest {
+                key: key(lod),
+                dataset: dataset.clone(),
+                projection,
+                style: MapStyle::default(),
+            });
+            let half = build_half_extent_km(lod);
+            for vertex in geometry.vertices.iter() {
+                assert!(
+                    f64::from(vertex.position_km[0]).abs() <= half + 1.0
+                        && f64::from(vertex.position_km[1]).abs() <= half + 1.0
+                );
+            }
+            assert!(geometry.vertex_count() > 0, "bucket {bucket} built nothing");
+        }
+    }
+
+    #[test]
+    fn a_label_the_geodesic_cannot_resolve_is_dropped_rather_than_stacked_on_the_radar() {
+        // A place exactly at the antipode of the anchor: Vincenty does not
+        // converge there, and the infallible projection used to answer with the
+        // origin, which is the antenna.
+        let projection = RadarProjection::new(0.0, 0.0);
+        let dataset = MapDataset::from_parts(
+            analyst_runtime::Generation::new(1),
+            Vec::new(),
+            Vec::new(),
+            vec![crate::dataset::LabelCandidate {
+                class: crate::dataset::LabelClass::Place,
+                name: "Antipode",
+                lon: 180.0,
+                lat: 0.0,
+                rank: 0,
+            }],
+        );
+        let geometry = build_geometry(&MapBuildRequest {
+            key: key(LodBucket(12)),
+            dataset,
+            projection,
+            style: MapStyle::default(),
+        });
+        assert!(
+            geometry.labels.is_empty(),
+            "an unresolvable label reached the map at {:?}",
+            geometry.labels.first().map(|l| (l.east_km, l.north_km))
+        );
     }
 
     #[test]

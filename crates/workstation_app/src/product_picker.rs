@@ -23,10 +23,7 @@
 
 use std::collections::BTreeSet;
 
-use color_tables::{
-    ColorTable, ColorTableFamily, ColorTableSet, builtin_tables_for_family,
-    palette_offers_for_family,
-};
+use color_tables::{ColorTable, ColorTableFamily, ColorTableSet, palette_offers_for_family};
 use eframe::egui;
 use product_engine::registry::DerivedVolumeId;
 use product_engine::{
@@ -905,6 +902,10 @@ fn filter_id() -> egui::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: production code offers palettes through
+    // `palette_offers_for_family`; the tests compare that list against the
+    // bare family list to pin the "+1 switch row" relationship.
+    use color_tables::builtin_tables_for_family;
     use crate::product_availability::availability_in;
     use product_engine::{
         AlgorithmStatus, AvailabilityQualifier, CutIdentity, CutLeg, NominalElevationGroup,

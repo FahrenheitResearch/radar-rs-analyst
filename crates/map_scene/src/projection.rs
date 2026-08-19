@@ -12,8 +12,23 @@
 //! prime-vertical curvature, which left a degree of latitude 250 m long and
 //! about a kilometre of drift at 460 km range. At analysis zoom that is several
 //! pixels of misalignment on a county line.
+//!
+//! This projection is the NEAR half of a composite. Beyond the scales an
+//! analyst works at, it is bent onto an orthographic globe by [`globe`]; see
+//! that module for why, and for the proof that the bend is exactly nothing
+//! until the camera is 20x coarser than the default. Nothing in THIS file is
+//! scale dependent, and the transform below is the shipped one, unchanged.
 
 use analyst_runtime::WorldPoint;
+
+/// The far-zoom orthographic globe.
+///
+/// Declared here rather than in `lib.rs` because it is a projection: it is the
+/// second half of the composite this module's transform is the near half of,
+/// and it is meaningless without [`RadarProjection`] to bend. Reachable as
+/// `map_scene::projection::globe`.
+#[path = "globe.rs"]
+pub mod globe;
 
 /// Bump when the transform itself changes. It is part of projection identity,
 /// so a change invalidates retained geometry built by an older algorithm.
@@ -26,8 +41,24 @@ const WGS84_F: f64 = 1.0 / 298.257_223_563;
 /// WGS84 semi-minor axis, metres.
 const WGS84_B_M: f64 = WGS84_A_M * (1.0 - WGS84_F);
 
-/// Vincenty converges in a handful of steps at radar ranges; the cap only
-/// guards the near-antipodal case, which is culled long before it is drawn.
+/// Vincenty converges in a handful of steps at radar ranges. The cap guards
+/// the near-antipodal case, where the iteration is known not to converge
+/// (Vincenty 1975, p. 92).
+///
+/// This comment used to claim that case "is culled long before it is drawn".
+/// That was false once [`crate::build::MAX_BUILD_HALF_EXTENT_KM`] reached
+/// 20 000 km: the build region then covered the whole earth, so near-antipodal
+/// points really were offered to this function. What saved it was
+/// [`Self::try_lon_lat_to_world`] returning `None` rather than a non-converged
+/// answer, and the callers honouring it.
+///
+/// Measured on the shipped basemap from KTLX: 251 771 line vertices, ZERO
+/// non-convergent, furthest vertex 18 181.5 km (163.5 degrees). The iteration
+/// only gives up inside roughly a tenth of a degree of the antipode - about
+/// 19 990 km - which for a radar in the contiguous United States is the middle
+/// of the southern Indian Ocean, where the dataset has nothing. So the cap has
+/// never fired in practice; it is still load bearing, because a radar anywhere
+/// else would reach land there.
 const MAX_ITERATIONS: usize = 32;
 const CONVERGENCE: f64 = 1e-12;
 
@@ -108,6 +139,36 @@ impl RadarProjection {
     pub fn lon_lat_to_world(&self, lon_deg: f64, lat_deg: f64) -> WorldPoint {
         self.try_lon_lat_to_world(lon_deg, lat_deg)
             .unwrap_or(WorldPoint::ORIGIN)
+    }
+
+    /// Project geographic coordinates onto the blended globe.
+    ///
+    /// `blend` is [`globe::blend_for_scale`] of the camera scale the result
+    /// will be drawn at. At `blend == 0.0` this IS
+    /// [`Self::try_lon_lat_to_world`] - the same call, not an equivalent one -
+    /// so the radar-local view cannot be changed by anything the globe does.
+    ///
+    /// `None` means either that the geodesic did not converge or that the
+    /// point is behind the limb. Both are "do not draw this", and callers must
+    /// break the feature rather than substitute a position.
+    pub fn try_lon_lat_to_globe(
+        &self,
+        lon_deg: f64,
+        lat_deg: f64,
+        blend: f32,
+    ) -> Option<WorldPoint> {
+        let world = self.try_lon_lat_to_world(lon_deg, lat_deg)?;
+        if blend == 0.0 {
+            return Some(world);
+        }
+        globe::warp_world(world, blend)
+    }
+
+    /// Inverse of [`Self::try_lon_lat_to_globe`], for the cursor readout when
+    /// the pane is showing the globe.
+    pub fn globe_to_lon_lat(&self, world: WorldPoint, blend: f32) -> Option<(f64, f64)> {
+        let local = globe::unwarp_world(world, blend)?;
+        Some(self.world_to_lon_lat(local))
     }
 
     /// Inverse of [`Self::lon_lat_to_world`], returning `(lon_deg, lat_deg)`.
@@ -440,6 +501,146 @@ mod tests {
         assert_eq!(a.id(), b.id());
         assert_ne!(a.id(), c.id());
         assert_eq!(a.id().algorithm_version, PROJECTION_ALGORITHM_VERSION);
+    }
+
+    /// Real sites, transcribed from the live catalogue at
+    /// `%LOCALAPPDATA%/FahrenheitResearch/RadarWorkstation/cache/radar-sites.tsv`.
+    const REAL_SITES: &[(&str, f64, f64)] = &[
+        ("KTLX", 35.333_049_774_169_92, -97.277_748_107_910_16),
+        ("KICT", 37.654_499_053_955_08, -97.442_802_429_199_22),
+        ("KAKQ", 36.983_879_089_355_47, -77.007_499_694_824_22),
+        ("KRTX", 45.714_968_872_070_31, -122.965_301_513_671_88),
+        ("AWPA2", 61.150_001_525_878_906, -149.779_998_779_296_88),
+        ("PHKI", 21.894_000_244_140_625, -159.552_001_953_125),
+        ("RODN", 26.302_000_045_776_367, 127.909_004_211_425_78),
+        ("TJUA", 18.115_600_585_937_5, -66.077_903_747_558_6),
+    ];
+
+    /// `(site, east_km bits, north_km bits)` from KTLX, captured from the
+    /// shipped transform on 2026-08-18.
+    ///
+    /// This is the pin behind the promise that the radar-local projection did
+    /// not move by a pixel when the globe was added. It is bit patterns, not
+    /// an epsilon: a change of one unit in the last place of a `f64` fails it.
+    const FROZEN_FROM_KTLX: &[(&str, u64, u64)] = &[
+        ("KTLX", 0x0000000000000000, 0x0000000000000000),
+        ("KICT", 0xc02d233ed3ccc32c, 0x407019e95e9065ca),
+        ("KAKQ", 0x409bfeb29aabfbf3, 0x40772ed8f6397b19),
+        ("KRTX", 0xc09ef79ba638a36b, 0x4096727082a20cdd),
+        ("AWPA2", 0xc0a4ecb51103a3cd, 0x40adb173d57c69ed),
+        ("PHKI", 0xc0b80c02558ae074, 0x407a0c790e148520),
+        ("RODN", 0xc0be0b44e4c7d594, 0x40c137743aeca2aa),
+        ("TJUA", 0x40a9e8cff4108ce6, 0xc096a3a6e0fa6fac),
+    ];
+
+    #[test]
+    fn the_radar_local_transform_is_bit_for_bit_what_it_shipped_as() {
+        let projection = RadarProjection::new(REAL_SITES[0].1, REAL_SITES[0].2);
+        for ((name, lat, lon), (frozen_name, east_bits, north_bits)) in
+            REAL_SITES.iter().zip(FROZEN_FROM_KTLX)
+        {
+            assert_eq!(name, frozen_name, "the two tables must stay aligned");
+            let world = projection
+                .try_lon_lat_to_world(*lon, *lat)
+                .expect("a real site projects");
+            assert_eq!(
+                world.east_km.to_bits(),
+                *east_bits,
+                "{name} easting moved: {} vs frozen {}",
+                world.east_km,
+                f64::from_bits(*east_bits)
+            );
+            assert_eq!(
+                world.north_km.to_bits(),
+                *north_bits,
+                "{name} northing moved: {} vs frozen {}",
+                world.north_km,
+                f64::from_bits(*north_bits)
+            );
+        }
+    }
+
+    /// The globe entry point at zero blend must be the SAME CALL, not an
+    /// equivalent one. Every camera scale an analyst uses produces zero blend
+    /// (proved in `globe`), so this is what keeps 50-460 km work untouched.
+    #[test]
+    fn the_globe_entry_point_is_the_shipped_transform_at_zero_blend() {
+        for (anchor_name, anchor_lat, anchor_lon) in REAL_SITES {
+            let projection = RadarProjection::new(*anchor_lat, *anchor_lon);
+            for (name, lat, lon) in REAL_SITES {
+                let shipped = projection.try_lon_lat_to_world(*lon, *lat);
+                let globe = projection.try_lon_lat_to_globe(*lon, *lat, 0.0);
+                match (shipped, globe) {
+                    (Some(shipped), Some(globe)) => {
+                        assert_eq!(
+                            shipped.east_km.to_bits(),
+                            globe.east_km.to_bits(),
+                            "{name} from {anchor_name}"
+                        );
+                        assert_eq!(
+                            shipped.north_km.to_bits(),
+                            globe.north_km.to_bits(),
+                            "{name} from {anchor_name}"
+                        );
+                    }
+                    (None, None) => {}
+                    _ => {
+                        panic!("{name} from {anchor_name}: the two paths disagreed on drawability")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Also pin the near field itself, at the ranges the analyst interrogates,
+    /// rather than only at whole-catalogue distances.
+    #[test]
+    fn analysis_ranges_survive_the_globe_entry_point_untouched() {
+        let projection = RadarProjection::new(REAL_SITES[0].1, REAL_SITES[0].2);
+        for range_km in [1.0_f64, 50.0, 120.0, 230.0, 300.0, 460.0] {
+            for azimuth_deg in (0..360).step_by(5) {
+                let azimuth = f64::from(azimuth_deg).to_radians();
+                let seed = WorldPoint::new(range_km * azimuth.sin(), range_km * azimuth.cos());
+                let (lon, lat) = projection.world_to_lon_lat(seed);
+                let shipped = projection
+                    .try_lon_lat_to_world(lon, lat)
+                    .expect("inside the footprint");
+                let globe = projection
+                    .try_lon_lat_to_globe(lon, lat, 0.0)
+                    .expect("inside the footprint");
+                assert_eq!(shipped.east_km.to_bits(), globe.east_km.to_bits());
+                assert_eq!(shipped.north_km.to_bits(), globe.north_km.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn the_globe_inverse_returns_the_point_the_forward_pass_started_from() {
+        let projection = RadarProjection::new(REAL_SITES[0].1, REAL_SITES[0].2);
+        for blend in [0.0_f32, 0.25, 0.6, 1.0] {
+            for (name, lat, lon) in REAL_SITES {
+                let Some(world) = projection.try_lon_lat_to_globe(*lon, *lat, blend) else {
+                    continue;
+                };
+                let (back_lon, back_lat) = projection
+                    .globe_to_lon_lat(world, blend)
+                    .expect("a drawn point inverts");
+                // Compare as a ground distance, so longitude near a pole is
+                // not judged by its own degrees.
+                let straight = projection
+                    .try_lon_lat_to_world(*lon, *lat)
+                    .expect("a real site projects");
+                let returned = projection
+                    .try_lon_lat_to_world(back_lon, back_lat)
+                    .expect("the inverse lands somewhere real");
+                let error_km = (returned.east_km - straight.east_km)
+                    .hypot(returned.north_km - straight.north_km);
+                assert!(
+                    error_km < 1e-3,
+                    "{name} at blend {blend} came back {error_km} km away"
+                );
+            }
+        }
     }
 
     #[test]

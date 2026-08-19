@@ -176,6 +176,17 @@ impl Camera2D {
         let before = self.screen_to_world(anchor, viewport);
         let current = self.sanitized();
         let factor = finite_positive(factor, 1.0);
+        // Clamp the FACTOR to what the scale limits can honour, not just the
+        // result. With only the result clamped, a notch at the ceiling still
+        // ran the anchor correction against a scale that had not moved, and
+        // scrolling into the wall accumulated visible drift - measured on the
+        // real site catalogue as markers walking thousands of screen points
+        // off after an over-scrolled round trip. With the factor clamped, a
+        // notch the limits cannot honour leaves the camera exactly as it was.
+        let factor = factor.clamp(
+            current.km_per_point / MAX_KM_PER_POINT,
+            current.km_per_point / MIN_KM_PER_POINT,
+        );
         self.km_per_point =
             (current.km_per_point / factor).clamp(MIN_KM_PER_POINT, MAX_KM_PER_POINT);
         self.center_east_km = current.center_east_km;
@@ -740,6 +751,66 @@ mod tests {
         let anchor = ScreenPoint::new(810.0, 190.0);
         let before = camera.screen_to_world(anchor, VIEW);
         camera.zoom_about(2.5, anchor, VIEW);
+        let after = camera.screen_to_world(anchor, VIEW);
+        close(before.east_km, after.east_km);
+        close(before.north_km, after.north_km);
+    }
+
+    /// The bug this pins: with only the RESULT clamped, a zoom-out notch at
+    /// the scale ceiling still ran the anchor correction against a scale that
+    /// had not moved, and scrolling into the wall walked the whole map -
+    /// radar sites included - off the screen over a round trip. A notch the
+    /// limits cannot honour must leave the camera bit-for-bit untouched.
+    #[test]
+    fn a_notch_the_scale_limits_cannot_honour_is_an_exact_no_op() {
+        let mut camera = Camera2D {
+            km_per_point: MAX_KM_PER_POINT,
+            center_east_km: 120.0,
+            center_north_km: -45.0,
+            ..Camera2D::default()
+        };
+        let held = camera;
+        // Off-centre anchor, so a drifting anchor correction cannot hide.
+        let anchor = ScreenPoint::new(1200.0, 300.0);
+        for _ in 0..40 {
+            camera.zoom_about(0.72, anchor, VIEW);
+        }
+        assert_eq!(camera.km_per_point.to_bits(), held.km_per_point.to_bits());
+        assert_eq!(
+            camera.center_east_km.to_bits(),
+            held.center_east_km.to_bits()
+        );
+        assert_eq!(
+            camera.center_north_km.to_bits(),
+            held.center_north_km.to_bits()
+        );
+
+        // And at the floor, the same in the other direction.
+        let mut camera = Camera2D {
+            km_per_point: MIN_KM_PER_POINT,
+            ..Camera2D::default()
+        };
+        let held = camera;
+        camera.zoom_about(1.4, anchor, VIEW);
+        assert_eq!(camera.km_per_point.to_bits(), held.km_per_point.to_bits());
+        assert_eq!(
+            camera.center_east_km.to_bits(),
+            held.center_east_km.to_bits()
+        );
+    }
+
+    /// A notch the limits can only PARTLY honour applies exactly the
+    /// achievable part: the scale lands on the limit, and the anchor holds.
+    #[test]
+    fn a_partly_honourable_notch_applies_its_achievable_part() {
+        let mut camera = Camera2D {
+            km_per_point: MAX_KM_PER_POINT * 0.9,
+            ..Camera2D::default()
+        };
+        let anchor = ScreenPoint::new(810.0, 190.0);
+        let before = camera.screen_to_world(anchor, VIEW);
+        camera.zoom_about(0.5, anchor, VIEW);
+        assert_eq!(camera.km_per_point, MAX_KM_PER_POINT);
         let after = camera.screen_to_world(anchor, VIEW);
         close(before.east_km, after.east_km);
         close(before.north_km, after.north_km);

@@ -1050,6 +1050,24 @@ fn analysis_controls(vol3d: &mut Vol3d, ui: &mut egui::Ui, value_min: f32, value
         ui.add(egui::Slider::new(&mut vol3d.advanced.support_fade, 0.2..=3.0).text("fade power"));
     });
 
+    // The reflectivity opacity ramp: opacity as a function of the VALUE, so a
+    // core reads as a solid body and weak echo as cloud. The knees are in the
+    // STRUCTURE field's dBZ, and the ramp is inert unless that field IS
+    // reflectivity - see `advanced::AdvancedParams::packed_ramp_scale`.
+    ui.horizontal_wrapped(|ui| {
+        ui.add(
+            egui::Slider::new(&mut vol3d.advanced.opacity_ramp_low_dbz, -30.0..=40.0)
+                .text("cloud edge dBZ"),
+        );
+        ui.add(
+            egui::Slider::new(&mut vol3d.advanced.opacity_ramp_high_dbz, 40.0..=80.0)
+                .text("solid core dBZ"),
+        );
+        ui.add(egui::Slider::new(&mut vol3d.advanced.opacity_ramp_gain, 1.0..=12.0).text("body"));
+        ui.add(egui::Slider::new(&mut vol3d.advanced.opacity_ramp_gamma, 1.0..=6.0).text("focus"));
+        ui.add(egui::Slider::new(&mut vol3d.advanced.opacity_ramp_floor, 0.0..=1.0).text("haze"));
+    });
+
     ui.horizontal_wrapped(|ui| {
         ui.label("crop");
         ui.add(egui::Slider::new(&mut vol3d.advanced.crop_x_min, 0.0..=0.99).text("west"));

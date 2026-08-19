@@ -154,7 +154,9 @@ impl SupportMode {
 }
 
 /// Number of floats in the advanced uniform block.
-pub const ADVANCED_UNIFORM_FLOATS: usize = 20;
+///
+/// A multiple of four, because a WGSL uniform buffer is sized in 16-byte rows.
+pub const ADVANCED_UNIFORM_FLOATS: usize = 28;
 /// Byte size of the advanced uniform buffer.
 pub const ADVANCED_UNIFORM_BYTES: u64 =
     (ADVANCED_UNIFORM_FLOATS * std::mem::size_of::<f32>()) as u64;
@@ -183,6 +185,14 @@ pub const ADVANCED_UNIFORM_FIELDS: [&str; ADVANCED_UNIFORM_FLOATS] = [
     "_advanced_pad_0",
     "_advanced_pad_1",
     "_advanced_pad_2",
+    "opacity_ramp_low",
+    "opacity_ramp_high",
+    "opacity_ramp_gamma",
+    "opacity_ramp_floor",
+    "opacity_ramp_gain",
+    "_advanced_pad_3",
+    "_advanced_pad_4",
+    "_advanced_pad_5",
 ];
 
 /// Resource bindings the advanced fragments add to bind group 0, on top of the
@@ -228,6 +238,23 @@ pub struct AdvancedParams {
     pub slice_z: f32,
     /// Fixed-step, no-hierarchy path kept for A/B verification.
     pub reference_path: bool,
+    /// Where the opacity ramp lifts off, in the ENGINE units of the structure
+    /// field. Below it every admitted sample absorbs at `opacity_ramp_floor`.
+    pub opacity_ramp_low_dbz: f32,
+    /// Where the ramp saturates, same units. At and above it a sample absorbs
+    /// at `opacity_ramp_gain`.
+    pub opacity_ramp_high_dbz: f32,
+    /// Exponent between the knees: 1 is linear in dBZ, higher concentrates
+    /// opacity into the cores. See [`Self::DEFAULT_OPACITY_RAMP_GAMMA`].
+    pub opacity_ramp_gamma: f32,
+    /// Extinction multiplier at and below the low knee. Not zero, so a deep
+    /// body of weak echo still reads as cloud; equal to `opacity_ramp_gain` it
+    /// flattens the ramp to a constant, which is what the renderer did before
+    /// the ramp existed.
+    pub opacity_ramp_floor: f32,
+    /// Extinction multiplier at and above the high knee. Above 1 on purpose:
+    /// see [`Self::DEFAULT_OPACITY_RAMP_GAIN`].
+    pub opacity_ramp_gain: f32,
 }
 
 impl Default for AdvancedParams {
@@ -250,11 +277,118 @@ impl Default for AdvancedParams {
             slice_y: 0.5,
             slice_z: 0.35,
             reference_path: false,
+            opacity_ramp_low_dbz: Self::DEFAULT_OPACITY_RAMP_LOW_DBZ,
+            opacity_ramp_high_dbz: Self::DEFAULT_OPACITY_RAMP_HIGH_DBZ,
+            opacity_ramp_gamma: Self::DEFAULT_OPACITY_RAMP_GAMMA,
+            opacity_ramp_floor: Self::DEFAULT_OPACITY_RAMP_FLOOR,
+            opacity_ramp_gain: Self::DEFAULT_OPACITY_RAMP_GAIN,
         }
     }
 }
 
 impl AdvancedParams {
+    /// Where the ramp lifts off, dBZ: about where a reflectivity field stops
+    /// being receiver noise and starts being cloud.
+    pub const DEFAULT_OPACITY_RAMP_LOW_DBZ: f32 = 5.0;
+    /// Where the ramp saturates, dBZ: a hail-bearing core, the thing that has
+    /// to read as a solid body and not as a brighter patch of the same haze.
+    pub const DEFAULT_OPACITY_RAMP_HIGH_DBZ: f32 = 60.0;
+    /// Exponent of the ramp between the knees, chosen against the physics
+    /// rather than by eye. For a Marshall-Palmer
+    /// drop-size distribution the visible extinction coefficient goes as
+    /// `Z^0.406` - Marshall & Palmer 1948 (*The distribution of raindrops with
+    /// size*, J. Meteor. 5(4), 165-166) for `Z = 200 R^1.6`, and Atlas 1953
+    /// (*Optical extinction by rainfall*, J. Meteor. 10(6), 486-488) for
+    /// `sigma ~ R^0.65` - which in dBZ is `10^(0.0406 dBZ)`. With
+    /// [`Self::DEFAULT_OPACITY_RAMP_FLOOR`], a power law in normalised dBZ at
+    /// this exponent reproduces that curve to inside 14% from 20 to 58 dBZ, and
+    /// [`tests::the_default_ramp_tracks_the_marshall_palmer_extinction_law`]
+    /// pins it so a "let's make it pop" edit has to argue with a measurement.
+    /// Lower it toward 1.0 for a flatter body, raise it to push all but the
+    /// cores into haze.
+    pub const DEFAULT_OPACITY_RAMP_GAMMA: f32 = 4.2;
+    /// Extinction multiplier at and below the low knee. Small but non-zero: a
+    /// tall column of 10 dBZ still has to accumulate into a visible cloud edge,
+    /// which is the point of rendering a volume instead of a surface. It is
+    /// part of the fit above (the physical law does not reach zero either) and
+    /// sits on the gain's scale: the fitted shape wants 0.02 OF the gain.
+    pub const DEFAULT_OPACITY_RAMP_FLOOR: f32 = 0.07;
+    /// Extinction multiplier at and above the high knee, above 1 deliberately.
+    /// A ramp normalised to 1 at the core leaves every value below the core
+    /// thinner than it was and nothing more solid - the exact opposite of the
+    /// complaint this answers, and what the first attempt at it measured. With
+    /// a gain the opacity slider still means what it says in the middle of the
+    /// ramp (about 45 dBZ here) while cores gain body and weak echo loses it.
+    /// It multiplies an optical depth, not an alpha, so above 1 nothing
+    /// overflows: a core saturates in fewer samples, which is "solid".
+    pub const DEFAULT_OPACITY_RAMP_GAIN: f32 = 3.5;
+
+    /// The extinction multiplier at a physical value of the STRUCTURE field.
+    ///
+    /// The number the picture is made of: it multiplies the optical depth of
+    /// every sample, so the ratio of two is how much more light a core stops
+    /// than drizzle does, independent of step size or camera.
+    /// `structure_min`/`structure_max` carry the same requirement as
+    /// [`Self::shader_uniforms`]: the range of the field in `t_volume`, which
+    /// is REFLECTIVITY in velocity two-box mode. Outside that field the ramp
+    /// is flat and this returns 1 — see [`Self::packed_ramp_scale`].
+    pub fn extinction_multiplier(&self, value: f32, structure_min: f32, structure_max: f32) -> f32 {
+        let span = (structure_max - structure_min).abs().max(f32::EPSILON);
+        let normalize = |raw: f32| ((raw - structure_min) / span).clamp(0.0, 1.0);
+        let (ramp_floor, gain) = self.packed_ramp_scale(structure_min, structure_max);
+        opacity_ramp(
+            normalize(value),
+            normalize(self.opacity_ramp_low_dbz),
+            normalize(self.opacity_ramp_high_dbz),
+            self.opacity_ramp_gamma,
+            ramp_floor,
+            gain,
+        )
+    }
+
+    /// The floor and gain actually sent to the shader: the operator's pair
+    /// where the ramp means something, and a flat `(1, 1)` where it does not.
+    ///
+    /// The ramp is an argument about REFLECTIVITY and about nothing else. Its
+    /// knees are in dBZ and its exponent is fitted to a drop-size
+    /// distribution, so the whole construction is meaningless the moment
+    /// `t_volume` carries a different field — and the 3D explorer will happily
+    /// build its box from any product the operator has selected. Applied
+    /// blindly, `5..60` normalised against another declared range is not
+    /// merely arbitrary, it is wrong in ways that misread the data:
+    ///
+    /// - **Velocity** (`-64..64` m/s, or `-100..100` unfolded) is SIGNED and
+    ///   roughly symmetric about zero, so a ramp that rises with the raw value
+    ///   makes outbound flow up to fifty times more opaque than inbound flow of
+    ///   the same speed. Half of every couplet — the half a tornado is read
+    ///   from — would fade out.
+    /// - **Correlation coefficient** (`0.208..1.052`) is entirely below the
+    ///   5 dBZ knee once normalised, so every voxel would sit on the floor and
+    ///   the field would render about fourteen times more transparent than the
+    ///   operator asked for. Differential reflectivity, spectrum width and
+    ///   specific differential phase collapse the same way over their working
+    ///   ranges.
+    /// - **Differential phase** (`0..360 deg`) and the derived volume products
+    ///   run the other way: 60 units is a small fraction of their range, so
+    ///   nearly every voxel would saturate at the gain and the box would render
+    ///   as an opaque brick.
+    ///
+    /// The one signal this function has for telling the fields apart is the
+    /// declared engine range it is already given, and reflectivity's is the
+    /// NEXRAD 8-bit encoding domain. It is a deliberately narrow test:
+    /// anything it does not recognise gets the flat ramp, which is exactly the
+    /// behaviour the renderer had before the ramp existed, so an unrecognised
+    /// field can only be unchanged and never wrong.
+    /// [`tests::the_ramp_is_flat_for_every_product_that_is_not_reflectivity`]
+    /// walks the real product catalog rather than a fixture.
+    fn packed_ramp_scale(&self, structure_min: f32, structure_max: f32) -> (f32, f32) {
+        if !ramp_applies_to_structure(structure_min, structure_max) {
+            return (1.0, 1.0);
+        }
+        let gain = self.opacity_ramp_gain.max(0.0);
+        (self.opacity_ramp_floor.clamp(0.0, gain), gain)
+    }
+
     /// Direct volume rendering with weak-support fading: the operational
     /// default, and the only preset that claims nothing about surfaces.
     pub fn apply_volume_preset(&mut self) {
@@ -263,6 +397,11 @@ impl AdvancedParams {
         self.preintegration = true;
         self.adaptive_strength = 0.75;
         self.jitter_strength = 0.6;
+        self.opacity_ramp_low_dbz = Self::DEFAULT_OPACITY_RAMP_LOW_DBZ;
+        self.opacity_ramp_high_dbz = Self::DEFAULT_OPACITY_RAMP_HIGH_DBZ;
+        self.opacity_ramp_gamma = Self::DEFAULT_OPACITY_RAMP_GAMMA;
+        self.opacity_ramp_floor = Self::DEFAULT_OPACITY_RAMP_FLOOR;
+        self.opacity_ramp_gain = Self::DEFAULT_OPACITY_RAMP_GAIN;
     }
 
     pub fn apply_hybrid_preset(&mut self) {
@@ -286,6 +425,16 @@ impl AdvancedParams {
         self.support_mode = SupportMode::Inspect;
         self.preintegration = false;
         self.adaptive_strength = 0.5;
+        // The opacity ramp is NOT flattened here, and deliberately so. Both
+        // inspection presentations must be ungraded — for the same reason
+        // `support_weight` does not fade them — but the render-mode and
+        // support-mode dropdowns reach them without going through any preset,
+        // so a preset that flattened the numbers would leave the two most
+        // common routes into the mode still graded by reflectivity. The
+        // shader's `opacity_ramp` returns 1 for both instead, which covers
+        // every route and leaves the operator's ramp settings intact when they
+        // come back out. See
+        // [`tests::the_shader_flattens_the_ramp_for_the_inspection_modes`].
     }
 
     /// Keep the horizontal crop box non-degenerate and ordered.
@@ -316,6 +465,7 @@ impl AdvancedParams {
     ) -> [f32; ADVANCED_UNIFORM_FLOATS] {
         let span = (structure_max - structure_min).abs().max(f32::EPSILON);
         let (crop_x_min, crop_x_max, crop_y_min, crop_y_max) = self.normalized_horizontal_crop();
+        let (ramp_floor, ramp_gain) = self.packed_ramp_scale(structure_min, structure_max);
         [
             self.render_mode.shader_value(),
             self.support_mode.shader_value(),
@@ -338,6 +488,17 @@ impl AdvancedParams {
             self.slice_z.clamp(0.0, 1.0),
             self.adaptive_strength.clamp(0.0, 1.0),
             if self.reference_path { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
+            0.0,
+            // Normalised against the STRUCTURE range for the same reason
+            // `iso_value` is: the shader compares them to a `t_volume` sample,
+            // which is reflectivity even when the palette is m/s.
+            ((self.opacity_ramp_low_dbz - structure_min) / span).clamp(0.0, 1.0),
+            ((self.opacity_ramp_high_dbz - structure_min) / span).clamp(0.0, 1.0),
+            self.opacity_ramp_gamma.max(0.05),
+            ramp_floor,
+            ramp_gain,
             0.0,
             0.0,
             0.0,
@@ -395,6 +556,49 @@ fn threshold_strength(value: f32, low: f32, high: f32, mode: f32, width: f32) ->
         return 0.0;
     }
     smoothstep(low, low + width, value)
+}
+
+/// The declared engine range of a NEXRAD reflectivity field, and the only
+/// structure domain [`AdvancedParams`]'s opacity ramp is a statement about.
+///
+/// It is the 8-bit encoding domain, `product_engine`'s
+/// `declared_engine_range` for REF and CREF and the reflectivity range the 3D
+/// pane substitutes in velocity two-box mode.
+/// [`tests::the_reflectivity_structure_range_matches_the_product_catalog`]
+/// pins it to the catalog, so the two cannot drift apart silently.
+pub const REFLECTIVITY_STRUCTURE_RANGE_DBZ: (f32, f32) = (-32.0, 94.5);
+
+/// Whether the field in `t_volume` is the reflectivity the ramp describes.
+///
+/// Tolerance is a twentieth of a dBZ: this is an identity check on a declared
+/// constant, not a similarity metric.
+fn ramp_applies_to_structure(structure_min: f32, structure_max: f32) -> bool {
+    (structure_min - REFLECTIVITY_STRUCTURE_RANGE_DBZ.0).abs() < 0.05
+        && (structure_max - REFLECTIVITY_STRUCTURE_RANGE_DBZ.1).abs() < 0.05
+}
+
+/// The shader's `opacity_ramp`, mirrored on the CPU so the transfer function
+/// can be measured and hand-checked without a GPU. Every argument is in the
+/// shader's NORMALIZED domain, 0..1 across the structure field's declared
+/// range; [`AdvancedParams::extinction_multiplier`] takes dBZ. The result
+/// multiplies OPTICAL DEPTH, never a composited alpha - see the WGSL for why
+/// that distinction is the correctness argument, and for the Levoy 1988 /
+/// Max 1995 / Kniss 2002 lineage of the ramp itself.
+fn opacity_ramp(
+    structure01: f32,
+    low01: f32,
+    high01: f32,
+    gamma: f32,
+    ramp_floor: f32,
+    gain: f32,
+) -> f32 {
+    let low = low01.clamp(0.0, 1.0);
+    let high = high01.max(low + 0.0005);
+    let gain = gain.max(0.0);
+    let ramp_floor = ramp_floor.clamp(0.0, gain);
+    let fraction = ((structure01 - low) / (high - low)).clamp(0.0, 1.0);
+    let shaped = fraction.powf(gamma.max(0.05));
+    ramp_floor + (gain - ramp_floor) * shaped
 }
 
 /// WGSL `smoothstep`: the Hermite `3t^2 - 2t^3` blend on a clamped parameter.
@@ -874,6 +1078,11 @@ pub fn compose_shader(prelude: &str) -> String {
     out.push_str(ADVANCED_FS_MAIN);
     out
 }
+
+/// The reflectivity opacity ramp's own test suite. A sibling file, because it
+/// is one coherent argument and it is longer than the code it checks.
+#[cfg(test)]
+mod ramp_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1605,6 +1814,7 @@ mod tests {
         let wrong = params.shader_uniforms(-100.0, 100.0, true);
         assert!((wrong[4] - 0.725).abs() < 1.0e-6);
     }
+
     /// What an opacity drag actually costs the UI thread.
     ///
     /// Contract 6 says opacity must not rebuild the SPATIAL hierarchy, and it
