@@ -1275,22 +1275,22 @@ mod tests {
     }
 
     #[test]
-    fn default_reflectivity_preset_filters_low_dbz_and_stretches_high_end() {
+    fn the_default_reflectivity_is_the_wilson_awips_look() {
         let table = builtin_reflectivity_table();
 
-        assert_eq!(table.name(), "GR2Analyst Classic REF (continuous)");
+        assert_eq!(table.name(), "AWIPS Wilson REF (interpolated)");
         assert!(table.interpolates());
-        assert_eq!(table.sample_mode_label(), "continuous");
-        // Continuous rendering has no grid to report a step size for. The
-        // palette still has one - it is one flip away - and the flipped table
-        // reports it.
+        assert_eq!(table.sample_mode_label(), "interpolated");
         assert_eq!(table.step_size(), None);
-        assert_eq!(
-            table.rendered(TableRendering::Stepped).step_size(),
-            Some(5.0)
-        );
-        assert_eq!(table.sample(5.0), Rgba8::TRANSPARENT);
-        assert_ne!(table.sample(10.0), Rgba8::TRANSPARENT);
+        // The noise floor stays off the scope; the first band fades in from
+        // -30 dBZ, which is deliberate - this palette shows clear-air return.
+        assert_eq!(table.sample(-31.0).to_array()[3], 0);
+        assert!(table.sample(-25.0).to_array()[3] > 90);
+        // Declared rows, read straight off the AWIPS table.
+        assert_eq!(table.sample(35.0), Rgba8::opaque(29, 104, 9));
+        assert_eq!(table.sample(50.0), Rgba8::opaque(255, 0, 0));
+        assert_eq!(table.sample(60.0), Rgba8::opaque(255, 255, 255));
+        assert_eq!(table.sample(75.0), Rgba8::opaque(5, 236, 240));
     }
 
     /// The shipped default for the two base moments is the continuous drawing
@@ -1332,20 +1332,16 @@ mod tests {
     /// The default is the same palette it always was, wearing a different
     /// sampling. Not a different colour scheme.
     #[test]
-    fn the_defaults_that_moved_moved_sampling_and_nothing_else() {
-        for (default, palette) in [
-            (builtin_reflectivity_table(), gr2_reflectivity_table()),
-            (builtin_velocity_table(), tornado_velocity_table()),
-        ] {
-            assert_eq!(default.base_name(), palette.base_name());
-            assert_eq!(default.stops(), palette.stops());
-            assert_eq!(default.product(), palette.product());
-            assert_eq!(default.units(), palette.units());
-            assert_eq!(default.range_folded_rgba(), palette.range_folded_rgba());
-            assert_eq!(default.inked_value_span(), palette.inked_value_span());
-            assert_eq!(default.rendered(TableRendering::Stepped), palette);
-            assert_eq!(palette.rendered(TableRendering::Smooth), default);
-        }
+    fn the_defaults_are_the_ported_palettes_exactly_as_authored() {
+        // The ported looks are authored as continuous sRGB ramps, so the
+        // smooth rendering the defaults ask for is the identity - the default
+        // IS the ported palette, byte for byte, and the old classics stay in
+        // the catalogue behind it.
+        assert_eq!(
+            builtin_reflectivity_table(),
+            awips_wilson_reflectivity_table()
+        );
+        assert_eq!(builtin_velocity_table(), generic_radar_velocity_table());
     }
 
     #[test]
@@ -1356,43 +1352,28 @@ mod tests {
     }
 
     #[test]
-    fn default_velocity_table_has_radarscope_style_velocity_contrast() {
+    fn the_default_velocity_is_the_radarscope_classic_look() {
         let table = builtin_velocity_table();
 
-        assert_eq!(table.name(), "Analyst Tornado VEL (continuous)");
+        assert_eq!(table.name(), "GenericRadar VEL (interpolated)");
         assert!(table.interpolates());
-        // Every probe below lands on a declared stop, so it reads the palette's
-        // own triple and returns the same answer in either rendering. That is
-        // the point: moving the default to continuous sampling did not move a
-        // single colour the palette declares.
-        let zero = table.sample(0.0);
-        let inbound = table.sample(-58.0);
-        let inbound_core = table.sample(-9.0);
-        let outbound = table.sample(14.0);
-        let outbound_high = table.sample(50.0);
-        let outbound_extreme = table.sample(64.0);
-        let [zero_r, zero_g, zero_b, zero_a] = zero.to_array();
-        assert_eq!(zero_a, 255);
-        assert!((zero_r as i16 - zero_g as i16).abs() <= 8);
-        assert!((zero_g as i16 - zero_b as i16).abs() <= 8);
-
-        let [in_r, in_g, in_b, _] = inbound.to_array();
-        assert!(in_b > 240 && in_g > 180 && in_r < 180);
-        let [core_r, core_g, core_b, _] = inbound_core.to_array();
-        assert!(core_g > 220 && core_r < 120 && core_b < 140);
-
-        let [out_r, out_g, out_b, _] = outbound.to_array();
-        assert!(out_r > 230 && out_g < 90 && out_b < 90);
-        let [high_r, high_g, high_b, _] = outbound_high.to_array();
-        assert!(high_r > 230 && high_g > 120 && high_b > 160);
-        let [extreme_r, extreme_g, extreme_b, _] = outbound_extreme.to_array();
-        assert!(extreme_r > 230 && extreme_g > 170 && extreme_b > 110);
+        // The table is authored in knots and scaled to m/s at parse time;
+        // probe at declared rows through the same conversion the parser used.
+        let kt = |value: f32| value * (1.0 / 1.9426);
+        assert_eq!(table.sample(kt(0.0)), Rgba8::opaque(130, 106, 120));
+        assert_eq!(table.sample(kt(10.0)), Rgba8::opaque(105, 0, 0));
+        assert_eq!(table.sample(kt(40.0)), Rgba8::opaque(249, 58, 84));
+        assert_eq!(table.sample(kt(-40.0)), Rgba8::opaque(10, 248, 35));
+        assert_eq!(table.sample(kt(-70.0)), Rgba8::opaque(55, 226, 229));
+        assert_eq!(table.sample(kt(-50.0)), Rgba8::opaque(180, 240, 243));
+        let range_folded = table.range_folded_rgba().to_array();
+        assert_eq!(&range_folded[..3], &[123, 0, 200]);
     }
 
     #[test]
     fn accepted_velocity_presets_whiten_strong_wind_cores() {
         for table in [
-            builtin_velocity_table(),
+            tornado_velocity_table().rendered(TableRendering::Smooth),
             analyst_velocity_table(),
             radarscope_contrast_velocity_table(),
         ] {
@@ -1438,7 +1419,8 @@ mod tests {
         assert_eq!(
             reflectivity,
             vec![
-                "GR2Analyst Classic REF (continuous)",
+                "AWIPS Wilson REF (interpolated)",
+                "GR2Analyst Classic REF (quantized stepped)",
                 "Smooth Classic REF (interpolated)",
                 "Smooth Sequential REF (interpolated)",
                 "Smooth Storm Core REF (interpolated)",
@@ -1454,7 +1436,8 @@ mod tests {
         assert_eq!(
             velocity,
             vec![
-                "Analyst Tornado VEL (continuous)",
+                "GenericRadar VEL (interpolated)",
+                "Analyst Tornado VEL (quantized stepped)",
                 "Smooth Doppler VEL (interpolated)",
                 "Smooth Couplet VEL (interpolated)",
                 "Analyst Pro VEL (stepped)",
@@ -1604,7 +1587,7 @@ mod tests {
 
     #[test]
     fn the_reflectivity_preset_inks_from_ten_dbz_not_from_its_transparent_first_stop() {
-        let table = builtin_reflectivity_table();
+        let table = gr2_reflectivity_table();
 
         // The GR2 preset declares stops at -10 and 7.5 dBZ with alpha 0, so a
         // legend drawn across the declared domain would label empty scope.
@@ -3009,7 +2992,7 @@ mod tests {
     #[test]
     fn renaming_the_built_ins_did_not_touch_their_stops() {
         // Read off GR2_REFLECTIVITY_TABLE: 17 rows, the first two transparent.
-        let table = builtin_reflectivity_table();
+        let table = gr2_reflectivity_table();
         assert_eq!(table.stops().len(), 17);
         assert_eq!(table.stops()[0].value, -10.0);
         assert_eq!(table.stops()[0].color, Rgba8::TRANSPARENT);
@@ -3059,7 +3042,7 @@ mod tests {
         );
         assert_eq!(
             builtin_reflectivity_table().name(),
-            "GR2Analyst Classic REF (continuous)"
+            "AWIPS Wilson REF (interpolated)"
         );
         assert_eq!(
             smooth_classic_reflectivity_table().name(),
@@ -3426,8 +3409,10 @@ mod tests {
             assert_eq!(table.sample(9.75).a, 128);
 
             // Every value the encoding can actually produce agrees with the
-            // stepped default, gate for gate, in both directions.
-            let stepped = builtin_reflectivity_table();
+            // GR2 classic they were built against, gate for gate, in both
+            // directions. (The default slot moved to AWIPS Wilson, which
+            // paints low dBZ on purpose, so the classic is named directly.)
+            let stepped = gr2_reflectivity_table();
             for raw in 0_u16..=255 {
                 let dbz = (raw as f32 - 66.0) / 2.0;
                 assert_eq!(
@@ -3446,12 +3431,9 @@ mod tests {
             smooth_classic_reflectivity_table().sample(9.75),
             Rgba8::new(8, 44, 70, 128)
         );
-        // And the stepped default at the same off-grid value is fully clear,
+        // And the stepped classic at the same off-grid value is fully clear,
         // which is the whole of the difference between the two.
-        assert_eq!(
-            builtin_reflectivity_table().sample(9.75),
-            Rgba8::TRANSPARENT
-        );
+        assert_eq!(gr2_reflectivity_table().sample(9.75), Rgba8::TRANSPARENT);
     }
 
     /// Hand-read off the three stop lists. Break anchors first, then one
@@ -3909,12 +3891,12 @@ mod tests {
             distinct(&tornado_velocity_table(), ColorTableFamily::Velocity),
             61
         );
-        // 240 and not 241: one pair of adjacent half-metre-per-second readings
-        // still rounds to the same byte triple, out near the pale end of the
-        // outbound ramp where the palette itself barely moves.
+        // The ported WDT/RadarScope default resolves 241 of the encodable
+        // readings; the remainder collapse inside its deliberately flat
+        // segments, which is the original behaviour.
         assert_eq!(
             distinct(&builtin_velocity_table(), ColorTableFamily::Velocity),
-            240
+            241
         );
     }
 
@@ -3936,8 +3918,23 @@ mod tests {
             // 1. Zero is neutral, so the zero isodop reads as a line.
             let zero = table.sample(0.0);
             assert_eq!(zero.a, 255, "{} fades zero out", table.name());
-            assert_eq!(zero.r, zero.g, "{} zero is not neutral", table.name());
-            assert_eq!(zero.g, zero.b, "{} zero is not neutral", table.name());
+            if table.base_name() == "GenericRadar VEL" {
+                // The ported WDT/RadarScope classic declares its zero as a
+                // muted mauve rather than a strict grey; that declaration IS
+                // the ported look, pinned byte-for-byte in
+                // `presets::port_fidelity`. It still has to be muted enough
+                // to read as the isodop.
+                let high = zero.r.max(zero.g).max(zero.b);
+                let low = zero.r.min(zero.g).min(zero.b);
+                assert!(
+                    high - low <= 32,
+                    "{} zero is not muted: {zero:?}",
+                    table.name()
+                );
+            } else {
+                assert_eq!(zero.r, zero.g, "{} zero is not neutral", table.name());
+                assert_eq!(zero.g, zero.b, "{} zero is not neutral", table.name());
+            }
 
             // 2. The isodop is findable, which means the zero colour is
             // local to zero: nothing beyond three metres per second of it may
@@ -4200,7 +4197,13 @@ mod tests {
     /// whose weakest asymmetric pair in the same band is far above it.
     #[test]
     fn an_asymmetric_couplet_is_no_harder_to_see_continuous_than_it_was_banded() {
-        let default = builtin_velocity_table();
+        // The ratio clauses below compare a palette against its own banded
+        // drawing, which only means something for the palette that USED to
+        // ship banded - Analyst Tornado VEL, whose smooth migration this test
+        // was written to guard. The shipped default is authored continuous,
+        // so there is no banded original to regress against; it takes the
+        // absolute floor at the end instead.
+        let default = tornado_velocity_table();
         let banded = default.rendered(TableRendering::Stepped);
         let continuous = default.rendered(TableRendering::Smooth);
 
@@ -4264,6 +4267,32 @@ mod tests {
              {worst_ratio:.4} as far as the banded one did",
             worst_ratio_at.0,
             worst_ratio_at.1
+        );
+
+        // And the palette actually shipping as the default: every asymmetric
+        // couplet in the mesocyclone band must clear the just-noticeable
+        // difference on its own terms.
+        let shipped = builtin_velocity_table();
+        let mut shipped_weakest = f32::INFINITY;
+        let mut shipped_weakest_at = (0.0_f32, 0.0_f32);
+        for inbound_half in -70..=-20 {
+            let inbound = inbound_half as f32 / 2.0;
+            for outbound_half in 20..=70 {
+                let outbound = outbound_half as f32 / 2.0;
+                let separation =
+                    oklab::difference(shipped.sample(inbound), shipped.sample(outbound));
+                if separation < shipped_weakest {
+                    shipped_weakest = separation;
+                    shipped_weakest_at = (inbound, outbound);
+                }
+            }
+        }
+        assert!(
+            shipped_weakest > 0.02,
+            "the shipped default's weakest asymmetric couplet, at ({:.1}, {:.1}) m/s, \
+             separates only {shipped_weakest:.4}",
+            shipped_weakest_at.0,
+            shipped_weakest_at.1
         );
     }
 
@@ -4441,6 +4470,13 @@ mod tests {
             let perceptual = continuous.sample_mode_label() == "continuous";
             if !perceptual {
                 legacy_palettes += 1;
+                if matches!(table.base_name(), "AWIPS Wilson REF" | "GenericRadar VEL") {
+                    // The ported looks are pinned byte-for-byte to their
+                    // originals in `presets::port_fidelity`; their mid-ramp
+                    // sag is the look itself, not a defect the perceptual
+                    // mixer is allowed to fix.
+                    continue;
+                }
             }
             let stops = table.stops().to_vec();
             for (index, window) in stops.windows(2).enumerate() {

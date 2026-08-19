@@ -116,11 +116,37 @@ fn banded_preset(name: &str, stops: Vec<ColorStop>) -> ColorTable {
 // ---------------------------------------------------------------------------
 
 pub fn builtin_reflectivity_table() -> ColorTable {
-    gr2_reflectivity_table().rendered(TableRendering::Smooth)
+    awips_wilson_reflectivity_table().rendered(TableRendering::Smooth)
 }
 
 pub fn builtin_velocity_table() -> ColorTable {
-    tornado_velocity_table().rendered(TableRendering::Smooth)
+    generic_radar_velocity_table().rendered(TableRendering::Smooth)
+}
+
+/// The default velocity look: a port of the classic WDT/RadarScope velocity
+/// ramp (WDT = Weather Decision Technologies, RadarScope's publisher), via
+/// the BowEcho preset of the same ramp.
+///
+/// The source table is a GR `.pal` with two-colour ramp entries - each row's
+/// second triple is the colour the segment reaches just before the next row.
+/// This crate's parser keeps one colour per stop, so every ramp pair is
+/// expanded here into its two endpoints, the upper one 0.01 kt below the next
+/// row's value. The fidelity of the expansion against a reference sampler of
+/// the original two-colour table is pinned by
+/// `the_genericradar_velocity_port_matches_the_gr_pal_original`.
+///
+/// Values are knots in the text; the `scale:` header converts them to m/s at
+/// parse time, exactly as the original did.
+pub fn generic_radar_velocity_table() -> ColorTable {
+    parsed_preset("GenericRadar VEL", GENERIC_RADAR_VELOCITY_TABLE)
+}
+
+/// The default reflectivity look: the AWIPS colour table by Karl Schneider
+/// ("Wilson edit"), via the BowEcho preset. Same ramp-pair expansion as
+/// [`generic_radar_velocity_table`], pinned by
+/// `the_wilson_reflectivity_port_matches_the_gr_pal_original`.
+pub fn awips_wilson_reflectivity_table() -> ColorTable {
+    parsed_preset("AWIPS Wilson REF", AWIPS_WILSON_REFLECTIVITY_TABLE)
 }
 
 pub fn tornado_velocity_table() -> ColorTable {
@@ -149,6 +175,7 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
     match family {
         ColorTableFamily::Reflectivity => vec![
             builtin_reflectivity_table(),
+            gr2_reflectivity_table(),
             smooth_classic_reflectivity_table(),
             smooth_sequential_reflectivity_table(),
             smooth_storm_core_reflectivity_table(),
@@ -162,6 +189,7 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
         ],
         ColorTableFamily::Velocity => vec![
             builtin_velocity_table(),
+            tornado_velocity_table(),
             smooth_doppler_velocity_table(),
             smooth_couplet_velocity_table(),
             analyst_velocity_table(),
@@ -1995,3 +2023,282 @@ color: 80 255 230 0
 color: 100 255 255 255
 color: 120 170 170 170
 "#;
+
+// Port of the classic WDT/RadarScope velocity ramp, via the BowEcho preset.
+// Each original two-colour ramp row is expanded to its two endpoints; the
+// upper endpoint sits 0.01 kt below the next row so the break between
+// segments stays a break. Values are knots; `scale:` converts to m/s.
+const GENERIC_RADAR_VELOCITY_TABLE: &str = r#"
+product: BV
+units: KTS
+scale: 1.9426
+mode: smooth
+color: -200 255 220 220
+color: -140 255 20 180
+color: -120 250 4 130
+color: -100.01 114 3 141
+color: -100 105 2 142
+color: -90.01 32 1 141
+color: -90 25 1 142
+color: -70.01 47 215 225
+color: -70 55 226 229
+color: -50.01 172 239 242
+color: -50 180 240 243
+color: -40.01 33 253 50
+color: -40 10 248 35
+color: -10.01 15 99 20
+color: -10 72 112 71
+color: -0.01 106 125 105
+color: 0 130 106 120
+color: 9.99 122 48 57
+color: 10 105 0 0
+color: 39.99 242 1 6
+color: 40 249 58 84
+color: 54.99 255 142 212
+color: 55 255 157 206
+color: 59.99 255 221 176
+color: 60 255 230 169
+color: 79.99 255 151 86
+color: 80 254 137 80
+color: 120 97 6 2
+color: 140 60 0 0
+color: 200 45 0 0
+RF: 123 0 200
+"#;
+
+// The AWIPS colour table by Karl Schneider ("Wilson edit"), via the BowEcho
+// preset, ramp pairs expanded the same way (0.01 dBZ below the next row).
+// The bottom entry is transparent, so everything below -30 dBZ stays off the
+// scope and [-30, -20) fades in exactly as the original ramps its alpha.
+const AWIPS_WILSON_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+mode: smooth
+color4: -30 116 78 173 0
+color4: -20.01 147 141 117 255
+color: -20 150 145 83
+color: -10.01 210 212 180
+color: -10 204 207 180
+color: 9.99 65 91 158
+color: 10 67 97 162
+color: 17.99 106 208 228
+color: 18 111 214 232
+color: 21.99 53 213 91
+color: 22 17 213 24
+color: 34.99 9 94 9
+color: 35 29 104 9
+color: 39.99 234 210 4
+color: 40 255 226 0
+color: 49.99 255 128 0
+color: 50 255 0 0
+color: 59.99 113 0 0
+color: 60 255 255 255
+color: 64.99 255 146 255
+color: 65 255 117 255
+color: 69.99 225 11 227
+color: 70 178 0 255
+color: 74.99 99 0 214
+color: 75 5 236 240
+color: 84.99 1 32 32
+color: 85 1 32 32
+color: 95 1 32 32
+"#;
+
+#[cfg(test)]
+mod port_fidelity {
+    use super::*;
+
+    /// The original BowEcho/GR texts, ramp pairs and all. The shipped
+    /// constants above are hand expansions of THESE; the reference sampler
+    /// below reads the originals directly, so any expansion mistake - a
+    /// transposed digit, a missing endpoint, a wrong break - shows up as a
+    /// colour disagreement somewhere in the dense sweep.
+    const WDT_ORIGINAL: &str = "
+color: 200 45 0 0
+color: 140 60 0 0
+color: 120 97 6 2
+color: 80 254 137 80
+color: 60 255 230 169 255 151 86
+color: 55 255 157 206 255 221 176
+color: 40 249 58 84 255 142 212
+color: 10 105 0 0 242 1 6
+color: 0 130 106 120 122 48 57
+color: -10 72 112 71 106 125 105
+color: -40 10 248 35 15 99 20
+color: -50 180 240 243 33 253 50
+color: -70 55 226 229 172 239 242
+color: -90 25 1 142 47 215 225
+color: -100 105 2 142 32 1 141
+color: -120 250 4 130 114 3 141
+color: -140 255 20 180
+color: -200 255 220 220
+";
+
+    const WILSON_ORIGINAL: &str = "
+color4: -30 116 78 173 0 147 141 117 255
+color: -20 150 145 83 210 212 180
+color: -10 204 207 180 65 91 158
+color: 10 67 97 162 106 208 228
+color: 18 111 214 232 53 213 91
+color: 22 17 213 24 9 94 9
+color: 35 29 104 9 234 210 4
+color: 40 255 226 0 255 128 0
+color: 50 255 0 0 113 0 0
+color: 60 255 255 255 255 146 255
+color: 65 255 117 255 225 11 227
+color: 70 178 0 255 99 0 214
+color: 75 5 236 240 1 32 32
+color: 85 1 32 32
+color: 95 1 32 32
+";
+
+    struct GrStop {
+        value: f32,
+        color: [u8; 4],
+        end: Option<[u8; 4]>,
+    }
+
+    /// GR `.pal` two-colour rows, scaled into display units.
+    fn parse_gr(text: &str, scale: f32) -> Vec<GrStop> {
+        let mut stops: Vec<GrStop> = text
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let (key, rest) = line.split_once(':')?;
+                let with_alpha = match key.trim().to_ascii_lowercase().as_str() {
+                    "color" => false,
+                    "color4" => true,
+                    _ => return None,
+                };
+                let numbers: Vec<f32> = rest
+                    .split_whitespace()
+                    .map(|token| token.parse::<f32>().expect("test table is numeric"))
+                    .collect();
+                let head = if with_alpha { 5 } else { 4 };
+                let color = |slice: &[f32]| {
+                    let mut rgba = [0_u8, 0, 0, 255];
+                    for (target, source) in rgba.iter_mut().zip(slice) {
+                        *target = *source as u8;
+                    }
+                    if !with_alpha {
+                        rgba[3] = 255;
+                    }
+                    rgba
+                };
+                let end = (numbers.len() > head).then(|| color(&numbers[head..]));
+                Some(GrStop {
+                    value: numbers[0] * scale,
+                    color: color(&numbers[1..head]),
+                    end,
+                })
+            })
+            .collect();
+        stops.sort_by(|a, b| a.value.total_cmp(&b.value));
+        stops
+    }
+
+    fn lerp_u8(left: u8, right: u8, amount: f32) -> u8 {
+        ((left as f32 + (right as f32 - left as f32) * amount).round()).clamp(0.0, 255.0) as u8
+    }
+
+    /// BowEcho's GrPal sampler, verbatim semantics: each segment ramps from
+    /// its own colour to its declared end colour, or to the next stop's
+    /// colour when none is declared, or stays put when it is transparent.
+    fn sample_gr(stops: &[GrStop], value: f32) -> [u8; 4] {
+        let first = &stops[0];
+        if value <= first.value {
+            return first.color;
+        }
+        let index = stops.partition_point(|stop| stop.value <= value);
+        let stop = &stops[index - 1];
+        let Some(next) = stops.get(index) else {
+            return stop.color;
+        };
+        let end = stop.end.unwrap_or(if stop.color[3] == 0 {
+            stop.color
+        } else {
+            next.color
+        });
+        let span = (next.value - stop.value).max(f32::EPSILON);
+        let t = ((value - stop.value) / span).clamp(0.0, 1.0);
+        [
+            lerp_u8(stop.color[0], end[0], t),
+            lerp_u8(stop.color[1], end[1], t),
+            lerp_u8(stop.color[2], end[2], t),
+            lerp_u8(stop.color[3], end[3], t),
+        ]
+    }
+
+    /// Sweep a shipped port against the reference, densely. Values within
+    /// 0.02 units of an original row are skipped: that is where the expansion
+    /// deliberately parks its 0.01-unit break, and the two disagree by
+    /// construction inside that sliver and nowhere else.
+    fn assert_port_matches(shipped: &ColorTable, stops: &[GrStop], from: f32, to: f32) {
+        let mut value = from;
+        let mut compared = 0_u32;
+        while value <= to {
+            let near_break = stops.iter().any(|stop| (value - stop.value).abs() < 0.02);
+            if !near_break {
+                let got = shipped.sample(value).to_array();
+                let want = sample_gr(stops, value);
+                for channel in 0..4 {
+                    let difference = (got[channel] as i16 - want[channel] as i16).abs();
+                    assert!(
+                        difference <= 1,
+                        "{} at {value}: shipped {got:?} vs original {want:?}",
+                        shipped.name()
+                    );
+                }
+                compared += 1;
+            }
+            value += 0.05;
+        }
+        assert!(compared > 2_000, "the sweep barely sampled: {compared}");
+        // At every declared row the port must agree exactly, not within one.
+        for stop in stops {
+            assert_eq!(
+                shipped.sample(stop.value).to_array(),
+                stop.color,
+                "{} at declared row {}",
+                shipped.name(),
+                stop.value
+            );
+        }
+    }
+
+    #[test]
+    fn the_genericradar_velocity_port_matches_the_gr_pal_original() {
+        let shipped = generic_radar_velocity_table();
+        let stops = parse_gr(WDT_ORIGINAL, 1.0 / 1.9426);
+        assert_port_matches(&shipped, &stops, -104.0, 104.0);
+        // The declared purple; the alpha is this crate's own range-folded
+        // convention, not the table's to override.
+        let range_folded = shipped.range_folded_rgba().to_array();
+        assert_eq!(&range_folded[..3], &[123, 0, 200]);
+    }
+
+    #[test]
+    fn the_wilson_reflectivity_port_matches_the_gr_pal_original() {
+        let shipped = awips_wilson_reflectivity_table();
+        let stops = parse_gr(WILSON_ORIGINAL, 1.0);
+        assert_port_matches(&shipped, &stops, -33.0, 97.0);
+        // The bottom of the table is transparent: the noise floor stays off
+        // the scope, and the first band fades in rather than popping.
+        assert_eq!(shipped.sample(-31.0).to_array()[3], 0);
+        assert_eq!(shipped.sample(-30.0).to_array()[3], 0);
+        assert!(shipped.sample(-25.0).to_array()[3] > 90);
+    }
+
+    /// Fresh installs draw these two, exactly as shipped.
+    #[test]
+    fn the_two_base_moment_defaults_are_the_ported_looks() {
+        assert_eq!(
+            builtin_velocity_table().name(),
+            "GenericRadar VEL (interpolated)"
+        );
+        assert_eq!(
+            builtin_reflectivity_table().name(),
+            "AWIPS Wilson REF (interpolated)"
+        );
+    }
+}

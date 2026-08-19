@@ -50,6 +50,15 @@ pub fn rendering_from_id(id: &str) -> TableRendering {
     }
 }
 
+/// The era of shipped defaults this build writes. Bumped when a family's
+/// default palette changes, so `resolve_choice` can tell a passive capture of
+/// a PAST default (migrate it) from a deliberate pick of the same palette
+/// made under the current defaults (keep it).
+///
+/// Generation 2: reflectivity moved GR2Analyst Classic -> AWIPS Wilson,
+/// velocity moved Analyst Tornado -> GenericRadar VEL (2026-08-19).
+const DEFAULTS_GENERATION: u32 = 2;
+
 /// What the analyst has installed, as the snapshot the store persists.
 pub fn capture_palettes(tables: &ColorTableSet) -> BTreeMap<String, PaletteChoice> {
     let mut choices = BTreeMap::new();
@@ -60,6 +69,7 @@ pub fn capture_palettes(tables: &ColorTableSet) -> BTreeMap<String, PaletteChoic
             PaletteChoice {
                 name: table.base_name().to_owned(),
                 rendering: rendering_id(table.rendering()).to_owned(),
+                generation: DEFAULTS_GENERATION,
                 ..Default::default()
             },
         );
@@ -78,6 +88,20 @@ fn resolve_choice(family: ColorTableFamily, choice: &PaletteChoice) -> ColorTabl
     let rendering = rendering_from_id(&choice.rendering);
     let catalog = color_tables::builtin_tables_for_family(family);
     let default = ColorTableSet::default();
+    // A stored old-default name written under an EARLIER defaults
+    // generation carries no analyst intent: the every-frame mirror wrote it
+    // for whoever launched the app, so when the shipped default moves the
+    // name follows it - once. A deliberate pick of the same classic under
+    // the current generation is stored with that generation and respected.
+    let superseded = choice.generation < DEFAULTS_GENERATION
+        && match family {
+            ColorTableFamily::Reflectivity => choice.name == "GR2Analyst Classic REF",
+            ColorTableFamily::Velocity => choice.name == "Analyst Tornado VEL",
+            _ => false,
+        };
+    if superseded {
+        return default.for_family(family).clone();
+    }
     let base = catalog
         .into_iter()
         .find(|table| table.base_name() == choice.name)
@@ -193,5 +217,66 @@ mod tests {
                 .rendering(),
             TableRendering::Smooth
         );
+    }
+
+    /// The 2026-08-19 default change, seen from an existing install: the
+    /// store is full of the OLD defaults' names because the every-frame
+    /// mirror wrote them for everyone, and nobody deliberately picked them.
+    /// A pre-generation store (generation 0) migrates to the new defaults.
+    #[test]
+    fn an_old_stores_passive_default_capture_migrates_to_the_new_defaults() {
+        let mut choices = BTreeMap::new();
+        choices.insert(
+            "velocity".to_owned(),
+            PaletteChoice {
+                name: "Analyst Tornado VEL".to_owned(),
+                rendering: "smooth".to_owned(),
+                ..Default::default()
+            },
+        );
+        choices.insert(
+            "reflectivity".to_owned(),
+            PaletteChoice {
+                name: "GR2Analyst Classic REF".to_owned(),
+                rendering: "smooth".to_owned(),
+                ..Default::default()
+            },
+        );
+        let restored = apply_palettes(&choices);
+        assert_eq!(
+            restored.for_family(ColorTableFamily::Velocity).base_name(),
+            "GenericRadar VEL"
+        );
+        assert_eq!(
+            restored
+                .for_family(ColorTableFamily::Reflectivity)
+                .base_name(),
+            "AWIPS Wilson REF"
+        );
+    }
+
+    /// The other side of that coin: the same classic names written under the
+    /// CURRENT generation are a deliberate pick from the picker, and stick.
+    #[test]
+    fn a_deliberate_pick_of_the_old_classics_sticks() {
+        let mut choices = BTreeMap::new();
+        choices.insert(
+            "velocity".to_owned(),
+            PaletteChoice {
+                name: "Analyst Tornado VEL".to_owned(),
+                rendering: "smooth".to_owned(),
+                generation: DEFAULTS_GENERATION,
+                ..Default::default()
+            },
+        );
+        let restored = apply_palettes(&choices);
+        assert_eq!(
+            restored.for_family(ColorTableFamily::Velocity).base_name(),
+            "Analyst Tornado VEL"
+        );
+        // And the capture stamps the generation, so its own writes are never
+        // mistaken for a past build's.
+        let captured = capture_palettes(&restored);
+        assert_eq!(captured["velocity"].generation, DEFAULTS_GENERATION);
     }
 }

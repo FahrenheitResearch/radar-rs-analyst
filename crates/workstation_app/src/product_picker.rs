@@ -1566,10 +1566,12 @@ mod tests {
 
     #[test]
     fn clicking_a_palette_returns_the_table_and_its_family() {
+        // An interpolated-authored table, so the picker's offer carries the
+        // same name the catalog does regardless of the analyst's rendering.
         let alternative = builtin_tables_for_family(ColorTableFamily::Velocity)
             .into_iter()
-            .nth(1)
-            .expect("the velocity family has more than one table");
+            .find(|table| table.name() == "Smooth Doppler VEL (interpolated)")
+            .expect("the velocity family ships Smooth Doppler");
         let mut picker = Harness::open(DisplayProduct::Velocity);
         let outcome = picker.click(palette_row_id(alternative.name()));
         let selection = outcome.palette.expect("a palette was chosen");

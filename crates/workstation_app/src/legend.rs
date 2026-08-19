@@ -979,14 +979,15 @@ mod tests {
         let layout = legend_layout(&domain, &builtin_table_for("REF"))
             .expect("reflectivity has a drawable legend");
 
+        // AWIPS Wilson fades in from -30 dBZ and turns fully opaque at
+        // -20.01; the bar starts where the paint is solid, not at -32.
         assert_eq!(
             layout.span,
-            ValueRange::new(10.0, 92.5),
-            "the built-in reflectivity palette is transparent below 10 dBZ, so a bar drawn \
-             from -32 dBZ would advertise 42 dBZ that is never painted"
+            ValueRange::new(-20.01, 94.5),
+            "the bar must start at the palette's first opaque stop"
         );
         assert_eq!(layout.unit_label, "dBZ");
-        assert_eq!(labels(&layout), vec!["20", "40", "60", "80"]);
+        assert_eq!(labels(&layout), vec!["-20", "0", "20", "40", "60", "80"]);
     }
 
     #[test]
