@@ -993,7 +993,7 @@ mod tests {
         );
     }
 
-    /// The wedge the owner wants back. 0.5° and 8.0° are consecutive covered
+    /// The wedge the native view exists for. 0.5° and 8.0° are consecutive covered
     /// beams that both saw echo, so the interpolated fill paints straight
     /// across the 2 km of air between them; the beams fill leaves it empty,
     /// because no beam was ever there.
@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(bands, 3, "three tilts, three bands, gaps between them");
 
         // The same column in the interpolated fill is one unbroken wash from
-        // the top beam down to the ground: that is what the owner is looking
+        // the top beam down to the ground: that is what the analyst is looking
         // at and does not want.
         let smooth = slice_with_fill(&volume, &request, SliceVerticalFill::Interpolated);
         let mut washes = 0;
@@ -1524,7 +1524,7 @@ mod tests {
     /// On a real volume: both fills build, carry echo, keep the cone of
     /// silence empty, and cost little enough to follow a live volume. The
     /// timings print so both numbers land in the test log. Prefers the
-    /// owner's 19-tilt KUEX case when the cache has it.
+    /// field 19-tilt KUEX case when the cache has it.
     #[test]
     fn real_volume_slice_carries_echo_and_reports_its_build_cost() {
         let Some(volume) = decode_cached("KUEX20260816_110248").or_else(any_cached_volume) else {
@@ -1587,7 +1587,7 @@ mod tests {
         // volume cannot show: Level II reflectivity arrives quantized to
         // 0.5 dBZ, so any pixel whose value is off that quantum was computed,
         // not measured. The beams slice has none of them; the interpolated
-        // slice — which is what the owner is looking at — is made of them.
+        // slice — which is what the analyst is looking at — is made of them.
         let off_quantum = |slice: &Slice| {
             slice
                 .values
@@ -1733,7 +1733,7 @@ mod tests {
         }
     }
 
-    /// The owner's own case, side by side: one long transect through the echo
+    /// The field case, side by side: one long transect through the echo
     /// of a named volume, rendered in both fills at exactly the workstation's
     /// 640x320 / 18 km geometry, plus a 2x nearest-neighbour blow-up so the
     /// beam edges can be judged by eye. `--ignored`, like the proof above.

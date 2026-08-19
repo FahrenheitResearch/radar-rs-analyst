@@ -219,13 +219,13 @@ struct CapabilitiesKey {
     radials: usize,
 }
 
-/// Which of the two owner-approved toolbars draws.
+/// Which of the two supported toolbars draws.
 ///
 /// Both are real, kept, and one setting apart (2026-08-19): the menu bar is
 /// the compact row with File / View / Map / Tools for the occasional
 /// controls; Everything is the v0.1.0 row that shows every control at once
-/// and wraps on narrower windows. Neither is a legacy mode - "i dont hate the
-/// new ui, but i much prefer the other style. Possible to have both styles?"
+/// and wraps on narrower windows. Neither is a legacy mode: both are kept
+/// deliberately, and one setting moves between them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ToolbarStyle {
     #[default]
@@ -1601,7 +1601,7 @@ impl WorkstationApp {
     }
 
     /// The toolbar, in whichever of the two styles Settings > Appearance
-    /// picks. Both styles are owner-approved and kept on purpose - the menu
+    /// picks. Both styles are supported and kept on purpose - the menu
     /// bar as the compact default, the v0.1.0 everything-visible row one
     /// setting away - so neither is a fossil the other is waiting to delete.
     ///
@@ -3929,9 +3929,9 @@ mod tests {
         texts
     }
 
-    /// Both chromes are owner-approved and ONE SETTING apart; the compact
-    /// menu bar is the preferred one (2026-08-19: "i much prefer the other
-    /// style"), so it is what a fresh install draws. Pinned in both places a
+    /// Both chromes are supported and ONE SETTING apart; the compact
+    /// menu bar is the preferred field default (2026-08-19), so it is
+    /// what a fresh install draws. Pinned in both places a
     /// silent flip could come from: the registry default and the cache the
     /// paint path actually reads.
     #[test]
@@ -4962,7 +4962,7 @@ mod tests {
     /// difference between this and believing a string helper returned
     /// something.
     ///
-    /// Both variants, because the failure the owner photographed was
+    /// Both variants, because the failure photographed in the field was
     /// variant-specific: near-black ink that is right on the light palette and
     /// invisible on the dark one.
     #[test]
