@@ -21,8 +21,11 @@ pub use jobs::{
     LatestLaneReceiver, LatestLaneSender, SendClosed, SubmitOutcome, latest_lane_channel,
 };
 pub use view::{
-    Camera2D, DEFAULT_KM_PER_POINT, GeometryCacheKey, LodBucket, LodSelector, MAX_KM_PER_POINT,
-    MIN_KM_PER_POINT, RasterView, ScreenPoint, ViewportMetrics, WorldPoint,
+    BURST_MEMORY_SECONDS, Camera2D, DEFAULT_KM_PER_POINT, GeometryCacheKey,
+    KEY_PAN_FRACTION_PER_SECOND, KEY_ZOOM_RATE_PER_SECOND, LodBucket, LodSelector, MAX_BURST_GAIN,
+    MAX_KM_PER_POINT, MAX_NAV_STEP_SECONDS, MIN_KM_PER_POINT, NavInput, RasterView, ScreenPoint,
+    TRACKPAD_POINTS_PER_NOTCH, ViewportMetrics, WheelNotches, WorldPoint, ZOOM_PER_NOTCH,
+    ZoomResponder, zoom_factor_for_notches,
 };
 pub use workspace::{
     MAX_PANES, PaneId, PaneIntent, PaneLayout, PaneLinkGroups, SmoothingMode, StormMotionIntent,

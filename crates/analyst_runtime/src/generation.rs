@@ -64,6 +64,14 @@ pub struct RenderStamp {
     pub pane: Generation,
     pub view: Generation,
     pub palette: Generation,
+    /// How far round a still-arriving sweep the pane is allowed to paint.
+    ///
+    /// Separate from `frame` because a live volume grows without changing
+    /// identity: the reveal advances many times over one frame's lifetime, and
+    /// each step is a different picture of the same data. It advances only when
+    /// the previous render has landed, so a request is never made stale by the
+    /// animation that asked for it.
+    pub sweep: Generation,
 }
 
 impl RenderStamp {
@@ -104,6 +112,7 @@ mod tests {
             pane: Generation::new(3),
             view: Generation::new(4),
             palette: Generation::new(5),
+            sweep: Generation::new(6),
         };
         assert!(base.is_current(base));
         assert!(!base.is_current(RenderStamp {
