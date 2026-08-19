@@ -35,7 +35,7 @@
 //! forgotten — is measured against the ground its pixels actually landed on,
 //! read back out of the rendered image. Anything below 4.5:1 fails the run.
 //! A picture a human has not looked at is not a sign-off; this is the
-//! pre-flight that makes looking worth the owner's time.
+//! pre-flight that makes looking worth a reviewer's time.
 
 // The whole application, compiled into this example exactly as `src/main.rs`
 // compiles it. The directory `#[path]` is what makes each module's own child

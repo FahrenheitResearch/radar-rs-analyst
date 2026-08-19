@@ -1777,7 +1777,7 @@ mod tests {
             for fill in BOTH_FILLS {
                 let started = std::time::Instant::now();
                 // `Native`, because that is what the workstation window asks
-                // for: this is the picture the owner is looking at.
+                // for: this is the picture the analyst is looking at.
                 let Some(slice) = sample_slice(
                     &prepared,
                     &request,
@@ -2138,7 +2138,7 @@ mod tests {
         }
 
         // And on real volumes, where the values are a real field rather than
-        // a constant: the owner's own case first.
+        // a constant: the field case first.
         let Some(volume) = decode_cached("KUEX20260816_110248").or_else(any_cached_volume) else {
             eprintln!("no cached Level II volume; the synthetic half of this test stands alone");
             return;
