@@ -9,7 +9,7 @@ use analyst_runtime::{
     FrameStage, Generation, LatestLaneReceiver, LatestLaneSender, latest_lane_channel,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use data_source::RealtimeLevel2Volume;
+use data_source::{FeedFreshness, RealtimeLevel2Volume};
 use eframe::egui;
 
 const COMMAND_LANE: u8 = 0;
@@ -73,6 +73,15 @@ struct LiveSession {
     /// When the live cache was last swept against its budget, so the sweep
     /// runs on [`LIVE_CACHE_PRUNE_INTERVAL`] rather than per poll.
     last_prune: Option<Instant>,
+    /// What was last reported to the app about the feed itself: the newest
+    /// volume time the bucket is holding, and whether that counts as current.
+    ///
+    /// Held so the report is published when it CHANGES rather than on every
+    /// 1.2 s poll. It is not the same thing as `last_fingerprint`: the
+    /// fingerprint is about the volume being downloaded, and a stalled feed
+    /// hands back the identical fingerprint for ever while its age keeps
+    /// growing, which is exactly the case that has to reach the status line.
+    last_feed: Option<(DateTime<Utc>, FeedFreshness)>,
 }
 
 impl LiveSession {
@@ -86,7 +95,22 @@ impl LiveSession {
             backfill_started: false,
             backfill_cancel: Arc::new(AtomicBool::new(false)),
             last_prune: None,
+            last_feed: None,
         }
+    }
+
+    /// Whether `(volume_time, freshness)` is news the app has not been told.
+    ///
+    /// Asked before the send and recorded only after one, by
+    /// [`Self::record_feed_report`], so a report that could not be queued is
+    /// retried on the next poll instead of being lost. A stall that nobody
+    /// hears is the failure this whole path exists to prevent.
+    fn feed_report_is_news(&self, volume_time: DateTime<Utc>, freshness: FeedFreshness) -> bool {
+        self.last_feed != Some((volume_time, freshness))
+    }
+
+    fn record_feed_report(&mut self, volume_time: DateTime<Utc>, freshness: FeedFreshness) {
+        self.last_feed = Some((volume_time, freshness));
     }
 
     /// Whether this poll should sweep the cache, claiming the slot if so.
@@ -144,6 +168,23 @@ pub enum LiveUpdate {
     Started {
         generation: Generation,
         site: String,
+    },
+    /// What the FEED looks like, as opposed to what has been downloaded from
+    /// it: the newest volume time the chunks bucket is holding for this site,
+    /// and whether that is recent enough to be shown as current.
+    ///
+    /// Sent before the download, and re-sent whenever either field changes, so
+    /// a session pointed at a dead prefix can be told apart from a session
+    /// pointed at a quiet one WHILE the transfer runs rather than after a
+    /// three-day-old volume has landed looking fresh. `newest_volume_time` is
+    /// deliberately a time and not an age: the app recomputes the age against
+    /// wall clock every frame, so the number on screen keeps counting up
+    /// between polls instead of freezing at whatever it was when this was sent.
+    FeedStatus {
+        generation: Generation,
+        site: String,
+        newest_volume_time: DateTime<Utc>,
+        freshness: FeedFreshness,
     },
     VolumeReady {
         generation: Generation,
@@ -306,6 +347,18 @@ fn poll_session(
             return;
         }
     };
+    // BEFORE the fingerprint gate and before the transfer, both deliberately.
+    //
+    // The bucket stopped receiving KUEX on 2026-08-16 and a live session
+    // started on 2026-08-19 downloaded its last fragment - 3 chunks, 596 KB,
+    // three days old - and drew it under the day's warning polygons with
+    // nothing on screen but "82 chunk(s) · 14.3 MiB · downloaded". The
+    // selection was correct; the silence was the bug. Reporting here means the
+    // status line is honest from the first poll, and stays reported for as long
+    // as the session lasts, because a stalled feed returns the same fingerprint
+    // for ever and the gate below would otherwise return before ever saying so.
+    publish_feed_status(session, &volume, Utc::now(), results, context);
+
     let fingerprint = VolumeFingerprint::from(&volume);
     if session.last_fingerprint.as_ref() == Some(&fingerprint) {
         session.last_error = None;
@@ -559,6 +612,38 @@ fn send_when_room(
         }
     }
     BackfillOutcome::Dropped
+}
+
+/// Tell the app what the feed looks like, if that has changed since the last
+/// time it was told.
+///
+/// The classification is [`data_source`]'s, not this module's: the age and the
+/// threshold belong beside the listing that produced the volume time, so there
+/// is exactly one definition of "too old" in the workspace.
+fn publish_feed_status(
+    session: &mut LiveSession,
+    volume: &RealtimeLevel2Volume,
+    now: DateTime<Utc>,
+    results: &SyncSender<LiveUpdate>,
+    context: &egui::Context,
+) {
+    let freshness = volume.freshness_at(now);
+    if !session.feed_report_is_news(volume.volume_time, freshness) {
+        return;
+    }
+    let update = LiveUpdate::FeedStatus {
+        generation: session.generation,
+        site: session.site.clone(),
+        newest_volume_time: volume.volume_time,
+        freshness,
+    };
+    // `try_send`, not `send`: this must never park the poll thread behind a
+    // full result queue. Recording only on success is what makes a dropped
+    // report a retry on the next poll rather than a stall nobody hears about.
+    if results.try_send(update).is_ok() {
+        session.record_feed_report(volume.volume_time, freshness);
+        context.request_repaint();
+    }
 }
 
 fn publish_error(
@@ -914,6 +999,7 @@ mod tests {
     fn update_name(update: LiveUpdate) -> &'static str {
         match update {
             LiveUpdate::Started { .. } => "Started",
+            LiveUpdate::FeedStatus { .. } => "FeedStatus",
             LiveUpdate::VolumeReady { .. } => "VolumeReady",
             LiveUpdate::Failed { .. } => "Failed",
             LiveUpdate::Stopped => "Stopped",
@@ -943,6 +1029,279 @@ mod tests {
             chunks: Vec::new(),
             complete: false,
             total_size: 0,
+        }
+    }
+
+    // --- the feed report ----------------------------------------------------
+    //
+    // Both feeds below are the real ones this was diagnosed against on
+    // 2026-08-19 at 16:27Z: KUEX, whose chunk prefix held ids 1..=931 with
+    // nothing written since `KUEX/931/20260816-110802-003-I` (LastModified
+    // 2026-08-16T11:08:09Z), and KOAX, which had just published
+    // `KOAX20260819_162446_RT680_V06` into the same live cache.
+
+    fn observed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-19T16:27:00Z")
+            .expect("a fixed observation instant")
+            .with_timezone(&Utc)
+    }
+
+    fn feed_volume(site: &str, volume_id: u16, rfc3339: &str) -> RealtimeLevel2Volume {
+        RealtimeLevel2Volume {
+            site: site.to_owned(),
+            volume_id,
+            volume_time: DateTime::parse_from_rfc3339(rfc3339)
+                .expect("a fixed volume time")
+                .with_timezone(&Utc),
+            chunks: Vec::new(),
+            complete: false,
+            total_size: 0,
+        }
+    }
+
+    /// The last thing KUEX ever published: 3 chunks, 596 KB, three days old.
+    fn stalled_kuex_volume() -> RealtimeLevel2Volume {
+        feed_volume("KUEX", 931, "2026-08-16T11:08:02Z")
+    }
+
+    /// KOAX on the same machine at the same moment.
+    fn live_koax_volume() -> RealtimeLevel2Volume {
+        feed_volume("KOAX", 680, "2026-08-19T16:24:46Z")
+    }
+
+    fn feed_report(update: LiveUpdate) -> (String, DateTime<Utc>, FeedFreshness) {
+        let LiveUpdate::FeedStatus {
+            site,
+            newest_volume_time,
+            freshness,
+            ..
+        } = update
+        else {
+            panic!("expected a FeedStatus");
+        };
+        (site, newest_volume_time, freshness)
+    }
+
+    /// The field failure in one assertion: the app is told the feed is stalled
+    /// from the poll that found it, with nothing downloaded yet.
+    #[test]
+    fn a_stalled_feed_is_reported_before_a_single_chunk_is_fetched() {
+        let (results, drain) = mpsc::sync_channel::<LiveUpdate>(RESULT_QUEUE_CAPACITY);
+        let context = egui::Context::default();
+        let mut session = LiveSession::new(
+            Generation::new(1),
+            "KUEX".to_owned(),
+            PathBuf::from("cache"),
+        );
+
+        publish_feed_status(
+            &mut session,
+            &stalled_kuex_volume(),
+            observed_now(),
+            &results,
+            &context,
+        );
+
+        let (site, newest, freshness) = feed_report(drain.try_recv().expect("a feed report"));
+        assert_eq!(site, "KUEX");
+        assert_eq!(freshness, FeedFreshness::Stalled);
+        // A time, not an age: the app counts it up against wall clock itself.
+        assert_eq!(
+            newest.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-08-16T11:08:02Z"
+        );
+    }
+
+    /// The same code path against the healthy feed, so "Stalled" is a
+    /// measurement rather than the only answer this function can give.
+    #[test]
+    fn a_feed_that_is_keeping_up_is_reported_current() {
+        let (results, drain) = mpsc::sync_channel::<LiveUpdate>(RESULT_QUEUE_CAPACITY);
+        let context = egui::Context::default();
+        let mut session = LiveSession::new(
+            Generation::new(1),
+            "KOAX".to_owned(),
+            PathBuf::from("cache"),
+        );
+
+        publish_feed_status(
+            &mut session,
+            &live_koax_volume(),
+            observed_now(),
+            &results,
+            &context,
+        );
+
+        let (site, _newest, freshness) = feed_report(drain.try_recv().expect("a feed report"));
+        assert_eq!(site, "KOAX");
+        assert_eq!(freshness, FeedFreshness::Current);
+    }
+
+    /// A stalled feed returns the identical volume every 1.2 s for days. The
+    /// report is published on change, not per poll - but a change in EITHER
+    /// field is a change.
+    #[test]
+    fn the_feed_report_is_published_on_change_and_not_per_poll() {
+        let (results, drain) = mpsc::sync_channel::<LiveUpdate>(RESULT_QUEUE_CAPACITY);
+        let context = egui::Context::default();
+        let mut session = LiveSession::new(
+            Generation::new(1),
+            "KUEX".to_owned(),
+            PathBuf::from("cache"),
+        );
+        let stalled = stalled_kuex_volume();
+
+        for _ in 0..8 {
+            publish_feed_status(&mut session, &stalled, observed_now(), &results, &context);
+        }
+        assert_eq!(
+            drain.try_recv().ok().map(update_name),
+            Some("FeedStatus"),
+            "the first poll has to say it"
+        );
+        assert!(
+            drain.try_recv().is_err(),
+            "eight polls of an unchanged feed must produce one report"
+        );
+
+        // The prefix comes back to life: same session, new volume time, and the
+        // classification flips. Both halves are news.
+        let recovered = feed_volume("KUEX", 932, "2026-08-19T16:26:31Z");
+        publish_feed_status(&mut session, &recovered, observed_now(), &results, &context);
+        let (_site, newest, freshness) = feed_report(drain.try_recv().expect("a second report"));
+        assert_eq!(freshness, FeedFreshness::Current);
+        assert_eq!(
+            newest.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-08-19T16:26:31Z"
+        );
+    }
+
+    /// A feed does not have to CHANGE to go stale - it only has to stop, and
+    /// then wall clock does the rest. The same listing, twice, either side of
+    /// the threshold: the second poll is news even though the bucket said the
+    /// identical thing.
+    ///
+    /// This is why `publish_feed_status` runs ahead of the fingerprint gate in
+    /// `poll_session`. A dead prefix hands back a byte-identical volume for
+    /// ever, so that gate returns early on every poll after the first; a report
+    /// placed below it could never carry the moment a healthy feed crossed into
+    /// stalled. That ordering is not covered by any test - `poll_session` calls
+    /// the network directly - so it is pinned here in the only way it can be:
+    /// the behaviour the ordering exists to deliver.
+    #[test]
+    fn a_feed_that_merely_stops_is_reported_when_wall_clock_crosses_the_threshold() {
+        let (results, drain) = mpsc::sync_channel::<LiveUpdate>(RESULT_QUEUE_CAPACITY);
+        let context = egui::Context::default();
+        let mut session = LiveSession::new(
+            Generation::new(1),
+            "KOAX".to_owned(),
+            PathBuf::from("cache"),
+        );
+        // The healthy KOAX volume, and then the bucket never moves again.
+        let frozen = live_koax_volume();
+        let started = frozen.volume_time;
+
+        publish_feed_status(&mut session, &frozen, started, &results, &context);
+        let (_site, _newest, freshness) = feed_report(drain.try_recv().expect("the first poll"));
+        assert_eq!(freshness, FeedFreshness::Current);
+
+        // Fourteen minutes of the same answer: a clear-air VCP plus latency,
+        // and nothing to say.
+        publish_feed_status(
+            &mut session,
+            &frozen,
+            started + chrono::Duration::minutes(14),
+            &results,
+            &context,
+        );
+        assert!(drain.try_recv().is_err(), "14 min is not news");
+
+        // Past the threshold, with the listing byte-identical to the first one.
+        publish_feed_status(
+            &mut session,
+            &frozen,
+            started + chrono::Duration::seconds(data_source::REALTIME_FEED_STALL_AFTER_SECONDS),
+            &results,
+            &context,
+        );
+        let (_site, newest, freshness) =
+            feed_report(drain.try_recv().expect("the crossing has to be reported"));
+        assert_eq!(freshness, FeedFreshness::Stalled);
+        assert_eq!(newest, started, "the volume never changed; the clock did");
+    }
+
+    /// A report that could not be queued must not be recorded as delivered.
+    /// The whole point of this path is that the analyst hears about the stall;
+    /// a full queue at the wrong moment must cost a poll, not the message.
+    #[test]
+    fn a_feed_report_that_cannot_be_queued_is_retried_on_the_next_poll() {
+        let (results, drain) = mpsc::sync_channel::<LiveUpdate>(1);
+        let context = egui::Context::default();
+        let mut session = LiveSession::new(
+            Generation::new(1),
+            "KUEX".to_owned(),
+            PathBuf::from("cache"),
+        );
+        let stalled = stalled_kuex_volume();
+
+        // Fill the one slot with something else, so the report cannot land.
+        results
+            .try_send(LiveUpdate::Stopped)
+            .expect("the queue starts empty");
+        publish_feed_status(&mut session, &stalled, observed_now(), &results, &context);
+        assert!(
+            session.last_feed.is_none(),
+            "a report that never reached the app must not be remembered as sent"
+        );
+
+        assert_eq!(drain.try_recv().ok().map(update_name), Some("Stopped"));
+        publish_feed_status(&mut session, &stalled, observed_now(), &results, &context);
+        let (_site, _newest, freshness) = feed_report(drain.try_recv().expect("the retry"));
+        assert_eq!(freshness, FeedFreshness::Stalled);
+    }
+
+    /// PROVE ON THE REAL FEED. Lists the live chunks bucket for each site and
+    /// runs the answer through the real report path, printing what the app
+    /// would be told.
+    ///
+    /// Ignored because it needs the network. `RADAR_LIVE_SITES` overrides the
+    /// list. Run it with:
+    ///
+    /// ```text
+    /// cargo test --release -p workstation_app --bin GenericRadar -- \
+    ///     --ignored --nocapture the_real_feeds_report_themselves
+    /// ```
+    #[test]
+    #[ignore = "lists the real NEXRAD chunks bucket"]
+    fn the_real_feeds_report_themselves_as_the_bucket_actually_is() {
+        let sites = std::env::var("RADAR_LIVE_SITES").unwrap_or_else(|_| "KUEX,KOAX".to_owned());
+        let context = egui::Context::default();
+
+        for site in sites.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (results, drain) = mpsc::sync_channel::<LiveUpdate>(RESULT_QUEUE_CAPACITY);
+            let mut session =
+                LiveSession::new(Generation::new(1), site.to_owned(), PathBuf::from("cache"));
+            let volume = data_source::latest_realtime_level2_volume(site)
+                .unwrap_or_else(|error| panic!("{site} listing: {error}"));
+            let now = Utc::now();
+
+            publish_feed_status(&mut session, &volume, now, &results, &context);
+            let (reported_site, newest, freshness) =
+                feed_report(drain.try_recv().expect("the first poll always reports"));
+
+            println!(
+                "{reported_site}  newest id {:>3} at {}  ·  {} chunk(s), {:.1} MiB, complete {}",
+                volume.volume_id,
+                newest.to_rfc3339_opts(SecondsFormat::Secs, true),
+                volume.chunks.len(),
+                volume.total_size as f64 / BYTES_PER_MIB,
+                volume.complete,
+            );
+            println!(
+                "          judged at {} → {freshness:?}, age {} s\n",
+                now.to_rfc3339_opts(SecondsFormat::Secs, true),
+                volume.age_at(now).num_seconds(),
+            );
         }
     }
 

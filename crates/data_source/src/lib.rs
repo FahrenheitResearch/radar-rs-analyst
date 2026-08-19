@@ -141,6 +141,88 @@ pub struct RealtimeLevel2Volume {
     pub total_size: u64,
 }
 
+impl RealtimeLevel2Volume {
+    /// How far behind `now` this volume's start time is, never negative.
+    ///
+    /// See [`volume_age_at`]. This is the number a live display has to show:
+    /// "newest in the feed" and "current" are different claims, and only this
+    /// one can tell them apart.
+    pub fn age_at(&self, now: DateTime<Utc>) -> Duration {
+        volume_age_at(self.volume_time, now)
+    }
+
+    /// Whether a live session looking at this volume may still imply it is
+    /// current. See [`classify_feed_age`].
+    pub fn freshness_at(&self, now: DateTime<Utc>) -> FeedFreshness {
+        classify_feed_age(self.age_at(now))
+    }
+}
+
+/// How far behind wall clock the newest volume in a realtime feed may fall
+/// before a live session must stop implying its picture is current.
+///
+/// Fifteen minutes, and the margin is deliberate on both sides.
+///
+/// The floor is the slowest legitimate case. A volume is aged from its START
+/// time, so the newest volume time is already a whole volume behind by the
+/// moment that volume finishes: VCP 12/212 run about 4.2 minutes, VCP 215
+/// about 6, and the clear-air VCP 31/32 about 10 (VCP 35 measured at 7 on
+/// KTLX - see [`REALTIME_PREVIOUS_VOLUME_MAX_GAP_MINUTES`]). Add the minute or
+/// two between a chunk being written and a listing showing it, and a healthy
+/// clear-air site can legitimately sit ~12 minutes behind wall clock. A
+/// threshold under that would cry stall at a radar that is working perfectly.
+///
+/// The ceiling is what the alarm is FOR. On 2026-08-19 the chunks bucket had
+/// stopped receiving KUEX: its id set was one contiguous run 1..=931 and the
+/// newest chunk anywhere under `KUEX/` was `KUEX/931/20260816-110802-003-I`,
+/// LastModified 2026-08-16T11:08:09Z - a three-day-old, three-chunk fragment
+/// that the app downloaded and displayed under today's warning polygons
+/// without a word. Anything between ~12 minutes and three days is a judgement
+/// call; 15 minutes is the smallest round number that clears the slowest real
+/// VCP, and every failure this guards against overshoots it by orders of
+/// magnitude.
+pub const REALTIME_FEED_STALL_AFTER_SECONDS: i64 = 15 * 60;
+
+/// Whether a realtime feed is keeping up with wall clock.
+///
+/// Deliberately two states and not three. The app has one decision to make -
+/// may this picture be presented as current, yes or no - and a middle
+/// "degraded" state would be a third thing to explain on a status line that an
+/// analyst reads in a glance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedFreshness {
+    /// The newest volume in the feed is recent enough to show as live.
+    Current,
+    /// The feed has stopped keeping up. The data is still real and still worth
+    /// drawing; it must simply never be labelled as current.
+    Stalled,
+}
+
+impl FeedFreshness {
+    pub fn is_stalled(self) -> bool {
+        matches!(self, Self::Stalled)
+    }
+}
+
+/// How far behind `now` a volume that started at `volume_time` is.
+///
+/// Clamped at zero: a radar whose clock runs a few seconds ahead of this
+/// machine's would otherwise produce a negative age, and "-3 s old" on a
+/// status line reads as a bug in the app rather than as skew in a clock the
+/// app does not own.
+pub fn volume_age_at(volume_time: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (now - volume_time).max(Duration::zero())
+}
+
+/// Classify a feed age against [`REALTIME_FEED_STALL_AFTER_SECONDS`].
+pub fn classify_feed_age(age: Duration) -> FeedFreshness {
+    if age.num_seconds() >= REALTIME_FEED_STALL_AFTER_SECONDS {
+        FeedFreshness::Stalled
+    } else {
+        FeedFreshness::Current
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DataSourceError {
     #[error("HTTP request failed: {0}")]
@@ -414,6 +496,26 @@ pub fn latest_level2_object_cached(
     })
 }
 
+/// The newest volume the chunks bucket is holding for `site`.
+///
+/// NEWEST IS NOT CURRENT, and a caller that treats the two as the same word
+/// will show days-old weather as live. This function answers "what is the most
+/// recent thing in the feed"; it cannot answer "is the feed still running",
+/// because a feed that stopped three days ago still has a most-recent thing in
+/// it. On 2026-08-19 that is exactly what KUEX was: ids 1..=931 with nothing
+/// written under the prefix since 2026-08-16T11:08:09Z, so this returned a
+/// three-chunk fragment from Saturday and was right to.
+///
+/// Ask the returned volume [`RealtimeLevel2Volume::freshness_at`] before
+/// presenting it as live. Doing that BEFORE the download - it is a field on a
+/// value already in hand, not another request - is what lets a caller say
+/// "this feed is stalled" while the transfer is still running rather than
+/// after a stale volume has landed looking fresh.
+///
+/// The real cure for a dead prefix is a second source for the same radar (the
+/// Level II archive bucket carries KUEX for the same period, and NWS TDS is a
+/// third). This function deliberately does not reach for one: choosing between
+/// sources is a policy decision that belongs above it.
 pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume> {
     let site = site.to_ascii_uppercase();
     let site_prefix = format!("{site}/");
@@ -2667,6 +2769,106 @@ mod tests {
             complete: chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end()),
             chunks,
         }
+    }
+
+    // --- feed staleness -----------------------------------------------------
+    //
+    // The values here are the two real feeds this was diagnosed against on
+    // 2026-08-19, not invented times. KUEX had stopped: its chunk prefix held
+    // one contiguous id run 1..=931 and the newest object anywhere under it was
+    // `KUEX/931/20260816-110802-003-I`, LastModified 2026-08-16T11:08:09Z.
+    // KOAX on the same machine at the same moment was publishing normally, with
+    // `KOAX20260819_162446_RT680_V06` in the live cache.
+
+    /// The volume time of the last thing KUEX ever published to the chunks
+    /// bucket, read off the key `KUEX/931/20260816-110802-003-I`.
+    fn kuex_last_volume_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 16, 11, 8, 2).unwrap()
+    }
+
+    /// The volume time of the KOAX volume the same session had just fetched.
+    fn koax_live_volume_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 19, 16, 24, 46).unwrap()
+    }
+
+    /// Wall clock at the moment that KOAX volume landed in the live cache -
+    /// the file's mtime, 09:27 local. Both feeds are judged at the same
+    /// instant, which is the whole point: one had just published, the other had
+    /// not published for three days.
+    fn observed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 19, 16, 27, 0).unwrap()
+    }
+
+    fn feed_volume(site: &str, volume_time: DateTime<Utc>) -> RealtimeLevel2Volume {
+        RealtimeLevel2Volume {
+            site: site.to_owned(),
+            volume_id: 931,
+            volume_time,
+            chunks: Vec::new(),
+            complete: false,
+            total_size: 0,
+        }
+    }
+
+    #[test]
+    fn the_stalled_kuex_feed_and_the_live_koax_feed_classify_differently() {
+        let now = observed_now();
+
+        let kuex = feed_volume("KUEX", kuex_last_volume_time());
+        assert_eq!(kuex.freshness_at(now), FeedFreshness::Stalled);
+        // Three days and change, which is what the analyst was shown as live.
+        assert_eq!(kuex.age_at(now).num_days(), 3);
+
+        let koax = feed_volume("KOAX", koax_live_volume_time());
+        assert_eq!(koax.freshness_at(now), FeedFreshness::Current);
+        assert_eq!(koax.age_at(now).num_minutes(), 2);
+    }
+
+    /// The threshold has to sit above the slowest healthy VCP and far below a
+    /// dead prefix. Both edges are pinned so a later tweak has to be deliberate.
+    #[test]
+    fn the_stall_threshold_clears_a_clear_air_vcp_and_catches_a_dead_prefix() {
+        assert_eq!(REALTIME_FEED_STALL_AFTER_SECONDS, 900);
+
+        // A clear-air VCP 31/32 volume takes about 10 minutes, and the age is
+        // measured from its start, so a healthy site legitimately sits this far
+        // behind. It must not be called stalled.
+        assert_eq!(
+            classify_feed_age(Duration::minutes(10)),
+            FeedFreshness::Current
+        );
+        // Plus a couple of minutes of publication and listing latency.
+        assert_eq!(
+            classify_feed_age(Duration::minutes(12)),
+            FeedFreshness::Current
+        );
+
+        // The edge itself, from both sides.
+        assert_eq!(
+            classify_feed_age(Duration::seconds(REALTIME_FEED_STALL_AFTER_SECONDS - 1)),
+            FeedFreshness::Current
+        );
+        assert_eq!(
+            classify_feed_age(Duration::seconds(REALTIME_FEED_STALL_AFTER_SECONDS)),
+            FeedFreshness::Stalled
+        );
+
+        // And the case that started this.
+        assert_eq!(classify_feed_age(Duration::days(3)), FeedFreshness::Stalled);
+        assert!(classify_feed_age(Duration::days(3)).is_stalled());
+    }
+
+    /// A radar clock a little ahead of this machine's must not produce a
+    /// negative age, which would read on a status line as a bug in the app.
+    #[test]
+    fn a_volume_time_ahead_of_wall_clock_ages_to_zero_rather_than_negative() {
+        let now = observed_now();
+        let ahead = now + Duration::seconds(4);
+        assert_eq!(volume_age_at(ahead, now), Duration::zero());
+        assert_eq!(
+            classify_feed_age(volume_age_at(ahead, now)),
+            FeedFreshness::Current
+        );
     }
 
     // --- the bounded live cache (review §2.9) -------------------------------

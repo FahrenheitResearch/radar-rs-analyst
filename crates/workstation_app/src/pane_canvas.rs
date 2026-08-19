@@ -799,10 +799,19 @@ fn draw_radar_sites(
             )
         };
         painter.rect_filled(box_rect, 1.0, fill);
+        // A halo ring under the ink ring, the same pairing the labels use:
+        // a lone 1 px slate outline disappears on top of bright reflectivity,
+        // which is exactly where an analyst most needs to find the site.
         painter.rect_stroke(
             box_rect,
             1.0,
-            egui::Stroke::new(if active || hovered { 1.6_f32 } else { 1.0 }, stroke_color),
+            egui::Stroke::new(3.0, chrome_color(map.chrome.label_halo)),
+            egui::StrokeKind::Middle,
+        );
+        painter.rect_stroke(
+            box_rect,
+            1.0,
+            egui::Stroke::new(if active || hovered { 1.6_f32 } else { 1.2 }, stroke_color),
             egui::StrokeKind::Middle,
         );
 

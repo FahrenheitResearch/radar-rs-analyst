@@ -721,7 +721,7 @@ mod build {
             &prepared,
             &request,
             interp_policy(moment),
-            SliceSmoothing::Smoothed,
+            SliceSmoothing::Native,
         )?;
 
         // Storm-relative: subtract the motion component along each column's
