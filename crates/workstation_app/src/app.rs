@@ -842,16 +842,17 @@ impl WorkstationApp {
             if (category.as_str(), id.as_str())
                 == (keys::appearance::CATEGORY, keys::appearance::THEME)
             {
-                let variant = if self.settings_store.effective_text(
-                    &self.settings_registry,
-                    keys::appearance::CATEGORY,
-                    keys::appearance::THEME,
-                ) == "dark"
-                {
-                    crate::theme::Variant::Dark
-                } else {
-                    crate::theme::Variant::Light
-                };
+                // The same one function `main.rs` starts up through, rather
+                // than a second hand-written `== "light"`: anything that is
+                // not an explicit "light" lands on the shipped night bench,
+                // so a stored value from a future build cannot silently flip
+                // the app into the other look.
+                let variant =
+                    crate::theme::Variant::from_setting(&self.settings_store.effective_text(
+                        &self.settings_registry,
+                        keys::appearance::CATEGORY,
+                        keys::appearance::THEME,
+                    ));
                 crate::theme::apply(context, variant);
             }
         }
@@ -1569,14 +1570,22 @@ impl WorkstationApp {
         context.request_repaint();
     }
 
-    /// The menu bar.
+    /// The toolbar: every control the analyst uses, visible at once.
+    ///
+    /// One wrapped row, not a menu bar. A control behind a menu title is a
+    /// control someone has to remember exists, and mid-storm nobody goes
+    /// looking - so the product, the colour table, the tilt, the quality and
+    /// the basemap all stay on the glass where they can be seen and pointed
+    /// at. On a narrow window the row wraps; that is the price, and it is the
+    /// cheaper one.
+    ///
+    /// No brand text on the bar: the title bar already says GenericRadar, and
+    /// this row is for instruments.
     ///
     /// `pub(crate)` so `examples/theme_gallery.rs` can photograph THIS
     /// function - the real bar, on real state, through the real egui → wgpu
     /// pipeline - rather than a mock of it that cannot go stale.
     pub(crate) fn toolbar(&mut self, ui: &mut egui::Ui) {
-        use crate::theme::bevel;
-
         let active = self.workspace.active_pane;
         let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
         let mut requested_load = None;
@@ -1593,358 +1602,290 @@ impl WorkstationApp {
         let mut toggle_camera_links = false;
         let mut toggle_warnings = false;
 
-        // A menu bar, not a control wall. The bar carries only what an
-        // analyst touches mid-storm - product, palette, tilt, site - and the
-        // occasional controls live under File / View / Map / Tools, so the
-        // bar is one row at any window width instead of wrapping into a
-        // block that eats the screen.
-        //
-        // Presentation is the theme's, not egui's: a face-coloured band with
-        // the chunky raised edge every Win95 toolbar had (`raised_frame`),
-        // titles and commands flat until the pointer arrives
-        // (`toolbar_menu` / `toolbar_button`, the Office 97 refinement),
-        // latching controls sunken and tinted so their state survives a
-        // screenshot (`toolbar_toggle`), readouts inset into the chrome
-        // (`sunken_readout`), and groove separators rather than hairlines
-        // between the groups (`etched_separator`). Nothing on this bar draws
-        // a bare label on whatever ground it lands on, which is what made the
-        // product name, the tilt and the live status invisible before.
-        bevel::raised_frame(ui, |ui| {
-            // Full width: a band that stops where its buttons stop is not a
-            // band, it is a floating box.
-            ui.set_min_width(ui.available_width());
-            // A menu bar's own density. The theme's 6-point item gap is right
-            // for a form and too airy for a row of menu titles, which in every
-            // menu bar since 1995 nearly touch; the grooves do the separating.
-            // Hit targets are untouched - the >= 24 points a finger lands on
-            // is padding INSIDE each control, not the gap between them.
-            ui.spacing_mut().item_spacing.x = 3.0;
-            ui.horizontal_wrapped(|ui| {
-                bevel::toolbar_menu(ui, "File", |ui| {
-                    ui.set_min_width(300.0);
-                    ui.label("Open a Level II archive");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.source_path_text)
-                            .desired_width(260.0)
-                            .hint_text("Level II file path"),
-                    );
-                    if ui.button("Load file").clicked() && !self.source_path_text.trim().is_empty()
-                    {
-                        requested_load = Some(PathBuf::from(self.source_path_text.trim()));
-                        ui.close();
-                    }
-                    bevel::etched_separator(ui);
-                    if ui.button("Settings…").clicked() {
-                        self.settings_ui.open = true;
-                        ui.close();
-                    }
-                });
-                bevel::toolbar_menu(ui, "View", |ui| {
-                    ui.set_min_width(200.0);
-                    ui.label("Layout");
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.source_path_text)
+                    .desired_width(260.0)
+                    .hint_text("Level II file path"),
+            );
+            if ui.button("Load").clicked() && !self.source_path_text.trim().is_empty() {
+                requested_load = Some(PathBuf::from(self.source_path_text.trim()));
+            }
+
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.site_text)
+                    .desired_width(56.0)
+                    .char_limit(4)
+                    .hint_text("KRTX"),
+            );
+            if self.live_site.is_some() {
+                if ui.button("Stop live").clicked() {
+                    live_action = Some(LiveAction::Stop);
+                }
+            } else if ui.button("Start live").clicked() && !self.site_text.trim().is_empty() {
+                live_action = Some(LiveAction::Start(self.site_text.trim().to_owned()));
+            }
+            if !self.live_status.is_empty() {
+                ui.label(&self.live_status);
+            }
+            // Beside the line it contradicts, and never instead of it. On
+            // 2026-08-19 the status above said "82 chunk(s) · 14.3 MiB ·
+            // downloaded" over a KUEX volume from the previous Saturday, and
+            // every word of it was true - which is how an analyst reads "no
+            // storms" off a screen that means "no data".
+            //
+            // A readout well rather than a bare label, because this one has to
+            // be found without being looked for: the inset ground separates it
+            // from the status line it sits next to, and the theme's error ink
+            // (which overrides `sunken_readout`'s fallback rather than fighting
+            // it) says which of the two to believe. The hover carries the exact
+            // Z time the feed stopped at.
+            if let Some(notice) = self.live_stall_notice(Utc::now()) {
+                crate::theme::bevel::sunken_readout(
+                    ui,
+                    0.0,
+                    360.0,
+                    egui::RichText::new(notice)
+                        .color(ui.visuals().error_fg_color)
+                        .strong(),
+                )
+                .on_hover_text(self.live_stall_hover());
+            }
+
+            ui.separator();
+            // Its own chip, so an analyst can tell "no warnings out" from "we
+            // are not receiving warnings".
+            let chip = match self.warnings_state.active() {
+                Some(active) => format!("{} · {active}", self.warnings_state.label()),
+                None => self.warnings_state.label().to_owned(),
+            };
+            let response = ui.selectable_label(self.show_warnings, chip).on_hover_text(
+                crate::app_support::warnings_hover(
+                    &self.warnings_state.detail(),
+                    self.show_warnings,
+                    self.placed_hazards.len(),
+                ),
+            );
+            if response.clicked() {
+                toggle_warnings = true;
+            }
+
+            ui.separator();
+            egui::ComboBox::from_id_salt("workstation-layout")
+                .selected_text(layout_label(selected_layout))
+                .width(112.0)
+                .show_ui(ui, |ui| {
                     for layout in [
                         PaneLayout::One,
                         PaneLayout::TwoVertical,
                         PaneLayout::TwoHorizontal,
                         PaneLayout::Four,
                     ] {
-                        if ui
-                            .selectable_label(selected_layout == layout, layout_label(layout))
-                            .clicked()
-                        {
-                            selected_layout = layout;
-                            ui.close();
-                        }
-                    }
-                    bevel::etched_separator(ui);
-                    ui.label("Display quality");
-                    for (label, preset) in render2d::DisplayQuality::PRESETS {
-                        if ui.selectable_label(self.quality == preset, label).clicked()
-                            && self.quality != preset
-                        {
-                            self.quality = preset;
-                            quality_changed = true;
-                            ui.close();
-                        }
-                    }
-                    bevel::etched_separator(ui);
-                    if ui
-                        .selectable_label(cameras_linked, "Link cameras")
-                        .clicked()
-                    {
-                        toggle_camera_links = true;
-                    }
-                });
-                bevel::toolbar_menu(ui, "Map", |ui| {
-                    crate::app_support::basemap_menu(
-                        ui,
-                        &mut self.map_scene,
-                        &mut self.settings_store,
-                    );
-                });
-                bevel::toolbar_menu(ui, "Tools", |ui| {
-                    ui.set_min_width(220.0);
-                    if ui
-                        .selectable_label(self.vol3d.open, "3D volume explorer")
-                        .clicked()
-                    {
-                        self.vol3d.open = !self.vol3d.open;
-                        ui.close();
-                    }
-                    if ui
-                        .selectable_label(
-                            self.xsection.armed || self.xsection.open,
-                            "Cross-section",
-                        )
-                        .on_hover_text(
-                            "Arm, then click two points on a radar pane. A separate window \
-                         shows the vertical slice of the current product along that \
-                         line; drag the A/B handles to adjust.",
-                        )
-                        .clicked()
-                    {
-                        self.xsection.toggle_armed();
-                        if self.xsection.armed {
-                            // One armed click-mode at a time: a click cannot be both
-                            // a Vrot gate and a section endpoint.
-                            self.vrot_active = false;
-                            self.vrot_state.clear();
-                            self.vrot_pane = None;
-                        }
-                        ui.close();
-                    }
-                    if ui
-                        .selectable_label(self.vrot_active, "Vrot sampling")
-                        .on_hover_text(
-                            "Click two gates across a velocity couplet. Needs a dealiased \
-                         product: measuring folded velocity gives a number wrong by a \
-                         multiple of the Nyquist that still looks reasonable.",
-                        )
-                        .clicked()
-                    {
-                        self.vrot_active = !self.vrot_active;
-                        if self.vrot_active {
-                            self.xsection.armed = false;
-                        }
-                        if !self.vrot_active {
-                            self.vrot_state.clear();
-                            self.vrot_pane = None;
-                        }
-                        ui.close();
-                    }
-                    if (self.vrot_state.measurement().is_some()
-                        || self.vrot_state.pending().is_some())
-                        && ui.button("Clear Vrot").clicked()
-                    {
-                        self.vrot_state.clear();
-                        self.vrot_pane = None;
-                        ui.close();
+                        ui.selectable_value(&mut selected_layout, layout, layout_label(layout));
                     }
                 });
 
-                bevel::etched_separator(ui);
-                // A latching toggle rather than a plain button: while the picker
-                // is down the control stays sunken and tinted, so a screenshot of
-                // the bar still says where the popup came from.
-                //
-                // `⏷` and not `▾`: the fonts egui bundles carry U+23F7 - it is
-                // what `egui::containers::menu::SubMenuButton` points its own
-                // arrow with - and do NOT carry U+25BE, which renders as a
-                // tofu box. Caught by looking at the photograph.
-                let picker_button = bevel::toolbar_toggle(
-                    ui,
-                    self.product_picker_open,
-                    format!("{} ⏷", current_product.label()),
-                )
+            let picker_button = ui
+                .selectable_label(self.product_picker_open, current_product.label())
                 .on_hover_text("Choose a product and its colour table");
-                let mut opened_this_frame = false;
-                if picker_button.clicked() {
-                    self.product_picker_open = !self.product_picker_open;
-                    if self.product_picker_open {
-                        self.product_picker.opened(current_product);
-                        opened_this_frame = true;
-                    }
-                }
+            let mut opened_this_frame = false;
+            if picker_button.clicked() {
+                self.product_picker_open = !self.product_picker_open;
                 if self.product_picker_open {
-                    // Only while open: the picker takes the arrow keys, Enter and
-                    // Escape off the global event queue every frame it runs, so
-                    // drawing it unconditionally would eat them from the toolbar.
-                    let outcome = egui::Area::new(egui::Id::new("workstation-product-picker"))
-                        .order(egui::Order::Foreground)
-                        // Clear of the band, not just of the button: the
-                        // bar's frame carries 6 points of margin and a
-                        // 2-point bevel below this control, and a popup that
-                        // starts 4 points down slices through both.
-                        .fixed_pos(picker_button.rect.left_bottom() + egui::vec2(0.0, 10.0))
-                        .show(ui.ctx(), |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                draw_product_picker(
-                                    ui,
-                                    ProductPickerInput {
-                                        state: &mut self.product_picker,
-                                        current: current_product,
-                                        availability: &self.product_availability,
-                                        tables: &self.color_tables,
-                                        show_experimental: false,
-                                    },
-                                )
-                            })
-                        });
-                    let popup_rect = outcome.response.rect;
-                    let outcome = outcome.inner.inner;
-                    if let Some(product) = outcome.product {
-                        selected_product = product;
-                        self.product_picker_open = false;
-                    }
-                    if let Some(selection) = outcome.palette {
-                        // Family-wide on purpose: installing a velocity table moves
-                        // VEL, DVEL, SRV and DSRV together, because they are the
-                        // same measurement drawn four ways.
-                        Arc::make_mut(&mut self.color_tables)
-                            .set_family(selection.family, selection.table);
-                        self.palette_clock.bump();
-                        palette_changed = true;
-                    }
-                    // `crate::popup` rather than `clicked_elsewhere()`. That method
-                    // answered yes for the click that OPENED this popup - the click
-                    // was on the button, which is outside the popup - so the popup
-                    // opened and closed inside one frame and the product button was
-                    // dead. The rule now knows about that click.
-                    let dismissal = crate::popup::dismissal_from_input(
-                        ui.ctx(),
-                        popup_rect,
-                        picker_button.rect,
-                        opened_this_frame,
-                        outcome.dismissed,
-                    );
-                    if dismissal.should_close() {
-                        self.product_picker_open = false;
-                    }
+                    self.product_picker.opened(current_product);
+                    opened_this_frame = true;
                 }
-
-                // The colour table stays on the bar. It is the control that tells
-                // an analyst whether a strange-looking field is the data or the
-                // palette, so burying it one level down inside a menu was wrong.
-                let palette_family = crate::product_picker::palette_family(current_product);
-                if let Some(family) = palette_family {
-                    let installed = self.color_tables.for_family(family).clone();
-                    egui::ComboBox::from_id_salt("workstation-palette")
-                        .selected_text(installed.name())
-                        .width(210.0)
-                        .show_ui(ui, |ui| {
-                            for table in color_tables::palette_offers_for_family(family, &installed)
-                            {
-                                let chosen = table.name() == installed.name();
-                                if ui.selectable_label(chosen, table.name()).clicked() && !chosen {
-                                    Arc::make_mut(&mut self.color_tables).set_family(family, table);
-                                    self.palette_clock.bump();
-                                    palette_changed = true;
-                                }
-                            }
+            }
+            if self.product_picker_open {
+                // Only while open: the picker takes the arrow keys, Enter and
+                // Escape off the global event queue every frame it runs, so
+                // drawing it unconditionally would eat them from the toolbar.
+                let outcome = egui::Area::new(egui::Id::new("workstation-product-picker"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(picker_button.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            draw_product_picker(
+                                ui,
+                                ProductPickerInput {
+                                    state: &mut self.product_picker,
+                                    current: current_product,
+                                    availability: &self.product_availability,
+                                    tables: &self.color_tables,
+                                    show_experimental: false,
+                                },
+                            )
                         })
-                        .response
-                        .on_hover_text(
-                            "Colour table for this product's family. The last row is the \
+                    });
+                let popup_rect = outcome.response.rect;
+                let outcome = outcome.inner.inner;
+                if let Some(product) = outcome.product {
+                    selected_product = product;
+                    self.product_picker_open = false;
+                }
+                if let Some(selection) = outcome.palette {
+                    // Family-wide on purpose: installing a velocity table moves
+                    // VEL, DVEL, SRV and DSRV together, because they are the
+                    // same measurement drawn four ways.
+                    Arc::make_mut(&mut self.color_tables)
+                        .set_family(selection.family, selection.table);
+                    self.palette_clock.bump();
+                    palette_changed = true;
+                }
+                // `crate::popup` rather than `clicked_elsewhere()`. That method
+                // answered yes for the click that OPENED this popup - the click
+                // was on the button, which is outside the popup - so the popup
+                // opened and closed inside one frame and the product button was
+                // dead. The rule now knows about that click.
+                let dismissal = crate::popup::dismissal_from_input(
+                    ui.ctx(),
+                    popup_rect,
+                    picker_button.rect,
+                    opened_this_frame,
+                    outcome.dismissed,
+                );
+                if dismissal.should_close() {
+                    self.product_picker_open = false;
+                }
+            }
+
+            // A colour table has to be reachable without the popup. It is the
+            // control that tells an analyst whether a strange-looking field is
+            // the data or the palette, so burying it one level down inside
+            // another menu was wrong.
+            let palette_family = crate::product_picker::palette_family(current_product);
+            if let Some(family) = palette_family {
+                let installed = self.color_tables.for_family(family).clone();
+                egui::ComboBox::from_id_salt("workstation-palette")
+                    .selected_text(installed.name())
+                    .width(210.0)
+                    .show_ui(ui, |ui| {
+                        for table in color_tables::palette_offers_for_family(family, &installed) {
+                            let chosen = table.name() == installed.name();
+                            if ui.selectable_label(chosen, table.name()).clicked() && !chosen {
+                                Arc::make_mut(&mut self.color_tables).set_family(family, table);
+                                self.palette_clock.bump();
+                                palette_changed = true;
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Colour table for this product's family. The last row is the \
                          selected palette redrawn the other way: smooth or stepped.",
-                        );
-                }
+                    );
+            }
 
-                // A stepper: two keys with the measurement inset between them.
-                // The well holds a floor width so the whole right-hand half of
-                // the bar does not shuffle sideways when 0.48° becomes 19.51°.
-                if bevel::toolbar_button(ui, "− Tilt").clicked() {
-                    tilt_delta = -1;
-                }
-                bevel::sunken_readout(ui, 74.0, 150.0, self.active_tilt_label())
-                    .on_hover_text(self.active_tilt_hover());
-                if bevel::toolbar_button(ui, "+ Tilt").clicked() {
-                    tilt_delta = 1;
-                }
+            crate::app_support::basemap_picker(ui, &mut self.map_scene, &mut self.settings_store);
 
-                bevel::etched_separator(ui);
-                // Sized, not `desired_width`: a text edit laid out from its font
-                // alone is shorter than the 24-point floor the rest of the bar
-                // keeps, and a row of controls that disagree about their height
-                // is the thing that reads as amateur.
-                ui.add_sized(
-                    [64.0, bevel::MIN_TOUCH_POINTS],
-                    egui::TextEdit::singleline(&mut self.site_text)
-                        .char_limit(4)
-                        .hint_text("KRTX"),
-                );
-                if self.live_site.is_some() {
-                    if bevel::toolbar_button(ui, "Stop live").clicked() {
-                        live_action = Some(LiveAction::Stop);
+            let mut selected_quality = self.quality;
+            egui::ComboBox::from_id_salt("workstation-quality")
+                .selected_text(selected_quality.preset_label().unwrap_or("Custom"))
+                .width(92.0)
+                .show_ui(ui, |ui| {
+                    for (label, preset) in render2d::DisplayQuality::PRESETS {
+                        ui.selectable_value(&mut selected_quality, preset, label);
                     }
-                } else if bevel::toolbar_button(ui, "Start live").clicked()
-                    && !self.site_text.trim().is_empty()
-                {
-                    live_action = Some(LiveAction::Start(self.site_text.trim().to_owned()));
-                }
-                if !self.live_status.is_empty() {
-                    // In a well, like every other readout: this line was drawn on
-                    // the bare window before, which is exactly where dark ink on
-                    // a dark ground disappeared.
-                    bevel::sunken_readout(ui, 0.0, 340.0, self.live_status.as_str())
-                        .on_hover_text(self.live_status.as_str());
-                }
-                // The loud one, and the whole reason this row was revisited. On
-                // 2026-08-19 the readout above said "82 chunk(s) · 14.3 MiB ·
-                // downloaded" over a KUEX volume from the previous Saturday, and
-                // every word of it was true - which is how an analyst reads "no
-                // storms" off a screen that means "no data". This sits beside it,
-                // in the theme's error ink, and contradicts it.
-                //
-                // A readout well rather than a bare label, so it keeps the bar's
-                // grammar; the explicit colour overrides `sunken_readout`'s
-                // fallback ink rather than fighting it, and the hover carries the
-                // exact Z time the feed stopped at.
-                if let Some(notice) = self.live_stall_notice(Utc::now()) {
-                    bevel::sunken_readout(
-                        ui,
-                        0.0,
-                        360.0,
-                        egui::RichText::new(notice)
-                            .color(ui.visuals().error_fg_color)
-                            .strong(),
-                    )
-                    .on_hover_text(self.live_stall_hover());
-                }
-
-                bevel::etched_separator(ui);
-                // Its own chip, so an analyst can tell "no warnings out" from "we
-                // are not receiving warnings".
-                let chip = match self.warnings_state.active() {
-                    Some(active) => format!("{} · {active}", self.warnings_state.label()),
-                    None => self.warnings_state.label().to_owned(),
-                };
-                let response = bevel::toolbar_toggle(ui, self.show_warnings, chip).on_hover_text(
-                    crate::app_support::warnings_hover(
-                        &self.warnings_state.detail(),
-                        self.show_warnings,
-                        self.placed_hazards.len(),
-                    ),
+                })
+                .response
+                .on_hover_text(
+                    "Display quality. Smooth adds sub-beams and sub-gates so a gate stops \
+                     being a visible block; High and Ultra also supersample, which is what \
+                     removes the speckle of a zoomed-out view. Ultra costs about sixteen \
+                     times the native raster per frame.",
                 );
-                if response.clicked() {
-                    toggle_warnings = true;
-                }
+            if selected_quality != self.quality {
+                self.quality = selected_quality;
+                quality_changed = true;
+            }
 
-                // The Vrot readout is a measurement, not a control: it stays on
-                // the bar whenever one exists, stale reason and all - there is no
-                // hover on glass.
-                if let Some(measurement) = self.vrot_state.measurement() {
-                    let readout = match self.vrot_state.stale_reason() {
-                        Some(reason) => format!(
-                            "{} · STALE: {}",
-                            self.vrot_readout(measurement),
-                            reason.label()
-                        ),
-                        None => self.vrot_readout(measurement),
-                    };
-                    bevel::sunken_readout(ui, 0.0, 320.0, readout.as_str())
-                        .on_hover_text(readout.as_str());
+            if ui.button("− Tilt").clicked() {
+                tilt_delta = -1;
+            }
+            ui.label(self.active_tilt_label())
+                .on_hover_text(self.active_tilt_hover());
+            if ui.button("+ Tilt").clicked() {
+                tilt_delta = 1;
+            }
+            if ui
+                .selectable_label(cameras_linked, "Link cameras")
+                .clicked()
+            {
+                toggle_camera_links = true;
+            }
+            if ui
+                .selectable_label(self.vol3d.open, "3D")
+                .on_hover_text(
+                    "Volumetric explorer: every tilt resampled into a box and ray marched",
+                )
+                .clicked()
+            {
+                self.vol3d.open = !self.vol3d.open;
+            }
+            if ui
+                .selectable_label(self.xsection.armed || self.xsection.open, "XSec")
+                .on_hover_text(
+                    "Cross-section: arm, then click two points on a radar pane. A separate \
+                     window shows the vertical slice of the current product along that line; \
+                     drag the A/B handles to adjust.",
+                )
+                .clicked()
+            {
+                self.xsection.toggle_armed();
+                if self.xsection.armed {
+                    // One armed click-mode at a time: a click cannot be both
+                    // a Vrot gate and a section endpoint.
+                    self.vrot_active = false;
+                    self.vrot_state.clear();
+                    self.vrot_pane = None;
                 }
-            });
+            }
+            if ui
+                .selectable_label(self.vrot_active, "Vrot")
+                .on_hover_text(
+                    "Click two gates across a velocity couplet. Needs a dealiased product: \
+                     measuring folded velocity gives a number wrong by a multiple of the \
+                     Nyquist that still looks reasonable.",
+                )
+                .clicked()
+            {
+                self.vrot_active = !self.vrot_active;
+                if self.vrot_active {
+                    self.xsection.armed = false;
+                }
+                if !self.vrot_active {
+                    self.vrot_state.clear();
+                    self.vrot_pane = None;
+                }
+            }
+            if self.vrot_state.measurement().is_some() || self.vrot_state.pending().is_some() {
+                if ui.button("Clear Vrot").clicked() {
+                    self.vrot_state.clear();
+                    self.vrot_pane = None;
+                }
+                if let Some(measurement) = self.vrot_state.measurement() {
+                    // A stale measurement stays readable but must not read as
+                    // current: the reason is on the label itself, not only in
+                    // hover text, because there is no hover on glass.
+                    match self.vrot_state.stale_reason() {
+                        Some(reason) => {
+                            ui.label(format!(
+                                "{} · STALE: {}",
+                                self.vrot_readout(measurement),
+                                reason.label()
+                            ));
+                        }
+                        None => {
+                            ui.label(self.vrot_readout(measurement));
+                        }
+                    }
+                }
+            }
+            if ui.button("Settings").clicked() {
+                self.settings_ui.open = true;
+            }
+            ui.label(format!("Pane {}", active.get() + 1));
         });
 
         if quality_changed || palette_changed {
@@ -2994,6 +2935,16 @@ impl WorkstationApp {
         })
     }
 
+    /// Whether the picture is coming from the archive bucket rather than the
+    /// chunk feed. `live_feed_stalled` decides that a notice is raised at all;
+    /// this decides which words it uses, so the fallback is never announced
+    /// with "stalled" over a forty-second-old volume.
+    fn live_feed_archive_fallback(&self) -> bool {
+        self.live_feed
+            .as_ref()
+            .is_some_and(|feed| feed.freshness.is_archive_fallback())
+    }
+
     /// The loud line, or `None` when the feed is keeping up.
     ///
     /// Says the site, says the word, and says how old - because "stalled" alone
@@ -3005,8 +2956,17 @@ impl WorkstationApp {
         }
         let feed = self.live_feed.as_ref()?;
         let age = data_source::volume_age_at(feed.newest_volume_time, now);
+        // "archive fallback" is the enum's own label; "feed stalled" is not
+        // read from it, because the clock-read OR in `live_feed_stalled` can
+        // raise this notice while `freshness` still says Current, and the
+        // words must not follow the enum into calling that "live".
+        let words = if feed.freshness.is_archive_fallback() {
+            feed.freshness.status_label()
+        } else {
+            "feed stalled"
+        };
         Some(format!(
-            "{} feed stalled · newest data {} old",
+            "{} {words} · newest data {} old",
             feed.site,
             format_age(age)
         ))
@@ -3018,14 +2978,29 @@ impl WorkstationApp {
         let Some(feed) = self.live_feed.as_ref() else {
             return String::new();
         };
+        let when = feed
+            .newest_volume_time
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        // Two different situations, two different sets of advice. On the
+        // fallback the picture is being kept current from the other bucket,
+        // so "pick another radar" would be telling the analyst to walk away
+        // from data that is fine.
+        if feed.freshness.is_archive_fallback() {
+            return format!(
+                "The realtime chunks feed for {} has stopped publishing, so this \
+                 session is polling the Level II archive bucket instead. The newest \
+                 archive volume starts at {when}, and new ones keep arriving - whole \
+                 volumes, roughly one scan behind a healthy chunk feed. The session \
+                 returns to the chunk feed by itself the moment it leads again.",
+                feed.site
+            );
+        }
         format!(
-            "The newest volume anywhere in the realtime chunks feed for {} starts at {}. \
+            "The newest volume anywhere in the realtime chunks feed for {} starts at {when}. \
              Nothing newer exists to fetch, so the panes are still drawing that volume - \
              real data, old data. Warning polygons are current and will not line up with it. \
              Pick another radar, or load this one from the archive.",
-            feed.site,
-            feed.newest_volume_time
-                .to_rfc3339_opts(SecondsFormat::Secs, true)
+            feed.site
         )
     }
 
@@ -3050,9 +3025,14 @@ impl WorkstationApp {
         // looking - the toolbar banner is the loud copy, this is the one over
         // the storm that is not there.
         if self.live_feed_stalled(now) {
+            let words = if self.live_feed_archive_fallback() {
+                "ARCHIVE FALLBACK"
+            } else {
+                "FEED STALLED"
+            };
             badges.push(match self.displayed_frame_age(now) {
-                Some(age) => format!("FEED STALLED · {} OLD", format_age(age)),
-                None => "FEED STALLED".to_owned(),
+                Some(age) => format!("{words} · {} OLD", format_age(age)),
+                None => words.to_owned(),
             });
         }
         if let Some(frame) = self.history.current()
@@ -3076,7 +3056,14 @@ impl WorkstationApp {
     fn pane_header_status(&self, pane: PaneId, now: DateTime<Utc>) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.live_feed_stalled(now) {
-            parts.push("STALLED".to_owned());
+            parts.push(
+                if self.live_feed_archive_fallback() {
+                    "ARCHIVE FALLBACK"
+                } else {
+                    "STALLED"
+                }
+                .to_owned(),
+            );
         }
         if let Some(age) = self.displayed_frame_age(now) {
             parts.push(format!("{} old", format_age(age)));
@@ -3170,10 +3157,7 @@ impl eframe::App for WorkstationApp {
         self.vol3d_window(&context);
         self.xsection_window(&context);
         self.toolbar(ui);
-        // No separator under the bar: the band paints its own raised bevel,
-        // and a stock hairline immediately below it reads as a second, weaker
-        // edge drawn by someone who could not see the first.
-        ui.add_space(2.0);
+        ui.separator();
 
         let available = ui.available_size();
         let canvas_height = (available.y - TIMELINE_HEIGHT).max(120.0);
@@ -3325,8 +3309,8 @@ mod tests {
     // ground_and_clears_to_it` - because the thing it guards is the pass
     // itself. `eframe::Frame::_new_kittest` makes that constructible outside
     // eframe, and a headless pass starts no basemap tile fetches: the tile
-    // store's provider is `None` until an operator picks one from the Map
-    // menu, and a test settings store has nobody's pick in it.
+    // store's provider is `None` until an operator picks one from the bar's
+    // imagery picker, and a test settings store has nobody's pick in it.
 
     const VIEWPORT: ViewportMetrics = ViewportMetrics {
         width_points: 240.0,
@@ -3435,6 +3419,128 @@ mod tests {
             assert_eq!(
                 clear[3], 1.0,
                 "{variant:?}: a see-through clear colour lets the desktop through"
+            );
+        }
+    }
+
+    /// The chrome the owner approved, pinned by what the bar actually draws.
+    ///
+    /// v0.1.0 shipped an everything-visible toolbar. A later change moved
+    /// most of it behind File / View / Map / Tools menu titles, and the
+    /// answer was that the row IS the instrument: a control an analyst has to
+    /// remember exists is a control that does not get used mid-storm. That
+    /// decision has no other guard - a menu bar compiles, passes every other
+    /// test in this file, and photographs beautifully - so this drives the
+    /// shipped `toolbar` and reads back every text run it emitted. Each named
+    /// control has to be on the bar in ONE pass, and no menu title may be.
+    ///
+    /// The dynamic labels (product, palette, quality, basemap, imagery, tilt,
+    /// warnings) are computed from the application's own state rather than
+    /// spelled out, so renaming a colour table does not fail this test while
+    /// hiding its picker still does.
+    #[test]
+    fn every_control_is_on_the_bar_and_none_of_them_hides_behind_a_menu_title() {
+        /// Every text run in the frame, flattened: `Shape::Vec` nests.
+        fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let text = text.galley.text().trim();
+                    if !text.is_empty() {
+                        found.push(text.to_owned());
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let context = egui::Context::default();
+        crate::theme::apply(&context, crate::theme::Variant::Dark);
+        let mut app = test_app();
+
+        // Read off the app, before the frame: these are the labels the bar is
+        // about to draw for the state it is in.
+        let product = DisplayProduct::from_product_id(&app.workspace.active().product);
+        let palette_family = crate::product_picker::palette_family(product);
+        let expected_palette =
+            palette_family.map(|family| app.color_tables.for_family(family).name().to_owned());
+        let expected_quality = app.quality.preset_label().unwrap_or("Custom").to_owned();
+        let expected_basemap = map_scene::MapStylePreset::for_style(app.map_scene.style())
+            .expect("a fresh scene holds one of the preset styles")
+            .label()
+            .to_owned();
+        let expected_tilt = app.active_tilt_label();
+        let expected_warnings = app.warnings_state.label().to_owned();
+
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1600.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.toolbar(ui),
+        );
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+
+        // The fixed labels: the controls themselves, in the words v0.1.0
+        // used.
+        let mut wanted = vec![
+            // File loading, on the bar rather than behind a File menu.
+            "Level II file path".to_owned(),
+            "Load".to_owned(),
+            // The live feed.
+            "KRTX".to_owned(),
+            "Start live".to_owned(),
+            // Layout, quality, tilt - the View menu's contents.
+            layout_label(app.workspace.layout).to_owned(),
+            expected_quality,
+            "− Tilt".to_owned(),
+            expected_tilt,
+            "+ Tilt".to_owned(),
+            // The map: basemap look and ground imagery, not a Map menu.
+            expected_basemap,
+            "No imagery".to_owned(),
+            // The Tools menu's contents.
+            "Link cameras".to_owned(),
+            "3D".to_owned(),
+            "XSec".to_owned(),
+            "Vrot".to_owned(),
+            "Settings".to_owned(),
+            // The product picker's button, its colour table, the warnings
+            // chip and the active pane readout.
+            product.label().to_owned(),
+            "Pane 1".to_owned(),
+        ];
+        wanted.extend(expected_palette);
+        for control in &wanted {
+            assert!(
+                texts.iter().any(|text| text == control),
+                "the bar drew no {control:?} control. It drew: {texts:?}"
+            );
+        }
+        // The warnings chip carries its state after a separator, so it is
+        // matched by its head rather than whole.
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with(&expected_warnings)),
+            "the bar drew no warnings chip starting {expected_warnings:?}. It drew: {texts:?}"
+        );
+
+        for title in ["File", "View", "Map", "Tools"] {
+            assert!(
+                !texts.iter().any(|text| text == title),
+                "a {title:?} menu title is back on the bar; the owner-approved v0.1.0 chrome \
+                 puts every control on the row instead. The bar drew: {texts:?}"
             );
         }
     }
@@ -4177,6 +4283,45 @@ mod tests {
         assert!(app.live_feed_stalled(observed_now()));
     }
 
+    /// The fallback path: the chunk feed is dead, the archive bucket is
+    /// current, and every surface names the bucket instead of crying
+    /// "stalled" over a forty-second-old volume.
+    #[test]
+    fn an_archive_fallback_names_the_bucket_not_a_stall() {
+        let archive_volume_time = observed_now() - TimeDelta::seconds(40);
+        let mut app = test_app();
+        app.live_site = Some("KUEX".to_owned());
+        app.status = "Live KUEX".to_owned();
+        app.live_feed = Some(LiveFeed {
+            site: "KUEX".to_owned(),
+            newest_volume_time: archive_volume_time,
+            freshness: FeedFreshness::ArchiveFallback,
+        });
+        install(&mut app, frame_at("KUEX", archive_volume_time));
+
+        assert_eq!(
+            app.live_stall_notice(observed_now()).as_deref(),
+            Some("KUEX archive fallback · newest data 40 s old")
+        );
+        assert_eq!(
+            app.pane_header_status(first_pane(), observed_now()),
+            "ARCHIVE FALLBACK · 40 s old"
+        );
+        assert_eq!(
+            app.pane_badges(DisplayProduct::default(), observed_now())
+                .first()
+                .map(String::as_str),
+            Some("ARCHIVE FALLBACK · 40 s OLD")
+        );
+        // The hover explains the bucket and must not hand out the dead-feed
+        // advice: on the fallback, "pick another radar" is walking away from
+        // data that is fine.
+        let hover = app.live_stall_hover();
+        assert!(hover.contains("archive bucket"), "hover: {hover}");
+        assert!(!hover.contains("Pick another radar"), "hover: {hover}");
+        assert!(app.live_feed_stalled(observed_now()));
+    }
+
     /// The healthy feed on the same machine at the same instant. Without this
     /// the banner could be unconditional and every assertion above would still
     /// pass.
@@ -4414,7 +4559,27 @@ mod tests {
             // The line the banner has to contradict, in the words the analyst
             // was actually shown on 2026-08-19.
             app.live_status = "82 chunk(s) · 14.3 MiB · downloaded".to_owned();
-            app.live_feed = Some(stalled_kuex_feed());
+            // The one fixture in this file measured FROM the wall clock rather
+            // than pinned against it, and the reason is a seam that does not
+            // exist: `toolbar` is a paint function, it takes no `now`, and it
+            // reads `Utc::now()` itself. With `stalled_kuex_feed()`'s fixed
+            // 2026-08-16T11:08:02Z in here the banner said "3 d old" on the
+            // day this was written and "4 d old" the next morning, so the
+            // exact-string assertion below was a test that deleted itself
+            // overnight. Three days and five hours keeps the age off both
+            // boundaries at any hour of any run.
+            //
+            // The real KUEX timestamp is not lost: it is asserted wherever a
+            // fixed `now` can be handed in - `a_stalled_feed_names_the_site_
+            // the_state_and_the_age` pins the hover's exact Z time, and the
+            // real-cache test at the end of this file decodes the volume
+            // itself. What THIS test is for is the colour pair, which does
+            // not care which day the feed died on.
+            app.live_feed = Some(LiveFeed {
+                site: "KUEX".to_owned(),
+                newest_volume_time: Utc::now() - TimeDelta::days(3) - TimeDelta::hours(5),
+                freshness: FeedFreshness::Stalled,
+            });
 
             let output = context.run_ui(
                 egui::RawInput {

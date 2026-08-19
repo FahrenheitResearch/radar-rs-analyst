@@ -1,10 +1,12 @@
-//! Small pure helpers that `app.rs` uses and does not need to hold.
+//! Helpers that `app.rs` uses and does not need to hold.
 //!
-//! They live here for one honest reason: `app.rs` is the composition root and an
-//! architecture test caps every module in this crate at 2000 lines, so a growing
-//! toolbar has to displace something. These four were the least coupled things
-//! in it - none touches `WorkstationApp` - which makes them the right thing to
-//! move and easy to test on their own.
+//! This header used to justify the file with an architecture test that capped
+//! every module in the crate at 2000 lines. That cap is gone -
+//! `tests/architecture.rs` says so and says why it was a bad rule - so the
+//! honest reason these are here is the one that survives it: none of them
+//! touches `WorkstationApp`. They take what they need as arguments, which is
+//! what lets `pane_canvas/chrome_tests.rs` drive the basemap picker with
+//! synthetic clicks without standing up an application first.
 
 use analyst_runtime::{PaneId, PaneLayout, ViewportMetrics, VolumeHistory};
 use eframe::egui;
@@ -13,70 +15,92 @@ use radar_core::RadarVolume;
 use crate::product::DisplayProduct;
 use crate::vol3d::pane::Vol3dCandidate;
 
-/// The Map menu body: basemap look, ground imagery, and the dim slider.
+/// The basemap look picker.
 ///
-/// Menu rows rather than nested combo boxes: a combo inside a menu popup
-/// closes the menu under the analyst's pointer. `for_style` preselects,
-/// because the controller stores a `MapStyle` rather than a preset.
+/// `MapSceneController::set_style` had no call site at all, so the map had
+/// exactly one appearance - black with slate lines - no matter what the style
+/// type could express. `for_style` preselects, because the controller stores a
+/// `MapStyle` rather than a preset.
 ///
 /// The settings store is here for exactly one write: a hand-dragged Dim
 /// slider. Style and provider are mirrored from the scene every frame by
 /// `app.rs`, but the scrim cannot be - while auto-dim is on it is measured
 /// from arriving tiles, and mirroring the measurement would silently convert
 /// it into a stored manual choice.
-pub(crate) fn basemap_menu(
+pub(crate) fn basemap_picker(
     ui: &mut egui::Ui,
     scene: &mut map_scene::MapSceneController,
     store: &mut settings::SettingsStore,
 ) {
-    ui.set_min_width(240.0);
     let current = scene.style();
-    // `recognised` is kept rather than collapsed into a default, because the
+    // `recognised` is kept rather than collapsed into `chosen`, because the
     // write-back below has to distinguish "the operator picked something else"
-    // from "this style is not in the preset table". Without that, an
-    // unrecognised style would be silently overwritten with Slate - the menu
-    // would quietly become a style eraser the moment anything other than
-    // itself sets a style.
+    // from "this style is not in the preset table". Comparing the resolved
+    // style to `current` cannot tell those apart, so an unrecognised style
+    // would be silently overwritten with Slate on the next toolbar frame - the
+    // picker would quietly become a style eraser the moment anything other
+    // than itself sets a style.
     let recognised = map_scene::MapStylePreset::for_style(current);
-    ui.label("Basemap");
-    for preset in map_scene::MapStylePreset::ALL {
-        if ui
-            .selectable_label(recognised == Some(preset), preset.label())
-            .clicked()
-            && recognised != Some(preset)
-        {
-            // `set_style` bumps the style clock and drops retained geometry,
-            // so the panes rebuild themselves without extra invalidation.
-            scene.set_style(preset.style());
-        }
+    let mut chosen = recognised.unwrap_or_default();
+    egui::ComboBox::from_id_salt("workstation-basemap")
+        .selected_text(chosen.label())
+        .width(140.0)
+        .show_ui(ui, |ui| {
+            for preset in map_scene::MapStylePreset::ALL {
+                ui.selectable_value(&mut chosen, preset, preset.label());
+            }
+        })
+        .response
+        .on_hover_text(
+            "Basemap look. Slate Dark is the shipped map; High Contrast is for a lit room or \
+             a projector; Daylight is dark ink on a light pane; Minimal thins the lines and \
+             holds counties back until twice the zoom.",
+        );
+    if recognised != Some(chosen) {
+        // `set_style` bumps the style clock and drops retained geometry, so the
+        // panes rebuild themselves without any extra invalidation here.
+        scene.set_style(chosen.style());
     }
 
-    ui.separator();
-    // Ground imagery: what the boundaries are drawn ON. "No imagery" is the
-    // shipped behaviour and the default, so an offline machine is never worse
-    // off. A provider whose terms this build cannot satisfy is not listed at
-    // all, rather than listed and then silently refusing to fetch.
-    ui.label("Ground imagery");
-    let provider = scene.tile_provider();
-    if ui
-        .selectable_label(provider.is_none(), "No imagery")
-        .clicked()
-        && provider.is_some()
-    {
-        scene.set_tile_provider(None);
-    }
-    for candidate in map_scene::TileProvider::ALL {
-        if !scene.tile_provider_permitted(candidate) {
-            continue;
-        }
-        if ui
-            .selectable_label(provider == Some(candidate), candidate.label())
-            .on_hover_text(candidate.coverage_note())
-            .clicked()
-            && provider != Some(candidate)
-        {
-            scene.set_tile_provider(Some(candidate));
-        }
+    // Ground imagery, which is a different axis from the vector look above:
+    // this picker chooses what the boundaries are drawn ON, the combo above
+    // chooses how they are drawn. "No imagery" is the shipped behaviour and
+    // stays the default, so an offline or firewalled machine is never worse
+    // off than it is today.
+    //
+    // A provider whose terms this build cannot satisfy is not listed at all,
+    // rather than listed and then silently refusing to fetch.
+    let available: Vec<map_scene::TileProvider> = map_scene::TileProvider::ALL
+        .into_iter()
+        .filter(|candidate| scene.tile_provider_permitted(*candidate))
+        .collect();
+    let mut provider = scene.tile_provider();
+    egui::ComboBox::from_id_salt("workstation-imagery")
+        .selected_text(
+            provider
+                .map(map_scene::TileProvider::label)
+                .unwrap_or("No imagery"),
+        )
+        .width(170.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut provider, None, "No imagery");
+            for candidate in available {
+                ui.selectable_value(&mut provider, Some(candidate), candidate.label())
+                    .on_hover_text(candidate.coverage_note());
+            }
+        })
+        .response
+        .on_hover_text(
+            "Raster ground imagery drawn UNDER the radar, with the vector boundaries still \
+             drawn over it. USGS layers are U.S. Government works in the public domain; \
+             OpenStreetMap is community-run and its tile policy forbids prefetching, so that \
+             provider fetches only what is on screen. Coverage is per tile, not per region - \
+             a missing tile falls back to a coarser one rather than leaving a hole. \
+             Attribution is drawn bottom right and is a condition of use: it is not optional \
+             and there is no switch for it.",
+        );
+    if provider != scene.tile_provider() {
+        scene.set_tile_provider(provider);
     }
     if scene.tile_provider().is_some() {
         let mut scrim = scene.tile_scrim();
@@ -87,7 +111,11 @@ pub(crate) fn basemap_menu(
                     .fixed_decimals(2),
             )
             .on_hover_text(
-                "How far the imagery is dimmed towards the pane's own ground,                  so weak reflectivity and near-zero velocity stay readable on                  top of it. The starting value is measured from the imagery                  that actually arrived.",
+                "How far the imagery is dimmed towards the pane's own ground, so weak \
+                 reflectivity and near-zero velocity stay readable on top of it. The \
+                 starting value is measured from the imagery that actually arrived - a \
+                 white topographic map needs far more of this than an aerial photograph \
+                 does - and choosing a different provider returns it to that measurement.",
             )
             .changed()
         {

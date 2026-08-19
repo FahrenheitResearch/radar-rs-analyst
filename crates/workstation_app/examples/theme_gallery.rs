@@ -16,10 +16,10 @@
 //!
 //! # The bar, photographed
 //!
-//! The headless run also photographs the application's OWN menu bar —
+//! The headless run also photographs the application's OWN toolbar —
 //! `app::WorkstationApp::toolbar`, the shipped function, not a sample of it —
 //! in both variants, at 1× and 2×, in four states (nothing hovered, a button
-//! under the pointer, a button held down, a menu dropped). It is built
+//! under the pointer, a button held down, a picker dropped open). It is built
 //! exactly as `main.rs` builds it and opened on a REAL Level II volume, so
 //! the tilt readout carries a measured elevation and the product, palette and
 //! live controls carry the state a real volume puts there. Point it at one:
@@ -138,6 +138,19 @@ fn gallery_body(ui: &mut egui::Ui, state: &mut GalleryState) {
     bevel::raised_frame(ui, |ui| {
         ui.horizontal(|ui| {
             ui.strong("GenericRadar");
+            bevel::etched_separator(ui);
+            // The menu-title primitive lives here rather than in the shipped
+            // bar: the application's toolbar is one everything-visible row by
+            // the owner's decision, so this panel is where `toolbar_menu`
+            // stays photographed at 1× and 2× and clickable under `--window`,
+            // instead of becoming a helper nobody ever looks at.
+            bevel::toolbar_menu(ui, "Menu", |ui| {
+                ui.set_min_width(200.0);
+                ui.label("A title latches while its menu is down.");
+                let _ = ui.button("A command");
+                bevel::etched_separator(ui);
+                let _ = ui.button("Another command");
+            });
             bevel::etched_separator(ui);
             if bevel::toolbar_button(ui, "Load").clicked() {
                 state.path_text.clear();
@@ -600,9 +613,12 @@ mod toolbar {
     /// it. 1408 · 4 bytes is 22 · 256, so the read-back needs no row padding
     /// at 1× or 2×.
     const WIDTH_POINTS: f32 = 1408.0;
-    /// The band, plus a strip of bare ground beneath it — the ground being
-    /// half of what this proves.
-    const HEIGHT_POINTS: f32 = 96.0;
+    /// The bar, plus a strip of bare ground beneath it — the ground being
+    /// half of what this proves. Deep enough for the toolbar to wrap to a
+    /// second row at 1408 points, which is what an everything-visible row
+    /// does at a real window width, and still leave the bottom third bare
+    /// for `check_the_ground_is_painted` to read.
+    const HEIGHT_POINTS: f32 = 144.0;
     /// The window the application is pumped in while its volume decodes.
     const PUMP_POINTS: (f32, f32) = (1408.0, 880.0);
     /// How long to wait for a real volume before giving up and saying so.
@@ -612,38 +628,39 @@ mod toolbar {
     /// this floor — none of them qualify for the 3:1 large-text allowance.
     const TEXT_FLOOR: f64 = 4.5;
 
-    /// Which pointer state a frame is photographed in. Flat-until-hover is a
-    /// claim about three renderings of the same control, so all three are
+    /// Which pointer state a frame is photographed in. A control's three
+    /// renderings are three different colour pairs, so all three are
     /// photographed; "no state may render as dark-on-dark" is a claim about
     /// all of them, so all three are audited.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Pointer {
-        /// Pointer off the bar: every command flat on the band.
+        /// Pointer off the bar: every control at rest.
         Rest,
-        /// Pointer on a command: it raises.
+        /// Pointer on a control: it lights.
         Hover,
-        /// Pointer held down on a command: it sinks.
+        /// Pointer held down on a control: it sinks.
         Press,
-        /// A menu title clicked open: the title latches and its menu drops.
-        Menu,
+        /// A picker clicked open, so the popup's own ink is audited on the
+        /// popup's own ground rather than only the closed bar's.
+        Popup,
     }
 
     impl Pointer {
-        const ALL: [Self; 4] = [Self::Rest, Self::Hover, Self::Press, Self::Menu];
+        const ALL: [Self; 4] = [Self::Rest, Self::Hover, Self::Press, Self::Popup];
 
         const fn name(self) -> &'static str {
             match self {
                 Self::Rest => "rest",
                 Self::Hover => "hover",
                 Self::Press => "press",
-                Self::Menu => "menu",
+                Self::Popup => "popup",
             }
         }
 
-        /// Frame height in points. A dropped menu needs room to drop into.
+        /// Frame height in points. A dropped popup needs room to drop into.
         const fn height_points(self) -> f32 {
             match self {
-                Self::Menu => 384.0,
+                Self::Popup => 384.0,
                 _ => HEIGHT_POINTS,
             }
         }
@@ -668,7 +685,9 @@ mod toolbar {
         println!("\n=== the real toolbar, on {} ===", volume.display());
 
         let ctx = egui::Context::default();
-        theme::apply(&ctx, Variant::Light);
+        // The shipped look first, so a run read from the top is read in
+        // the variant the app opens in.
+        theme::apply(&ctx, Variant::Dark);
         let mut renderer = Renderer::new(device, TARGET_FORMAT, RendererOptions::PREDICTABLE);
         let mut app = build(&ctx, out_dir, volume);
 
@@ -680,7 +699,7 @@ mod toolbar {
         );
 
         let mut failures = Vec::new();
-        for (variant, name) in [(Variant::Light, "light"), (Variant::Dark, "dark")] {
+        for (variant, name) in [(Variant::Dark, "dark"), (Variant::Light, "light")] {
             theme::apply(&ctx, variant);
             let palette = Palette::of(variant);
             check_the_app_grounds_itself(
@@ -713,7 +732,10 @@ mod toolbar {
                         targets = Targets {
                             hover: centre_of(&runs, "+ Tilt"),
                             press: centre_of(&runs, "− Tilt"),
-                            menu: centre_of(&runs, "File"),
+                            // The layout combo: its closed face reads "1
+                            // pane" on a bar whose defaults this harness
+                            // wiped, and clicking it drops a real popup.
+                            popup: centre_of(&runs, "1 pane"),
                         };
                     }
                     let width_px = (WIDTH_POINTS * scale) as u32;
@@ -729,7 +751,7 @@ mod toolbar {
                     // The bare-ground check reads the bottom third of the
                     // frame, which is bare only while nothing is dropped into
                     // it; the three closed states prove the ground already.
-                    if pointer != Pointer::Menu {
+                    if pointer != Pointer::Popup {
                         check_the_ground_is_painted(&pixels, width_px, height_px, palette);
                     }
                     failures.extend(audit(&runs, &pixels, width_px, height_px, scale, palette));
@@ -745,8 +767,9 @@ mod toolbar {
         println!(
             "\nEvery text run on the real bar clears WCAG 2.2 SC 1.4.3 ({TEXT_FLOOR}:1) against \
              the ground its pixels actually landed on, in both variants, at 1x and 2x, at rest, \
-             hovered and pressed.\nThe PNGs above are the pre-flight. A human has still not \
-             looked at them; until one has, nothing here is signed off."
+             hovered, pressed and with a picker dropped open.\nThe PNGs above are the \
+             pre-flight. A human has still not looked at them; until one has, nothing here is \
+             signed off."
         );
     }
 
@@ -829,7 +852,7 @@ mod toolbar {
     struct Targets {
         hover: egui::Pos2,
         press: egui::Pos2,
-        menu: egui::Pos2,
+        popup: egui::Pos2,
     }
 
     /// One photographed frame of the real bar: settle, capture, rasterise,
@@ -925,10 +948,10 @@ mod toolbar {
                 egui::Event::PointerMoved(targets.press),
                 button(targets.press, true),
             ],
-            Pointer::Menu => vec![
-                egui::Event::PointerMoved(targets.menu),
-                button(targets.menu, true),
-                button(targets.menu, false),
+            Pointer::Popup => vec![
+                egui::Event::PointerMoved(targets.popup),
+                button(targets.popup, true),
+                button(targets.popup, false),
             ],
         }
     }
@@ -948,11 +971,21 @@ mod toolbar {
                     egui::Event::PointerGone,
                 ]]
             }
-            // Click the title again to put the menu away, then a pass for the
-            // popup to actually close.
-            Pointer::Menu => vec![
-                vec![button(targets.menu, true), button(targets.menu, false)],
-                vec![egui::Event::PointerGone],
+            // Click the picker again to put it away, then Escape in case a
+            // future egui closes popups only that way, then a pass for the
+            // popup to actually go.
+            Pointer::Popup => vec![
+                vec![button(targets.popup, true), button(targets.popup, false)],
+                vec![
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerGone,
+                ],
             ],
             _ => Vec::new(),
         }

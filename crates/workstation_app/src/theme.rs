@@ -110,6 +110,25 @@ pub enum Variant {
 }
 
 impl Variant {
+    /// The variant a stored `Settings > Appearance > Theme` value names.
+    ///
+    /// One function rather than a `== "light"` written out at each call site.
+    /// There are two: `main.rs` reads the store before the first frame, and
+    /// `app.rs` re-reads it when the setting changes. They were hand-copies of
+    /// each other, nothing pinned either, and the shipped default was silently
+    /// flipped once already by editing the catalog underneath them.
+    ///
+    /// Anything that is not the exact string the catalog offers for the
+    /// daylight bench lands on the night bench - the shipped, owner-approved
+    /// look - so a value written by a future build cannot turn the app white
+    /// on a machine that does not understand it.
+    pub fn from_setting(stored: &str) -> Self {
+        match stored {
+            "light" => Self::Light,
+            _ => Self::Dark,
+        }
+    }
+
     /// The egui theme slot this variant styles.
     pub const fn egui_theme(self) -> Theme {
         match self {
