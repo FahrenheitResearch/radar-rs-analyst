@@ -23,6 +23,23 @@ const HTTP_USER_AGENT: &str = "radar-rs-analyst/0.1 local-desktop";
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
 const REALTIME_CHUNK_DOWNLOAD_BATCH: usize = 8;
+/// Total attempts per S3 object. See [`download_s3_object_to_path`].
+const S3_OBJECT_DOWNLOAD_ATTEMPTS: usize = 3;
+const S3_OBJECT_DOWNLOAD_RETRY_DELAY: StdDuration = StdDuration::from_millis(150);
+/// How many active volume ids to walk backwards before giving up on finding a
+/// complete predecessor. Four covers a couple of aborted or skipped volumes
+/// without turning a quiet site into a long chain of listings.
+const REALTIME_PREVIOUS_VOLUME_LOOKBACK: usize = 4;
+/// How far before the current volume a predecessor may start and still be
+/// treated as "the previous volume".
+///
+/// This is the guard against the recycled-id trap, and it has to be generous
+/// enough for the slowest clear-air VCP (VCP 31/32 run about 10 minutes per
+/// volume; VCP 35 was observed at 7 minutes on KTLX) yet far shorter than the
+/// bucket's retention, which is measured in days: on 2026-08-18 the KTLX
+/// prefix held ids 1..=680 covering 2026-08-16T08:20Z to 2026-08-18T17:57Z.
+/// Without this bound a wrapped id resolves to a two-day-old volume.
+const REALTIME_PREVIOUS_VOLUME_MAX_GAP_MINUTES: i64 = 30;
 const MIN_RECENT_LEVEL2_SITE_CATALOG_COUNT: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +161,18 @@ pub enum DataSourceError {
     },
     #[error("realtime chunk download worker panicked")]
     DownloadWorkerPanic,
+    #[error("download of {site} volume {volume_id} was cancelled")]
+    DownloadCancelled { site: String, volume_id: u16 },
+    #[error(
+        "{site} volume {volume_id} at {volume_time} is missing chunk {missing_chunk_id} of {last_chunk_id}"
+    )]
+    ChunkSetNotContiguous {
+        site: String,
+        volume_id: u16,
+        volume_time: DateTime<Utc>,
+        missing_chunk_id: u16,
+        last_chunk_id: u16,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DataSourceError>;
@@ -388,13 +417,7 @@ pub fn latest_level2_object_cached(
 pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume> {
     let site = site.to_ascii_uppercase();
     let site_prefix = format!("{site}/");
-    let mut active_ids = list_s3(LEVEL2_CHUNKS_BUCKET, &site_prefix, Some("/"), None)?
-        .common_prefixes
-        .into_iter()
-        .filter_map(|prefix| realtime_volume_id_from_prefix(&site, &prefix.prefix))
-        .collect::<Vec<_>>();
-    active_ids.sort_unstable();
-    active_ids.dedup();
+    let active_ids = list_active_realtime_volume_ids(&site)?;
 
     let Some(volume_id) = latest_realtime_volume_id_from_active_ids(&active_ids) else {
         return Err(DataSourceError::NoObjects {
@@ -438,9 +461,112 @@ pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume>
     })
 }
 
-fn realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeLevel2Volume> {
+/// Fetch the newest complete volume that ran *before* the one identified by
+/// `current_volume_id` / `current_volume_time`.
+///
+/// A live session that has only just started holds a single tilt, which is not
+/// a volume: the 3D box interpolates a vertical profile per (azimuth, range)
+/// and a one-sample profile fills only the beam it came from, and the 2D sweep
+/// animation has no previous picture to paint the unswept wedge with. Pulling
+/// the volume before the live one closes that gap immediately instead of after
+/// a whole VCP.
+///
+/// The predecessor is found through the ACTIVE id set, never by arithmetic.
+/// Realtime volume ids are a wrapping counter that steps 999 -> 1 with no zero
+/// (measured: KTLX/999 starts 2026-08-16T08:13:07Z, KTLX/1 at 08:20:09Z,
+/// KTLX/2 at 08:27:11Z), so `current - 1` names a directory that does not exist
+/// at the wrap; and the bucket keeps expired ids for days, so the id it names
+/// may hold a volume from two days ago. Three traps are handled here:
+///
+/// * the wrap - the walk is nearest-preceding-ACTIVE-id, so a missing or
+///   wrapped `current - 1` resolves to whatever really precedes it;
+/// * the recycled id - every candidate must start earlier than, and within
+///   `REALTIME_PREVIOUS_VOLUME_MAX_GAP_MINUTES` of, the current volume, which
+///   is the only thing that can distinguish "one volume back" from "996
+///   volumes back" when all you have is a wrapping counter;
+/// * the aged-out head - "complete" means the contiguous run `1..=n`, not just
+///   an `E` chunk at the end. See [`first_missing_chunk_id`].
+pub fn previous_complete_realtime_level2_volume(
+    site: &str,
+    current_volume_id: u16,
+    current_volume_time: DateTime<Utc>,
+) -> Result<RealtimeLevel2Volume> {
+    let site = site.to_ascii_uppercase();
+    let active_ids = list_active_realtime_volume_ids(&site)?;
+    let candidate_ids = preceding_realtime_volume_ids_from_active_ids(
+        &active_ids,
+        current_volume_id,
+        REALTIME_PREVIOUS_VOLUME_LOOKBACK,
+    );
+
+    let oldest_accepted =
+        current_volume_time - Duration::minutes(REALTIME_PREVIOUS_VOLUME_MAX_GAP_MINUTES);
+    let mut first_error = None;
+    for candidate_id in candidate_ids {
+        let groups = match realtime_level2_volume_groups_for_id(&site, candidate_id) {
+            Ok(groups) => groups,
+            Err(DataSourceError::NoObjects { .. }) => {
+                // A directory that has expired between the listing and this
+                // call is ordinary; keep walking backwards.
+                continue;
+            }
+            Err(error) => {
+                // A dropped link or an unparseable listing is not ordinary, and
+                // reporting it as "no objects" would read like the site is off
+                // the air. Keep walking - a later candidate may still answer -
+                // but report this if none does.
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        if let Some(volume) =
+            select_previous_complete_volume(groups, current_volume_time, oldest_accepted)
+        {
+            return Ok(volume);
+        }
+    }
+
+    Err(first_error.unwrap_or(DataSourceError::NoObjects {
+        bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+        prefix: format!("{site}/ before volume {current_volume_id}"),
+    }))
+}
+
+/// The active volume id immediately preceding `current_volume_id`.
+///
+/// Membership in `ids` is the only source of truth: the answer is the id with
+/// the smallest positive distance walking backwards around the wrapping
+/// counter, so a missing `current - 1` resolves to whatever really precedes
+/// it, and `current == 1` resolves to 999 rather than underflowing.
+pub fn previous_realtime_volume_id_from_active_ids(
+    ids: &[u16],
+    current_volume_id: u16,
+) -> Option<u16> {
+    preceding_realtime_volume_ids_from_active_ids(ids, current_volume_id, 1)
+        .into_iter()
+        .next()
+}
+
+/// Fetch one realtime volume by id. When the id directory holds more than one
+/// volume (see [`realtime_volume_groups`]) the newest is returned.
+pub fn realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeLevel2Volume> {
+    // Keys in the chunks bucket are upper case; a lower-case site would list
+    // an empty prefix rather than fail, which is the worse of the two.
+    let site = site.to_ascii_uppercase();
+    realtime_level2_volume_groups_for_id(&site, volume_id)?
+        .pop()
+        .ok_or_else(|| DataSourceError::NoObjects {
+            bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+            prefix: format!("{site}/{volume_id}/"),
+        })
+}
+
+fn realtime_level2_volume_groups_for_id(
+    site: &str,
+    volume_id: u16,
+) -> Result<Vec<RealtimeLevel2Volume>> {
     let volume_prefix = format!("{site}/{volume_id}/");
-    let mut chunks = list_s3_limited(
+    let chunks = list_s3_limited(
         LEVEL2_CHUNKS_BUCKET,
         &volume_prefix,
         None,
@@ -452,33 +578,63 @@ fn realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeL
     .filter(|object| object.size > 0)
     .filter_map(parse_realtime_chunk_object)
     .collect::<Vec<_>>();
-    chunks.sort_by_key(|chunk| chunk.chunk_id);
 
-    let Some(first_chunk) = chunks.first() else {
+    let groups = realtime_volume_groups(site, volume_id, chunks);
+    if groups.is_empty() {
         return Err(DataSourceError::NoObjects {
             bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
             prefix: volume_prefix,
         });
-    };
+    }
+    Ok(groups)
+}
 
-    let volume_time = first_chunk.volume_time;
-    let complete = chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end());
-    let total_size = chunks.iter().map(|chunk| chunk.object.size).sum();
-
-    Ok(RealtimeLevel2Volume {
-        site: site.to_owned(),
-        volume_id,
-        volume_time,
-        chunks,
-        complete,
-        total_size,
-    })
+fn list_active_realtime_volume_ids(site: &str) -> Result<Vec<u16>> {
+    let site_prefix = format!("{site}/");
+    let mut ids = list_s3(LEVEL2_CHUNKS_BUCKET, &site_prefix, Some("/"), None)?
+        .common_prefixes
+        .into_iter()
+        .filter_map(|prefix| realtime_volume_id_from_prefix(site, &prefix.prefix))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }
 
 pub fn download_realtime_volume(
     volume: &RealtimeLevel2Volume,
     cache_dir: &Path,
 ) -> Result<DownloadedObject> {
+    download_realtime_volume_cancellable(volume, cache_dir, &|| false)
+}
+
+/// [`download_realtime_volume`], abandoned between chunk batches when
+/// `cancelled` starts returning true.
+///
+/// A whole volume is 6-13 MB. A background fetch that keeps pulling that after
+/// the analyst has switched sites is bandwidth spent on a result that can no
+/// longer be installed, so the caller gets a way to stop it. Chunks already
+/// written stay in the chunk cache and are reused if the same volume is asked
+/// for again.
+pub fn download_realtime_volume_cancellable(
+    volume: &RealtimeLevel2Volume,
+    cache_dir: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<DownloadedObject> {
+    // Refused before anything is written, because concatenating a gapped chunk
+    // set produces a file that decodes into plausible-looking radials under a
+    // garbage header rather than failing. See [`first_missing_chunk_id`]; the
+    // live poll recovers on its next pass, which is 1.2 s away.
+    if let Some(missing_chunk_id) = first_missing_chunk_id(&volume.chunks) {
+        return Err(DataSourceError::ChunkSetNotContiguous {
+            site: volume.site.clone(),
+            volume_id: volume.volume_id,
+            volume_time: volume.volume_time,
+            missing_chunk_id,
+            last_chunk_id: volume.chunks.last().map_or(0, |chunk| chunk.chunk_id),
+        });
+    }
+
     fs::create_dir_all(cache_dir)?;
     let filename = realtime_volume_cache_filename(volume);
     let path = cache_dir.join(&filename);
@@ -536,6 +692,12 @@ pub fn download_realtime_volume(
     }
 
     for batch in missing.chunks(REALTIME_CHUNK_DOWNLOAD_BATCH) {
+        if cancelled() {
+            return Err(DataSourceError::DownloadCancelled {
+                site: volume.site.clone(),
+                volume_id: volume.volume_id,
+            });
+        }
         thread::scope(|scope| -> Result<()> {
             let mut workers = Vec::with_capacity(batch.len());
             for (object, path) in batch {
@@ -794,6 +956,138 @@ fn realtime_volume_candidate_ids_from_active_ids(ids: &[u16]) -> Vec<u16> {
     candidates
 }
 
+/// The `max_count` active ids preceding `current_volume_id`, nearest first.
+///
+/// Distance is measured backwards around the wrapping counter, which is what
+/// makes the wrap ordinary rather than a special case: with the counter at 1
+/// the nearest preceding active id is 999, and no subtraction ever underflows
+/// because the modulus is added before the subtraction. `current_volume_id`
+/// itself is never returned.
+fn preceding_realtime_volume_ids_from_active_ids(
+    ids: &[u16],
+    current_volume_id: u16,
+    max_count: usize,
+) -> Vec<u16> {
+    let modulus = u32::from(REALTIME_VOLUME_ID_MODULUS);
+    let current = u32::from(current_volume_id) % modulus;
+    let mut by_distance = ids
+        .iter()
+        .copied()
+        .filter(|id| *id < REALTIME_VOLUME_ID_MODULUS)
+        .map(|id| ((current + modulus - u32::from(id)) % modulus, id))
+        .filter(|(distance, _)| *distance > 0)
+        .collect::<Vec<_>>();
+    by_distance.sort_unstable();
+    by_distance.dedup();
+    by_distance
+        .into_iter()
+        .take(max_count)
+        .map(|(_, id)| id)
+        .collect()
+}
+
+/// Split one volume-id directory into the distinct volumes it holds, oldest
+/// first.
+///
+/// A directory is normally one volume. It is two when the id counter wraps
+/// back onto a directory the bucket has not expired yet - retention is days
+/// (KTLX held ids 1..=680 spanning 2026-08-16 to 2026-08-18 when sampled on
+/// 2026-08-18) while the counter cycles in roughly 999 volumes. Every chunk
+/// key carries its own volume's start time, so grouping on that time separates
+/// the two exactly; concatenating them instead would produce a file that is
+/// neither volume.
+fn realtime_volume_groups(
+    site: &str,
+    volume_id: u16,
+    chunks: Vec<RealtimeChunkObject>,
+) -> Vec<RealtimeLevel2Volume> {
+    let mut by_time = BTreeMap::<DateTime<Utc>, Vec<RealtimeChunkObject>>::new();
+    for chunk in chunks {
+        by_time.entry(chunk.volume_time).or_default().push(chunk);
+    }
+    by_time
+        .into_iter()
+        .map(|(volume_time, mut chunks)| {
+            chunks.sort_by_key(|chunk| chunk.chunk_id);
+            // An `E` chunk on its own is not a whole volume: see
+            // [`first_missing_chunk_id`]. The head of a volume can be gone
+            // while its tail, including the `E`, is still listed.
+            let complete = chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end())
+                && first_missing_chunk_id(&chunks).is_none();
+            let total_size = chunks.iter().map(|chunk| chunk.object.size).sum();
+            RealtimeLevel2Volume {
+                site: site.to_owned(),
+                volume_id,
+                volume_time,
+                chunks,
+                complete,
+                total_size,
+            }
+        })
+        .collect()
+}
+
+/// The first chunk id missing from `chunks`, or `None` when they are the
+/// contiguous run `1..=n` that a Level II volume is delivered as.
+///
+/// Chunk 1 carries the 24-byte Volume Header Record and the metadata block, so
+/// a set that starts anywhere else concatenates into a file with no header at
+/// all - and `decode_volume_from_bytes` does not check for the `AR2V` magic, it
+/// reads the first 24 bytes as a header and then hunts for bzip blocks, so such
+/// a file decodes into radials carrying a garbage site and time rather than
+/// failing. That is the one failure this whole module has to prevent, because
+/// it is the one an analyst cannot see.
+///
+/// This is not hypothetical. The chunks bucket expires individual chunk
+/// OBJECTS by age, not whole volume directories, so a directory at the
+/// retention edge is left holding only its tail. Measured against the live
+/// bucket on 2026-08-18: `KTLX/969` held exactly `20260816-044049-054-I` and
+/// `20260816-044049-055-E`; `KEAX/592` held 54..=61; `KEAX/742` held 21..=55;
+/// `KRTX/897` held 6..=67; `KAMA/271` held 20..=55; `KAMA/455` held 43..=55.
+/// Every one of those ends in an `E` chunk, which is all the completeness test
+/// used to look at. Scanning all 642 KTLX directories found no gap in any
+/// volume younger than the retention edge, so requiring contiguity never
+/// rejects live data.
+fn first_missing_chunk_id(chunks: &[RealtimeChunkObject]) -> Option<u16> {
+    // An empty set is missing chunk 1 like any other headless set. Saying
+    // "contiguous" here would let `download_realtime_volume` write a zero-byte
+    // file and call it a volume.
+    if chunks.is_empty() {
+        return Some(1);
+    }
+    let mut expected = 1u16;
+    for chunk in chunks {
+        // Not `!=` against a running max: a repeated chunk id would otherwise
+        // pass and be concatenated twice, which corrupts the file just as
+        // thoroughly as a gap does.
+        if chunk.chunk_id != expected {
+            return Some(expected);
+        }
+        expected = expected.checked_add(1)?;
+    }
+    None
+}
+
+/// Pick the newest volume in `groups` that is a usable predecessor of the
+/// volume starting at `current_volume_time`.
+///
+/// Complete only, because a partial predecessor would reintroduce the hole the
+/// backfill exists to close, and strictly inside
+/// `oldest_accepted..current_volume_time`, because an id directory that has
+/// not expired since the counter last passed it holds a volume that is days
+/// old, not minutes.
+fn select_previous_complete_volume(
+    groups: Vec<RealtimeLevel2Volume>,
+    current_volume_time: DateTime<Utc>,
+    oldest_accepted: DateTime<Utc>,
+) -> Option<RealtimeLevel2Volume> {
+    groups.into_iter().rev().find(|volume| {
+        volume.complete
+            && volume.volume_time < current_volume_time
+            && volume.volume_time >= oldest_accepted
+    })
+}
+
 fn parse_realtime_chunk_object(object: S3Object) -> Option<RealtimeChunkObject> {
     let key = object.key.clone();
     let mut path_parts = key.split('/');
@@ -887,8 +1181,66 @@ fn append_realtime_chunks(
     Ok(())
 }
 
+/// Fetch one immutable S3 object, retrying the transport failures that a
+/// pooled HTTPS connection produces under load.
+///
+/// Measured, not anticipated: pulling four volumes back to back while the live
+/// poll listed the same prefix - which is exactly the traffic shape the
+/// previous-volume backfill introduces - failed on
+/// `https://…/KTLX/689/20260818-190055-001-S` with
+/// `hyper::Error(IncompleteMessage)`, a connection S3 had already closed and
+/// the pool handed out anyway. Without a retry that single chunk loses a whole
+/// 10 MB volume; the live poll would recover on its next pass 1.2 s later, but
+/// the backfill gets one attempt per session and would simply never appear.
+///
+/// Repeating a GET on an immutable chunk object is safe. Timeouts are NOT
+/// retried, because a link that is actually dead should fail in one timeout
+/// rather than three.
 fn download_s3_object_to_path(bucket: &str, object: &S3Object, path: &Path) -> Result<()> {
     let url = format!("https://{bucket}.s3.amazonaws.com/{}", object.key);
+    for attempt in 1..=S3_OBJECT_DOWNLOAD_ATTEMPTS {
+        match download_s3_object_attempt(&url, object, path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if attempt == S3_OBJECT_DOWNLOAD_ATTEMPTS || !is_retriable_download_error(&error) {
+                    return Err(error);
+                }
+                eprintln!("retrying {url} after attempt {attempt}: {error}");
+                thread::sleep(S3_OBJECT_DOWNLOAD_RETRY_DELAY);
+            }
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
+}
+
+/// Whether repeating the request could plausibly succeed. A 404 or a full disk
+/// will not fix itself; a dropped connection, a truncated body or a 5xx will.
+fn is_retriable_download_error(error: &DataSourceError) -> bool {
+    match error {
+        // A body that ended early is the same fault as a dropped connection,
+        // it just happened to close cleanly.
+        DataSourceError::DownloadSizeMismatch { .. } => true,
+        DataSourceError::Http(http) => {
+            if http.is_timeout() {
+                return false;
+            }
+            match http.status() {
+                Some(status) => {
+                    status.is_server_error()
+                        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                }
+                // No status at all means the failure was below HTTP: connect,
+                // TLS, or a connection closed mid-response.
+                None => true,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn download_s3_object_attempt(url: &str, object: &S3Object, path: &Path) -> Result<()> {
+    let url = url.to_owned();
     let mut response = download_http_client()
         .get(&url)
         .send()?
@@ -1157,6 +1509,720 @@ mod tests {
     }
 
     #[test]
+    fn previous_realtime_volume_id_wraps_through_the_active_set() {
+        // The shape KTLX really had, listed on 2026-08-18T18:40Z: 642 active
+        // ids in the runs 1..=2, 10..=29, 97..=684 and 969..=999.
+        //
+        // Those runs are ONE pass of the counter, not two cycles: 969 starts at
+        // 2026-08-16T04:40:49Z, 999 at 08:13:07Z, 1 at 08:20:09Z, 2 at
+        // 08:27:11Z and 684 at 2026-08-18T18:25:41Z. So the counter really does
+        // step 999 -> 1 with no zero in between, and the whole set spans two
+        // and a half days - the gaps are volumes the bucket has expired or the
+        // radar never sent, not a second cycle.
+        let mut ktlx_ids = (1..=2u16).collect::<Vec<_>>();
+        ktlx_ids.extend(10..=29u16);
+        ktlx_ids.extend(97..=684u16);
+        ktlx_ids.extend(969..=999u16);
+
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&ktlx_ids, 684),
+            Some(683)
+        );
+        // The wrap. `current - 1` would name 0 (absent, and one underflow away
+        // from 65535); the newest run boundary would name 684, a live volume.
+        // The counter really goes 999 -> 1, so 999 is the answer, and the real
+        // bucket agrees: KTLX/999 starts 7m02s before KTLX/1.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&ktlx_ids, 1),
+            Some(999)
+        );
+        // Every id at a run boundary, walked both ways. 97 is the oldest id the
+        // bucket still holds, so its predecessor is the previous run's end (29,
+        // which is 2026-08-16T11:37Z - eight hours earlier, which only the time
+        // guard in `select_previous_complete_volume` can reject).
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&ktlx_ids, 97),
+            Some(29)
+        );
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&ktlx_ids, 10),
+            Some(2)
+        );
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&ktlx_ids, 2),
+            Some(1)
+        );
+        // And the case a wrapping counter cannot resolve on its own: walking
+        // backwards from 969 the nearest active id is 684, which is two days
+        // LATER in time. An id alone cannot tell "285 volumes ago" from "715
+        // volumes ahead", which is why `select_previous_complete_volume`
+        // demands the candidate's own start time be earlier and recent.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&ktlx_ids, 969),
+            Some(684)
+        );
+
+        // Nearest preceding ACTIVE id, not `current - 1`: backwards from 3 the
+        // distances are 900 -> 103 and 7 -> 996, so 900 wins.
+        let sparse = [3u16, 7, 900];
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&sparse, 7),
+            Some(3)
+        );
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&sparse, 3),
+            Some(900)
+        );
+
+        // Nothing precedes the only active volume, and nothing precedes
+        // nothing.
+        assert_eq!(previous_realtime_volume_id_from_active_ids(&[42], 42), None);
+        assert_eq!(previous_realtime_volume_id_from_active_ids(&[], 42), None);
+    }
+
+    /// Every element of a set that straddles the wrap, and the same set with
+    /// ids removed the way the bucket really ages them out.
+    ///
+    /// The counter runs 1..=999 and steps 999 -> 1 with no zero (confirmed
+    /// against the live bucket: KTLX/999 = 2026-08-16T08:13:07Z, KTLX/1 =
+    /// 08:20:09Z, KTLX/2 = 08:27:11Z). The distances below are therefore taken
+    /// modulo 1000, which counts a value the counter never emits; that is
+    /// harmless because 0 is never a member, so it can never be chosen, and the
+    /// ORDER of the real candidates is unaffected.
+    #[test]
+    fn previous_volume_id_is_right_for_every_element_across_the_wrap() {
+        // Time order of this set is 998, 999, 1, 2.
+        let straddling = [998u16, 999, 1, 2];
+        // 2 <- 1: distance 1.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&straddling, 2),
+            Some(1)
+        );
+        // 1 <- 999: distance (1 + 1000 - 999) % 1000 = 2, beating 998 at 3.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&straddling, 1),
+            Some(999)
+        );
+        // 999 <- 998: distance 1.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&straddling, 999),
+            Some(998)
+        );
+        // 998 is the OLDEST member, so nothing in the set really precedes it.
+        // The walk answers 2 (distance 996) because that is the nearest id
+        // going backwards; the whole answer is a volume 996 steps back, which
+        // in wall-clock terms is ahead. `select_previous_complete_volume`'s
+        // time bound is what turns that into "no predecessor", and the ignored
+        // real-feed test below shows it doing so.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&straddling, 998),
+            Some(2)
+        );
+
+        // The same set with ids aged out. 999 gone: 1's predecessor becomes
+        // 998 (distance 3) rather than an absent 999 or an underflowed 0.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&[998, 1, 2], 1),
+            Some(998)
+        );
+        // 1 gone: 2's predecessor becomes 999 (distance 3), not 1.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&[998, 999, 2], 2),
+            Some(999)
+        );
+        // Both gone: 2 falls back across the wrap to 998, distance 4.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&[998, 2], 2),
+            Some(998)
+        );
+        // The current id absent from the set is the same walk: nothing about
+        // the answer depends on the counter's own directory still existing.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&[998, 999], 1),
+            Some(999)
+        );
+
+        // A radar that just came up has one directory and no predecessor, and
+        // an off-air site has none at all. Neither may panic or list anything.
+        assert_eq!(previous_realtime_volume_id_from_active_ids(&[7], 7), None);
+        assert_eq!(previous_realtime_volume_id_from_active_ids(&[], 7), None);
+        // Out-of-range ids from a malformed prefix are ignored rather than
+        // wrapped into a real id.
+        assert_eq!(
+            previous_realtime_volume_id_from_active_ids(&[1000, 1001, 5], 7),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn preceding_realtime_volume_ids_walk_backwards_nearest_first() {
+        // Backwards distances from 2: 1 -> 1, 999 -> 3, 998 -> 4, 997 -> 5,
+        // 4 -> 998, 3 -> 999. The lookback therefore crosses the wrap before
+        // it ever reaches the ids ahead of the counter.
+        let ids = [1u16, 2, 3, 4, 997, 998, 999];
+        assert_eq!(
+            preceding_realtime_volume_ids_from_active_ids(&ids, 2, 4),
+            vec![1, 999, 998, 997]
+        );
+        assert_eq!(
+            preceding_realtime_volume_ids_from_active_ids(&ids, 2, 1),
+            vec![1]
+        );
+        assert!(preceding_realtime_volume_ids_from_active_ids(&ids, 2, 0).is_empty());
+
+        // A radar that has just come back on the air has one directory. The
+        // real lookback is `REALTIME_PREVIOUS_VOLUME_LOOKBACK`, and it must
+        // produce nothing to list rather than four listings that all miss: a
+        // backfill that cannot happen must cost no requests at all.
+        assert!(
+            preceding_realtime_volume_ids_from_active_ids(
+                &[689],
+                689,
+                REALTIME_PREVIOUS_VOLUME_LOOKBACK
+            )
+            .is_empty()
+        );
+        // And when the predecessors have aged out, the walk offers only what is
+        // really there - four asked for, two available.
+        assert_eq!(
+            preceding_realtime_volume_ids_from_active_ids(
+                &[680, 689],
+                689,
+                REALTIME_PREVIOUS_VOLUME_LOOKBACK
+            ),
+            vec![680]
+        );
+    }
+
+    #[test]
+    fn realtime_volume_groups_split_a_recycled_volume_id() {
+        let old_time = Utc.with_ymd_and_hms(2026, 8, 16, 8, 20, 9).unwrap();
+        let new_time = Utc.with_ymd_and_hms(2026, 8, 18, 17, 57, 28).unwrap();
+        let chunks = vec![
+            test_chunk(1, new_time, 2, RealtimeChunkType::Intermediate, 20),
+            test_chunk(1, old_time, 1, RealtimeChunkType::Start, 4),
+            test_chunk(1, new_time, 1, RealtimeChunkType::Start, 10),
+            test_chunk(1, old_time, 2, RealtimeChunkType::End, 6),
+        ];
+
+        let groups = realtime_volume_groups("KTLX", 1, chunks);
+
+        assert_eq!(groups.len(), 2);
+        // Oldest first, and each group carries only its own chunks: the two
+        // days between them must not end up concatenated into one file.
+        assert_eq!(groups[0].volume_time, old_time);
+        assert_eq!(groups[0].total_size, 10);
+        assert!(groups[0].complete);
+        assert_eq!(groups[1].volume_time, new_time);
+        assert_eq!(groups[1].total_size, 30);
+        assert!(!groups[1].complete);
+        assert_eq!(
+            groups[1]
+                .chunks
+                .iter()
+                .map(|chunk| chunk.chunk_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    /// A chunk set whose head has been aged out is not a complete volume, even
+    /// though its last chunk is an `E`.
+    ///
+    /// Every case here is a directory that really existed in the chunks bucket
+    /// on 2026-08-18; the chunk ids are copied from the listings.
+    #[test]
+    fn a_head_truncated_chunk_set_is_not_a_complete_volume() {
+        let volume_time = Utc.with_ymd_and_hms(2026, 8, 16, 4, 40, 49).unwrap();
+
+        // KTLX/969 held exactly these two objects and nothing else.
+        let ktlx_969 = realtime_volume_groups(
+            "KTLX",
+            969,
+            vec![
+                test_chunk(
+                    969,
+                    volume_time,
+                    54,
+                    RealtimeChunkType::Intermediate,
+                    71_000,
+                ),
+                test_chunk(969, volume_time, 55, RealtimeChunkType::End, 12_000),
+            ],
+        );
+        assert_eq!(ktlx_969.len(), 1);
+        assert!(
+            !ktlx_969[0].complete,
+            "chunks 54..=55 are the tail of a volume, not a volume"
+        );
+        assert_eq!(first_missing_chunk_id(&ktlx_969[0].chunks), Some(1));
+
+        // KAMA/455 held 43..=55, KEAX/592 held 54..=61, KRTX/897 held 6..=67.
+        for (site, volume_id, first, last) in [
+            ("KAMA", 455u16, 43u16, 55u16),
+            ("KEAX", 592, 54, 61),
+            ("KRTX", 897, 6, 67),
+        ] {
+            let chunks = (first..=last)
+                .map(|chunk_id| {
+                    let chunk_type = if chunk_id == last {
+                        RealtimeChunkType::End
+                    } else {
+                        RealtimeChunkType::Intermediate
+                    };
+                    test_chunk(volume_id, volume_time, chunk_id, chunk_type, 60_000)
+                })
+                .collect::<Vec<_>>();
+            let groups = realtime_volume_groups(site, volume_id, chunks);
+            assert!(
+                !groups[0].complete,
+                "{site}/{volume_id} starts at chunk {first}, so it has no volume header"
+            );
+        }
+
+        // A gap in the middle is just as fatal, and is what a zero-byte chunk
+        // (dropped by the size filter in the listing) leaves behind.
+        let gapped = realtime_volume_groups(
+            "KTLX",
+            683,
+            vec![
+                test_chunk(683, volume_time, 1, RealtimeChunkType::Start, 10),
+                test_chunk(683, volume_time, 2, RealtimeChunkType::Intermediate, 10),
+                test_chunk(683, volume_time, 4, RealtimeChunkType::End, 10),
+            ],
+        );
+        assert!(!gapped[0].complete);
+        assert_eq!(first_missing_chunk_id(&gapped[0].chunks), Some(3));
+
+        // The whole run still is one.
+        let whole = realtime_volume_groups(
+            "KTLX",
+            683,
+            vec![
+                test_chunk(683, volume_time, 1, RealtimeChunkType::Start, 10),
+                test_chunk(683, volume_time, 2, RealtimeChunkType::Intermediate, 10),
+                test_chunk(683, volume_time, 3, RealtimeChunkType::End, 10),
+            ],
+        );
+        assert!(whole[0].complete);
+        assert_eq!(first_missing_chunk_id(&whole[0].chunks), None);
+
+        // A repeated chunk id would be concatenated twice, so it is a gap by
+        // another name: after the second 2 the run can no longer reach 3.
+        let duplicated = [
+            test_chunk(683, volume_time, 1, RealtimeChunkType::Start, 10),
+            test_chunk(683, volume_time, 2, RealtimeChunkType::Intermediate, 10),
+            test_chunk(683, volume_time, 2, RealtimeChunkType::Intermediate, 10),
+            test_chunk(683, volume_time, 3, RealtimeChunkType::End, 10),
+        ];
+        assert_eq!(first_missing_chunk_id(&duplicated), Some(3));
+
+        // And an empty set is missing chunk 1, not "contiguous", so it can
+        // never be written out as a zero-byte volume.
+        assert_eq!(first_missing_chunk_id(&[]), Some(1));
+    }
+
+    /// A gapped chunk set must be refused before any bytes are written, so it
+    /// cannot leave a file that later decodes as a real volume.
+    #[test]
+    fn assembling_a_gapped_chunk_set_is_refused_and_writes_nothing() {
+        let dir = unique_test_dir("refuse-gapped");
+        let volume_time = Utc.with_ymd_and_hms(2026, 8, 16, 4, 40, 49).unwrap();
+        let volume = RealtimeLevel2Volume {
+            site: "KTLX".to_owned(),
+            volume_id: 969,
+            volume_time,
+            chunks: vec![
+                test_chunk(
+                    969,
+                    volume_time,
+                    54,
+                    RealtimeChunkType::Intermediate,
+                    71_000,
+                ),
+                test_chunk(969, volume_time, 55, RealtimeChunkType::End, 12_000),
+            ],
+            complete: true, // as the old grouping would have reported it
+            total_size: 83_000,
+        };
+
+        let error = download_realtime_volume(&volume, &dir)
+            .expect_err("a headless chunk set must not be assembled");
+        assert!(
+            matches!(
+                error,
+                DataSourceError::ChunkSetNotContiguous {
+                    missing_chunk_id: 1,
+                    last_chunk_id: 55,
+                    ..
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        // Refused before `create_dir_all`, so not even the cache directory is
+        // brought into existence by a volume that can never be assembled.
+        assert!(
+            !dir.exists(),
+            "{} should not have been created",
+            dir.display()
+        );
+    }
+
+    /// A file the cache already holds is not fetched again, and the check is
+    /// made before any network call - this test runs with no network at all.
+    #[test]
+    fn a_cached_realtime_volume_is_reported_as_a_cache_hit_without_downloading() {
+        let dir = unique_test_dir("cache-hit");
+        fs::create_dir_all(&dir).expect("test cache dir");
+        let volume = test_realtime_volume_with_sizes(&[4, 6, 10]);
+
+        // The bytes do not matter, only that the assembled file is already the
+        // exact size of the volume: that is the whole cache test.
+        let cached = dir.join(realtime_volume_cache_filename(&volume));
+        fs::write(&cached, vec![0u8; 20]).expect("pre-populated cache file");
+
+        let downloaded =
+            download_realtime_volume(&volume, &dir).expect("cached volume resolves offline");
+        assert!(downloaded.cache_hit);
+        assert_eq!(downloaded.path, cached);
+        assert_eq!(downloaded.object.size, 20);
+        // No chunk cache was created, which is the proof that no chunk was
+        // requested: the chunk directory is made only on the download path.
+        assert!(!dir.join(".chunks").exists());
+
+        fs::remove_dir_all(&dir).expect("clean cache-hit test dir");
+    }
+
+    /// A cache directory that cannot be created is an error, not a panic, and
+    /// leaves nothing behind.
+    #[test]
+    fn an_unusable_cache_directory_is_an_error_rather_than_a_panic() {
+        let dir = unique_test_dir("bad-cache");
+        fs::create_dir_all(&dir).expect("test parent dir");
+        // A plain file standing where the cache directory should be. Portable,
+        // and it exercises the same `create_dir_all` failure a read-only or
+        // permission-denied directory produces.
+        let blocked = dir.join("not-a-directory");
+        fs::write(&blocked, b"occupied").expect("blocking file");
+
+        let volume = test_realtime_volume_with_sizes(&[4, 6, 10]);
+        let error = download_realtime_volume(&volume, &blocked)
+            .expect_err("a file is not a cache directory");
+        assert!(
+            matches!(error, DataSourceError::Io(_)),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&blocked).expect("blocking file survives"),
+            b"occupied"
+        );
+
+        fs::remove_dir_all(&dir).expect("clean bad-cache test dir");
+    }
+
+    #[test]
+    fn previous_volume_selection_rejects_stale_and_partial_candidates() {
+        let current_time = Utc.with_ymd_and_hms(2026, 8, 18, 17, 57, 28).unwrap();
+        let oldest_accepted =
+            current_time - Duration::minutes(REALTIME_PREVIOUS_VOLUME_MAX_GAP_MINUTES);
+        let stale = test_group(Utc.with_ymd_and_hms(2026, 8, 16, 8, 20, 9).unwrap(), true);
+        let partial = test_group(
+            Utc.with_ymd_and_hms(2026, 8, 18, 17, 50, 26).unwrap(),
+            false,
+        );
+        let previous = test_group(Utc.with_ymd_and_hms(2026, 8, 18, 17, 50, 26).unwrap(), true);
+        let ahead = test_group(Utc.with_ymd_and_hms(2026, 8, 18, 18, 4, 30).unwrap(), true);
+
+        // A recycled id holding a two-day-old volume is not the predecessor.
+        assert!(
+            select_previous_complete_volume(vec![stale.clone()], current_time, oldest_accepted)
+                .is_none()
+        );
+        // Neither is a volume that never finished ...
+        assert!(
+            select_previous_complete_volume(vec![partial.clone()], current_time, oldest_accepted)
+                .is_none()
+        );
+        // ... nor one that starts after the volume we are backfilling behind.
+        assert!(
+            select_previous_complete_volume(vec![ahead.clone()], current_time, oldest_accepted)
+                .is_none()
+        );
+
+        let chosen = select_previous_complete_volume(
+            vec![stale, partial, previous.clone(), ahead],
+            current_time,
+            oldest_accepted,
+        )
+        .expect("recent complete predecessor is selected");
+        assert_eq!(chosen.volume_time, previous.volume_time);
+    }
+
+    /// The wrap, the staleness guard and the predecessor walk checked against
+    /// the bucket rather than against a fixture.
+    ///
+    /// ```text
+    /// cargo test --release -p data_source -- --ignored --nocapture \
+    ///     the_real_feed_agrees_which_volume_precedes_the_live_one
+    /// ```
+    ///
+    /// `RADAR_LIVE_SITE` picks the site (default KTLX).
+    #[test]
+    #[ignore = "lists the real NEXRAD chunks bucket"]
+    fn the_real_feed_agrees_which_volume_precedes_the_live_one() {
+        let site = std::env::var("RADAR_LIVE_SITE").unwrap_or_else(|_| "KTLX".to_owned());
+        let active = list_active_realtime_volume_ids(&site).expect("active id listing");
+        assert!(!active.is_empty(), "{site} has no volumes in the bucket");
+        println!("{site}: {} active ids", active.len());
+
+        let live = latest_realtime_level2_volume(&site).expect("live volume");
+        let previous =
+            previous_complete_realtime_level2_volume(&site, live.volume_id, live.volume_time)
+                .expect("previous complete volume");
+        let gap = live.volume_time - previous.volume_time;
+        println!(
+            "live id {:>3} at {} ({} chunk(s), complete {})",
+            live.volume_id,
+            live.volume_time.to_rfc3339(),
+            live.chunks.len(),
+            live.complete
+        );
+        println!(
+            "prev id {:>3} at {} ({} chunk(s), complete {}), {} s earlier",
+            previous.volume_id,
+            previous.volume_time.to_rfc3339(),
+            previous.chunks.len(),
+            previous.complete,
+            gap.num_seconds()
+        );
+
+        // The predecessor is the nearest ACTIVE id walking backwards, not
+        // `live - 1`: at the wrap `live - 1` names 0, which the counter never
+        // emits, and after an expiry it names a directory that is gone.
+        let expected = previous_realtime_volume_id_from_active_ids(&active, live.volume_id);
+        let naive = live.volume_id.wrapping_sub(1);
+        println!("nearest preceding active id = {expected:?}, naive live-1 = {naive}");
+        if let Some(expected) = expected
+            && expected == previous.volume_id
+        {
+            // The ordinary case: the immediate predecessor was usable.
+        } else {
+            // The walk skipped past ids that were expired, incomplete or stale.
+            // Whatever it landed on still has to satisfy every invariant below.
+            println!("walked past {expected:?} to {}", previous.volume_id);
+        }
+
+        assert!(previous.complete, "a backfill must be a whole volume");
+        assert_eq!(
+            first_missing_chunk_id(&previous.chunks),
+            None,
+            "a complete volume is the contiguous run 1..=n"
+        );
+        assert!(
+            previous.volume_time < live.volume_time,
+            "the predecessor must start earlier, whatever its id says"
+        );
+        assert!(
+            gap <= Duration::minutes(REALTIME_PREVIOUS_VOLUME_MAX_GAP_MINUTES),
+            "{} minutes is not the previous volume, it is a recycled id",
+            gap.num_minutes()
+        );
+        assert_ne!(previous.volume_id, live.volume_id);
+    }
+
+    /// The bucket really does hold volume directories whose head has been aged
+    /// out, and they must not be reported as complete or assembled.
+    ///
+    /// ```text
+    /// cargo test --release -p data_source -- --ignored --nocapture \
+    ///     head_truncated_directories_in_the_real_bucket_are_refused
+    /// ```
+    #[test]
+    #[ignore = "lists the real NEXRAD chunks bucket"]
+    fn head_truncated_directories_in_the_real_bucket_are_refused() {
+        let site = std::env::var("RADAR_LIVE_SITE").unwrap_or_else(|_| "KTLX".to_owned());
+        let active = list_active_realtime_volume_ids(&site).expect("active id listing");
+        let dir = unique_test_dir("truncated-refusal");
+
+        // The truncation lives at the retention edge, and because the counter
+        // wraps, the oldest volumes by TIME are not the lowest ids: they are
+        // the first ids of each contiguous run, which is where expiry has been
+        // eating. On 2026-08-18 KTLX's runs began at 1, 10, 97 and 969, and the
+        // head-truncated directory was 969 - the run start with the HIGHEST id.
+        let run_starts = active
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, id)| *index == 0 || active[index - 1] + 1 != *id)
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
+        // Deduplicated: runs can start within ten ids of each other, and
+        // visiting a directory twice would double-count it in the total below.
+        let mut probe_ids = run_starts
+            .iter()
+            .flat_map(|start| {
+                (*start..)
+                    .take(10)
+                    .filter(|id| active.binary_search(id).is_ok())
+            })
+            .collect::<Vec<_>>();
+        probe_ids.sort_unstable();
+        probe_ids.dedup();
+        println!(
+            "{site} runs start at {run_starts:?}; probing {} ids",
+            probe_ids.len()
+        );
+
+        let mut found = 0usize;
+        for volume_id in probe_ids {
+            let Ok(groups) = realtime_level2_volume_groups_for_id(&site, volume_id) else {
+                continue;
+            };
+            for group in groups {
+                let Some(missing) = first_missing_chunk_id(&group.chunks) else {
+                    continue;
+                };
+                found += 1;
+                println!(
+                    "{site}/{volume_id} at {}: chunks {}..={} ({} of them), missing {missing}, last type {}",
+                    group.volume_time.to_rfc3339(),
+                    group.chunks.first().expect("non-empty group").chunk_id,
+                    group.chunks.last().expect("non-empty group").chunk_id,
+                    group.chunks.len(),
+                    group
+                        .chunks
+                        .last()
+                        .expect("non-empty group")
+                        .chunk_type
+                        .label()
+                );
+                assert!(
+                    !group.complete,
+                    "a gapped chunk set is not a complete volume even when it ends in E"
+                );
+                let error = download_realtime_volume(&group, &dir)
+                    .expect_err("a gapped chunk set must not be assembled");
+                assert!(
+                    matches!(error, DataSourceError::ChunkSetNotContiguous { .. }),
+                    "unexpected error: {error}"
+                );
+            }
+        }
+        println!("{found} head-truncated group(s) at the {site} retention edge");
+        assert!(
+            !dir.exists(),
+            "nothing may be written for a volume that cannot be assembled"
+        );
+    }
+
+    /// The backfill must not slow the live poll. Measured, not argued: the poll
+    /// is timed on its own and then timed again while a whole 10 MB volume is
+    /// being pulled on another thread through the same two shared
+    /// `reqwest::blocking::Client`s.
+    ///
+    /// ```text
+    /// cargo test --release -p data_source -- --ignored --nocapture \
+    ///     a_backfill_does_not_slow_the_live_poll
+    /// ```
+    #[test]
+    #[ignore = "downloads a whole volume from the real NEXRAD chunks bucket"]
+    fn a_backfill_does_not_slow_the_live_poll() {
+        /// The live worker's cadence. A poll that stays well inside this cannot
+        /// make the session miss a chunk.
+        const LIVE_POLL_INTERVAL_MS: u128 = 1_200;
+
+        let site = std::env::var("RADAR_LIVE_SITE").unwrap_or_else(|_| "KTLX".to_owned());
+        let live_cache = unique_test_dir("poll-latency-live");
+        let backfill_cache = unique_test_dir("poll-latency-backfill");
+
+        // One warm-up so the connection pool and the DNS answer are not
+        // charged to the first sample.
+        let live = latest_realtime_level2_volume(&site).expect("warm-up listing");
+        let _ = download_realtime_volume(&live, &live_cache).expect("warm-up download");
+
+        let poll_once = |cache: &Path| -> u128 {
+            let started = Instant::now();
+            let volume = latest_realtime_level2_volume(&site).expect("live listing");
+            let _ = download_realtime_volume(&volume, cache).expect("live download");
+            started.elapsed().as_millis()
+        };
+
+        let idle = (0..10).map(|_| poll_once(&live_cache)).collect::<Vec<_>>();
+
+        // A cold cache directory, so the backfill really moves the bytes.
+        let previous =
+            previous_complete_realtime_level2_volume(&site, live.volume_id, live.volume_time)
+                .expect("previous complete volume");
+        let backfill_bytes = previous.total_size;
+        let backfill_dir = backfill_cache.clone();
+        // One volume transfers in about 1.5 s, which is barely three polls, so
+        // the transfer is repeated into fresh cache directories to hold the
+        // link busy long enough for the poll distribution to mean something.
+        const BACKFILL_REPEATS: usize = 4;
+        let backfill = thread::spawn(move || {
+            let started = Instant::now();
+            let mut cache_hits = 0usize;
+            for repeat in 0..BACKFILL_REPEATS {
+                let downloaded =
+                    download_realtime_volume(&previous, &backfill_dir.join(repeat.to_string()))
+                        .expect("backfill download");
+                if downloaded.cache_hit {
+                    cache_hits += 1;
+                }
+            }
+            (started.elapsed().as_millis(), cache_hits)
+        });
+
+        let mut loaded = Vec::new();
+        while !backfill.is_finished() {
+            loaded.push(poll_once(&live_cache));
+        }
+        let (backfill_ms, cache_hits) = backfill.join().expect("backfill thread");
+
+        let median = |samples: &[u128]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        };
+        println!(
+            "backfill: {BACKFILL_REPEATS} x {:.1} MiB in {backfill_ms} ms ({cache_hits} cache hit(s))",
+            backfill_bytes as f64 / (1_024.0 * 1_024.0)
+        );
+        // Every repeat used a cold cache directory, so this really was
+        // sustained transfer and not a metadata check.
+        assert_eq!(cache_hits, 0);
+        println!(
+            "poll idle       : n={} median {} ms max {} ms  {idle:?}",
+            idle.len(),
+            median(&idle),
+            idle.iter().max().copied().unwrap_or_default()
+        );
+        println!(
+            "poll under load : n={} median {} ms max {} ms  {loaded:?}",
+            loaded.len(),
+            median(&loaded),
+            loaded.iter().max().copied().unwrap_or_default()
+        );
+
+        assert!(
+            !loaded.is_empty(),
+            "the backfill finished before a poll ran"
+        );
+        // The requirement is not "identical" - it is a shared link, and one
+        // number off a public bucket is noise. The requirement is that the poll
+        // still fits inside the interval it is run on, so the live tilt keeps
+        // arriving while the backfill transfers.
+        assert!(
+            median(&loaded) < LIVE_POLL_INTERVAL_MS,
+            "median poll under load was {} ms, which does not fit in the {LIVE_POLL_INTERVAL_MS} ms live cadence",
+            median(&loaded)
+        );
+
+        let _ = fs::remove_dir_all(&live_cache);
+        let _ = fs::remove_dir_all(&backfill_cache);
+    }
+
+    #[test]
     fn realtime_chunk_key_parser_extracts_volume_metadata() {
         let chunk = parse_realtime_chunk_object(S3Object {
             key: "KGGW/628/20260608-002828-025-I".to_owned(),
@@ -1193,6 +2259,76 @@ mod tests {
     }
 
     #[test]
+    fn only_transport_failures_are_worth_repeating() {
+        // A body that stopped early is the retriable case that does not look
+        // like a network error at the type level.
+        assert!(is_retriable_download_error(
+            &DataSourceError::DownloadSizeMismatch {
+                url: "test://chunk".to_owned(),
+                expected: 10,
+                actual: 4,
+            }
+        ));
+        // A full or read-only disk will not fix itself, and neither will a
+        // cancelled session or a chunk set with a hole in it. Retrying those
+        // would spend the live worker's time on a settled answer.
+        assert!(!is_retriable_download_error(&DataSourceError::Io(
+            io::Error::from(io::ErrorKind::PermissionDenied)
+        )));
+        assert!(!is_retriable_download_error(&DataSourceError::NoObjects {
+            bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+            prefix: "KTLX/1/".to_owned(),
+        }));
+        assert!(!is_retriable_download_error(
+            &DataSourceError::DownloadCancelled {
+                site: "KTLX".to_owned(),
+                volume_id: 683,
+            }
+        ));
+        assert!(!is_retriable_download_error(
+            &DataSourceError::ChunkSetNotContiguous {
+                site: "KTLX".to_owned(),
+                volume_id: 969,
+                volume_time: Utc.with_ymd_and_hms(2026, 8, 16, 4, 40, 49).unwrap(),
+                missing_chunk_id: 1,
+                last_chunk_id: 55,
+            }
+        ));
+    }
+
+    /// A chunk that is genuinely gone must fail on the first attempt, not after
+    /// three. Uses a key that cannot exist rather than a fixture, because the
+    /// shape of S3's 404 is the thing under test.
+    #[test]
+    #[ignore = "asks the real NEXRAD chunks bucket for a key that does not exist"]
+    fn a_missing_chunk_object_is_not_retried() {
+        let dir = unique_test_dir("missing-chunk");
+        fs::create_dir_all(&dir).expect("test dir");
+        let object = S3Object {
+            key: "KTLX/1/29260818-000000-001-S".to_owned(),
+            size: 1_024,
+            last_modified: None,
+        };
+
+        let started = Instant::now();
+        let error = download_s3_object_to_path(LEVEL2_CHUNKS_BUCKET, &object, &dir.join("chunk"))
+            .expect_err("a key from the year 2926 does not exist");
+        let elapsed = started.elapsed();
+        println!("404 rejected in {} ms: {error}", elapsed.as_millis());
+
+        assert!(
+            !is_retriable_download_error(&error),
+            "a 404 must not be retried: {error}"
+        );
+        assert!(
+            !dir.join("chunk").exists() && !dir.join("chunk.download").exists(),
+            "a failed fetch must leave no file behind"
+        );
+
+        fs::remove_dir_all(&dir).expect("clean missing-chunk test dir");
+    }
+
+    #[test]
     fn realtime_append_adds_only_missing_chunk_bytes() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1226,6 +2362,64 @@ mod tests {
             b"aaaabbcccc"
         );
         fs::remove_dir_all(&dir).expect("clean append test dir");
+    }
+
+    /// A directory name no other test or run can collide with, so these tests
+    /// stay correct when the suite runs in parallel or twice at once.
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("radar-rs-{label}-{}-{unique}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn test_chunk(
+        volume_id: u16,
+        volume_time: DateTime<Utc>,
+        chunk_id: u16,
+        chunk_type: RealtimeChunkType,
+        size: u64,
+    ) -> RealtimeChunkObject {
+        let code = match chunk_type {
+            RealtimeChunkType::Start => "S",
+            RealtimeChunkType::Intermediate => "I",
+            RealtimeChunkType::End => "E",
+        };
+        RealtimeChunkObject {
+            object: S3Object {
+                key: format!(
+                    "KTLX/{volume_id}/{}-{chunk_id:03}-{code}",
+                    volume_time.format("%Y%m%d-%H%M%S")
+                ),
+                size,
+                last_modified: None,
+            },
+            site: "KTLX".to_owned(),
+            volume_id,
+            volume_time,
+            chunk_id,
+            chunk_type,
+        }
+    }
+
+    fn test_group(volume_time: DateTime<Utc>, complete: bool) -> RealtimeLevel2Volume {
+        let chunk_type = if complete {
+            RealtimeChunkType::End
+        } else {
+            RealtimeChunkType::Intermediate
+        };
+        RealtimeLevel2Volume {
+            site: "KTLX".to_owned(),
+            volume_id: 679,
+            volume_time,
+            chunks: vec![test_chunk(679, volume_time, 1, chunk_type, 8)],
+            complete,
+            total_size: 8,
+        }
     }
 
     fn test_realtime_volume_with_sizes(sizes: &[u64]) -> RealtimeLevel2Volume {
