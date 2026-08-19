@@ -1478,69 +1478,126 @@ impl WorkstationApp {
         let mut toggle_camera_links = false;
         let mut toggle_warnings = false;
 
+        // A menu bar, not a control wall. The bar carries only what an
+        // analyst touches mid-storm - product, palette, tilt, site - and the
+        // occasional controls live under File / View / Map / Tools, so the
+        // bar is one row at any window width instead of wrapping into a
+        // block that eats the screen.
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Radar Workstation");
-            ui.separator();
-            ui.add(
-                egui::TextEdit::singleline(&mut self.source_path_text)
-                    .desired_width(260.0)
-                    .hint_text("Level II file path"),
-            );
-            if ui.button("Load").clicked() && !self.source_path_text.trim().is_empty() {
-                requested_load = Some(PathBuf::from(self.source_path_text.trim()));
-            }
-
-            ui.separator();
-            ui.add(
-                egui::TextEdit::singleline(&mut self.site_text)
-                    .desired_width(56.0)
-                    .char_limit(4)
-                    .hint_text("KRTX"),
-            );
-            if self.live_site.is_some() {
-                if ui.button("Stop live").clicked() {
-                    live_action = Some(LiveAction::Stop);
+            ui.menu_button("File", |ui| {
+                ui.set_min_width(300.0);
+                ui.label("Open a Level II archive");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.source_path_text)
+                        .desired_width(260.0)
+                        .hint_text("Level II file path"),
+                );
+                if ui.button("Load file").clicked() && !self.source_path_text.trim().is_empty() {
+                    requested_load = Some(PathBuf::from(self.source_path_text.trim()));
+                    ui.close();
                 }
-            } else if ui.button("Start live").clicked() && !self.site_text.trim().is_empty() {
-                live_action = Some(LiveAction::Start(self.site_text.trim().to_owned()));
-            }
-            if !self.live_status.is_empty() {
-                ui.label(&self.live_status);
-            }
-
-            ui.separator();
-            // Its own chip, so an analyst can tell "no warnings out" from "we
-            // are not receiving warnings".
-            let chip = match self.warnings_state.active() {
-                Some(active) => format!("{} · {active}", self.warnings_state.label()),
-                None => self.warnings_state.label().to_owned(),
-            };
-            let response = ui
-                .selectable_label(self.show_warnings, chip)
-                .on_hover_text(crate::app_support::warnings_hover(
-                    &self.warnings_state.detail(),
-                    self.show_warnings,
-                    self.placed_hazards.len(),
-                ));
-            if response.clicked() {
-                toggle_warnings = true;
-            }
-
-            ui.separator();
-            egui::ComboBox::from_id_salt("workstation-layout")
-                .selected_text(layout_label(selected_layout))
-                .width(112.0)
-                .show_ui(ui, |ui| {
-                    for layout in [
-                        PaneLayout::One,
-                        PaneLayout::TwoVertical,
-                        PaneLayout::TwoHorizontal,
-                        PaneLayout::Four,
-                    ] {
-                        ui.selectable_value(&mut selected_layout, layout, layout_label(layout));
+                ui.separator();
+                if ui.button("Settings…").clicked() {
+                    self.settings_ui.open = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button("View", |ui| {
+                ui.set_min_width(200.0);
+                ui.label("Layout");
+                for layout in [
+                    PaneLayout::One,
+                    PaneLayout::TwoVertical,
+                    PaneLayout::TwoHorizontal,
+                    PaneLayout::Four,
+                ] {
+                    if ui
+                        .selectable_label(selected_layout == layout, layout_label(layout))
+                        .clicked()
+                    {
+                        selected_layout = layout;
+                        ui.close();
                     }
-                });
+                }
+                ui.separator();
+                ui.label("Display quality");
+                for (label, preset) in render2d::DisplayQuality::PRESETS {
+                    if ui.selectable_label(self.quality == preset, label).clicked()
+                        && self.quality != preset
+                    {
+                        self.quality = preset;
+                        quality_changed = true;
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(cameras_linked, "Link cameras")
+                    .clicked()
+                {
+                    toggle_camera_links = true;
+                }
+            });
+            ui.menu_button("Map", |ui| {
+                crate::app_support::basemap_menu(ui, &mut self.map_scene, &mut self.settings_store);
+            });
+            ui.menu_button("Tools", |ui| {
+                ui.set_min_width(220.0);
+                if ui
+                    .selectable_label(self.vol3d.open, "3D volume explorer")
+                    .clicked()
+                {
+                    self.vol3d.open = !self.vol3d.open;
+                    ui.close();
+                }
+                if ui
+                    .selectable_label(self.xsection.armed || self.xsection.open, "Cross-section")
+                    .on_hover_text(
+                        "Arm, then click two points on a radar pane. A separate window \
+                         shows the vertical slice of the current product along that \
+                         line; drag the A/B handles to adjust.",
+                    )
+                    .clicked()
+                {
+                    self.xsection.toggle_armed();
+                    if self.xsection.armed {
+                        // One armed click-mode at a time: a click cannot be both
+                        // a Vrot gate and a section endpoint.
+                        self.vrot_active = false;
+                        self.vrot_state.clear();
+                        self.vrot_pane = None;
+                    }
+                    ui.close();
+                }
+                if ui
+                    .selectable_label(self.vrot_active, "Vrot sampling")
+                    .on_hover_text(
+                        "Click two gates across a velocity couplet. Needs a dealiased \
+                         product: measuring folded velocity gives a number wrong by a \
+                         multiple of the Nyquist that still looks reasonable.",
+                    )
+                    .clicked()
+                {
+                    self.vrot_active = !self.vrot_active;
+                    if self.vrot_active {
+                        self.xsection.armed = false;
+                    }
+                    if !self.vrot_active {
+                        self.vrot_state.clear();
+                        self.vrot_pane = None;
+                    }
+                    ui.close();
+                }
+                if (self.vrot_state.measurement().is_some() || self.vrot_state.pending().is_some())
+                    && ui.button("Clear Vrot").clicked()
+                {
+                    self.vrot_state.clear();
+                    self.vrot_pane = None;
+                    ui.close();
+                }
+            });
 
+            ui.separator();
             let picker_button = ui
                 .selectable_label(self.product_picker_open, current_product.label())
                 .on_hover_text("Choose a product and its colour table");
@@ -1605,10 +1662,9 @@ impl WorkstationApp {
                 }
             }
 
-            // A colour table has to be reachable without the popup. It is the
-            // control that tells an analyst whether a strange-looking field is
-            // the data or the palette, so burying it one level down inside
-            // another menu was wrong.
+            // The colour table stays on the bar. It is the control that tells
+            // an analyst whether a strange-looking field is the data or the
+            // palette, so burying it one level down inside a menu was wrong.
             let palette_family = crate::product_picker::palette_family(current_product);
             if let Some(family) = palette_family {
                 let installed = self.color_tables.for_family(family).clone();
@@ -1632,29 +1688,6 @@ impl WorkstationApp {
                     );
             }
 
-            crate::app_support::basemap_picker(ui, &mut self.map_scene, &mut self.settings_store);
-
-            let mut selected_quality = self.quality;
-            egui::ComboBox::from_id_salt("workstation-quality")
-                .selected_text(selected_quality.preset_label().unwrap_or("Custom"))
-                .width(92.0)
-                .show_ui(ui, |ui| {
-                    for (label, preset) in render2d::DisplayQuality::PRESETS {
-                        ui.selectable_value(&mut selected_quality, preset, label);
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Display quality. Smooth adds sub-beams and sub-gates so a gate stops \
-                     being a visible block; High and Ultra also supersample, which is what \
-                     removes the speckle of a zoomed-out view. Ultra costs about sixteen \
-                     times the native raster per frame.",
-                );
-            if selected_quality != self.quality {
-                self.quality = selected_quality;
-                quality_changed = true;
-            }
-
             if ui.button("− Tilt").clicked() {
                 tilt_delta = -1;
             }
@@ -1663,79 +1696,60 @@ impl WorkstationApp {
             if ui.button("+ Tilt").clicked() {
                 tilt_delta = 1;
             }
-            if ui
-                .selectable_label(cameras_linked, "Link cameras")
-                .clicked()
-            {
-                toggle_camera_links = true;
-            }
-            if ui
-                .selectable_label(self.vol3d.open, "3D")
-                .on_hover_text("Volumetric explorer: every tilt resampled into a box and ray marched")
-                .clicked()
-            {
-                self.vol3d.open = !self.vol3d.open;
-            }
-            if ui
-                .selectable_label(self.xsection.armed || self.xsection.open, "XSec")
-                .on_hover_text(
-                    "Cross-section: arm, then click two points on a radar pane.                      A separate window shows the vertical slice of the current                      product along that line; drag the A/B handles to adjust.",
-                )
-                .clicked()
-            {
-                self.xsection.toggle_armed();
-                if self.xsection.armed {
-                    // One armed click-mode at a time: a click cannot be both
-                    // a Vrot gate and a section endpoint.
-                    self.vrot_active = false;
-                    self.vrot_state.clear();
-                    self.vrot_pane = None;
+
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.site_text)
+                    .desired_width(56.0)
+                    .char_limit(4)
+                    .hint_text("KRTX"),
+            );
+            if self.live_site.is_some() {
+                if ui.button("Stop live").clicked() {
+                    live_action = Some(LiveAction::Stop);
                 }
+            } else if ui.button("Start live").clicked() && !self.site_text.trim().is_empty() {
+                live_action = Some(LiveAction::Start(self.site_text.trim().to_owned()));
             }
-            if ui
-                .selectable_label(self.vrot_active, "Vrot")
-                .on_hover_text(
-                    "Click two gates across a velocity couplet.
-                     Needs a dealiased product: measuring folded velocity gives                      a number wrong by a multiple of the Nyquist that still                      looks reasonable.",
-                )
-                .clicked()
-            {
-                self.vrot_active = !self.vrot_active;
-                if self.vrot_active {
-                    self.xsection.armed = false;
-                }
-                if !self.vrot_active {
-                    self.vrot_state.clear();
-                    self.vrot_pane = None;
-                }
+            if !self.live_status.is_empty() {
+                ui.label(&self.live_status);
             }
-            if self.vrot_state.measurement().is_some() || self.vrot_state.pending().is_some() {
-                if ui.button("Clear Vrot").clicked() {
-                    self.vrot_state.clear();
-                    self.vrot_pane = None;
-                }
-                if let Some(measurement) = self.vrot_state.measurement() {
-                    // A stale measurement stays readable but must not read as
-                    // current: the reason is on the label itself, not only in
-                    // hover text, because there is no hover on glass.
-                    match self.vrot_state.stale_reason() {
-                        Some(reason) => {
-                            ui.label(format!(
-                                "{} · STALE: {}",
-                                self.vrot_readout(measurement),
-                                reason.label()
-                            ));
-                        }
-                        None => {
-                            ui.label(self.vrot_readout(measurement));
-                        }
+
+            ui.separator();
+            // Its own chip, so an analyst can tell "no warnings out" from "we
+            // are not receiving warnings".
+            let chip = match self.warnings_state.active() {
+                Some(active) => format!("{} · {active}", self.warnings_state.label()),
+                None => self.warnings_state.label().to_owned(),
+            };
+            let response = ui.selectable_label(self.show_warnings, chip).on_hover_text(
+                crate::app_support::warnings_hover(
+                    &self.warnings_state.detail(),
+                    self.show_warnings,
+                    self.placed_hazards.len(),
+                ),
+            );
+            if response.clicked() {
+                toggle_warnings = true;
+            }
+
+            // The Vrot readout is a measurement, not a control: it stays on
+            // the bar whenever one exists, stale reason and all - there is no
+            // hover on glass.
+            if let Some(measurement) = self.vrot_state.measurement() {
+                match self.vrot_state.stale_reason() {
+                    Some(reason) => {
+                        ui.label(format!(
+                            "{} · STALE: {}",
+                            self.vrot_readout(measurement),
+                            reason.label()
+                        ));
+                    }
+                    None => {
+                        ui.label(self.vrot_readout(measurement));
                     }
                 }
             }
-            if ui.button("Settings").clicked() {
-                self.settings_ui.open = true;
-            }
-            ui.label(format!("Pane {}", active.get() + 1));
         });
 
         if quality_changed || palette_changed {
