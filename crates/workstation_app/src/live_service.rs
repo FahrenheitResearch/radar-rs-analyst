@@ -24,6 +24,12 @@ const COMMAND_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const BACKFILL_SEND_ATTEMPTS: usize = 20;
 const BACKFILL_SEND_RETRY: Duration = Duration::from_millis(100);
 const BYTES_PER_MIB: f64 = 1_024.0 * 1_024.0;
+/// How often one session sweeps the live cache against its byte budget.
+///
+/// The walk is a directory listing - milliseconds against the ~1.2 s poll -
+/// but a growing cache only moves at ~0.5 GB/day, so once per few minutes
+/// bounds it exactly as well as once per poll would.
+const LIVE_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VolumeFingerprint {
@@ -64,6 +70,9 @@ struct LiveSession {
     /// before the listing, between chunk batches, and before the result is
     /// published.
     backfill_cancel: Arc<AtomicBool>,
+    /// When the live cache was last swept against its budget, so the sweep
+    /// runs on [`LIVE_CACHE_PRUNE_INTERVAL`] rather than per poll.
+    last_prune: Option<Instant>,
 }
 
 impl LiveSession {
@@ -76,7 +85,19 @@ impl LiveSession {
             last_error: None,
             backfill_started: false,
             backfill_cancel: Arc::new(AtomicBool::new(false)),
+            last_prune: None,
         }
+    }
+
+    /// Whether this poll should sweep the cache, claiming the slot if so.
+    fn take_prune_slot(&mut self) -> bool {
+        let due = self
+            .last_prune
+            .is_none_or(|at| at.elapsed() >= LIVE_CACHE_PRUNE_INTERVAL);
+        if due {
+            self.last_prune = Some(Instant::now());
+        }
+        due
     }
 
     /// Claim this session's single backfill attempt.
@@ -323,6 +344,25 @@ fn poll_session(
         // the chunk poll immediately, which stays the priority because it is
         // what keeps the current tilt fresh.
         let _spawned = spawn_backfill(session, &volume, results, context);
+        // Keep the disk bounded while the feed runs: this cache measured
+        // 1,072 MB after ~2 days unbounded, with a 17.5 GB proven endpoint
+        // on this machine. The prune's own age guard protects the volume
+        // still assembling and any backfill mid-download.
+        if session.take_prune_slot() {
+            let report = data_source::prune_live_cache(
+                &session.cache_dir,
+                data_source::DEFAULT_LIVE_CACHE_BUDGET_BYTES,
+            );
+            if report.entries_removed > 0 {
+                eprintln!(
+                    "{} live cache pruned: {} entries removed, {:.1} -> {:.1} MiB",
+                    session.site,
+                    report.entries_removed,
+                    report.bytes_before as f64 / BYTES_PER_MIB,
+                    report.bytes_after as f64 / BYTES_PER_MIB
+                );
+            }
+        }
     }
 }
 
@@ -556,6 +596,30 @@ mod tests {
         assert_eq!(normalize_site(" krtx ".to_owned()).unwrap(), "KRTX");
         assert!(normalize_site("RTX".to_owned()).is_err());
         assert!(normalize_site("KR/X".to_owned()).is_err());
+    }
+
+    /// §2.9: the sweep runs on session start and then on its interval, not
+    /// per 1.2 s poll.
+    #[test]
+    fn the_prune_slot_opens_at_start_and_then_on_the_interval() {
+        let mut session = LiveSession::new(
+            Generation::new(1),
+            "KTLX".to_owned(),
+            PathBuf::from("cache"),
+        );
+        assert!(
+            session.take_prune_slot(),
+            "the first poll bounds the backlog"
+        );
+        assert!(
+            !session.take_prune_slot(),
+            "the next poll must not re-walk the cache"
+        );
+
+        // The interval elapses.
+        session.last_prune = Some(Instant::now() - LIVE_CACHE_PRUNE_INTERVAL);
+        assert!(session.take_prune_slot());
+        assert!(!session.take_prune_slot());
     }
 
     #[test]

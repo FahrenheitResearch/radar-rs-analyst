@@ -43,12 +43,6 @@
 //! of it. [`measure`] therefore refuses raw velocity outright rather than
 //! attaching a caveat nobody reads.
 
-// This is a binary crate, so `pub` buys nothing from the `dead_code` lint: a
-// complete and tested measurement is "never used" until a pane calls it, and
-// clippy runs with `-D warnings`. Remove this once the two-click gesture is
-// wired to `measure`; anything still reported dead then really is dead.
-#![allow(dead_code)]
-
 use std::fmt;
 
 use product_engine::units::METERS_PER_SECOND_TO_KNOTS;
@@ -143,10 +137,6 @@ impl VrotMeasurement {
     pub fn vrot_knots(&self) -> f64 {
         f64::from(self.vrot_mps) * METERS_PER_SECOND_TO_KNOTS
     }
-
-    pub fn delta_v_knots(&self) -> f64 {
-        f64::from(self.delta_v_mps) * METERS_PER_SECOND_TO_KNOTS
-    }
 }
 
 /// Something worth telling the analyst about a measurement that still stands.
@@ -165,14 +155,6 @@ impl VrotWarning {
                  clicks are on the couplet and not on storm motion"
             }
         }
-    }
-
-    /// The same text under the name the status line uses. Kept as an alias
-    /// rather than a rename because the readout code and the rest of this
-    /// crate reach for different words for one string, and a refusal that
-    /// fails to compile is a refusal an analyst never sees.
-    pub const fn message(self) -> &'static str {
-        self.label()
     }
 }
 
@@ -218,14 +200,6 @@ impl VrotRefusal {
             }
         }
     }
-
-    /// The same text under the name the status line uses. Kept as an alias
-    /// rather than a rename because the readout code and the rest of this
-    /// crate reach for different words for one string, and a refusal that
-    /// fails to compile is a refusal an analyst never sees.
-    pub const fn message(self) -> &'static str {
-        self.label()
-    }
 }
 
 impl fmt::Display for VrotRefusal {
@@ -256,14 +230,6 @@ impl StaleReason {
             Self::DifferentProduct => "measured on a different product",
             Self::DifferentSite => "measured at a different radar",
         }
-    }
-
-    /// The same text under the name the status line uses. Kept as an alias
-    /// rather than a rename because the readout code and the rest of this
-    /// crate reach for different words for one string, and a refusal that
-    /// fails to compile is a refusal an analyst never sees.
-    pub const fn message(self) -> &'static str {
-        self.label()
     }
 }
 
@@ -686,16 +652,8 @@ mod tests {
             let message = refusal.label();
             assert!(message.len() > 40, "{refusal:?} says only {message:?}");
             assert_eq!(message, refusal.to_string());
-            assert_eq!(
-                message,
-                refusal.message(),
-                "the two names for this string must not drift apart"
-            );
         }
-        assert_eq!(
-            VrotWarning::SameSign.label(),
-            VrotWarning::SameSign.message()
-        );
+        assert!(!VrotWarning::SameSign.label().is_empty());
         for reason in [
             StaleReason::NewVolume,
             StaleReason::DifferentCut,
@@ -704,7 +662,6 @@ mod tests {
         ] {
             assert!(!reason.label().is_empty());
             assert_eq!(reason.label(), reason.to_string());
-            assert_eq!(reason.label(), reason.message());
         }
     }
 }

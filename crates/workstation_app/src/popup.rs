@@ -69,12 +69,8 @@ pub fn dismissal_from_input(
     opened_this_frame: bool,
     explicitly_dismissed: bool,
 ) -> PopupDismissal {
-    let (pointer_pressed, position) = ctx.input(|input| {
-        (
-            input.pointer.any_pressed(),
-            input.pointer.interact_pos(),
-        )
-    });
+    let (pointer_pressed, position) =
+        ctx.input(|input| (input.pointer.any_pressed(), input.pointer.interact_pos()));
     let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
     PopupDismissal {
         opened_this_frame,

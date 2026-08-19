@@ -905,8 +905,8 @@ mod tests {
     // Test-only: production code offers palettes through
     // `palette_offers_for_family`; the tests compare that list against the
     // bare family list to pin the "+1 switch row" relationship.
-    use color_tables::builtin_tables_for_family;
     use crate::product_availability::availability_in;
+    use color_tables::builtin_tables_for_family;
     use product_engine::{
         AlgorithmStatus, AvailabilityQualifier, CutIdentity, CutLeg, NominalElevationGroup,
         ProductRegistry,

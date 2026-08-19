@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration as StdDuration, Instant};
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
 use serde::Deserialize;
@@ -648,6 +648,7 @@ pub fn download_realtime_volume_cancellable(
         .map(|metadata| metadata.len() == volume.total_size)
         .unwrap_or(false)
     {
+        discard_chunks_of_complete_volume(volume, cache_dir);
         return Ok(DownloadedObject {
             object: S3Object {
                 key: filename,
@@ -663,12 +664,7 @@ pub fn download_realtime_volume_cancellable(
         });
     }
 
-    let chunk_cache_dir = cache_dir.join(".chunks").join(format!(
-        "{}_{}_{:03}",
-        volume.site,
-        volume.volume_time.format("%Y%m%d_%H%M%S"),
-        volume.volume_id
-    ));
+    let chunk_cache_dir = realtime_chunk_cache_dir(cache_dir, volume);
     fs::create_dir_all(&chunk_cache_dir)?;
 
     let mut chunk_paths = Vec::with_capacity(volume.chunks.len());
@@ -728,6 +724,7 @@ pub fn download_realtime_volume_cancellable(
             volume.total_size,
             &url,
         )?;
+        discard_chunks_of_complete_volume(volume, cache_dir);
         return Ok(DownloadedObject {
             object: S3Object {
                 key: filename,
@@ -764,6 +761,7 @@ pub fn download_realtime_volume_cancellable(
         fs::remove_file(&path)?;
     }
     fs::rename(&temp_path, &path)?;
+    discard_chunks_of_complete_volume(volume, cache_dir);
 
     Ok(DownloadedObject {
         object: S3Object {
@@ -778,6 +776,219 @@ pub fn download_realtime_volume_cancellable(
         url,
         cache_hit: false,
     })
+}
+
+/// Where one realtime volume's individual chunk files are cached while it is
+/// still assembling.
+fn realtime_chunk_cache_dir(cache_dir: &Path, volume: &RealtimeLevel2Volume) -> PathBuf {
+    cache_dir.join(".chunks").join(format!(
+        "{}_{}_{:03}",
+        volume.site,
+        volume.volume_time.format("%Y%m%d_%H%M%S"),
+        volume.volume_id
+    ))
+}
+
+/// Drop the per-chunk copies of a volume whose assembled file is on disk.
+///
+/// Only for a COMPLETE volume: its file passes the size check at the top of
+/// [`download_realtime_volume_cancellable`] on every later request, so the
+/// chunks buy nothing - and they were the largest growth term measured in the
+/// unbounded cache (540 MB of retained `.chunks/` out of 1,072 MB after ~2
+/// days of single-site use). A partial volume keeps its chunks: the file is
+/// re-extended from them as the volume grows.
+fn discard_chunks_of_complete_volume(volume: &RealtimeLevel2Volume, cache_dir: &Path) {
+    if volume.complete {
+        let _ = fs::remove_dir_all(realtime_chunk_cache_dir(cache_dir, volume));
+    }
+}
+
+/// Live-cache budget for a desktop install, bytes.
+///
+/// Deliberate, not arbitrary: the measured growth is ~0.5 GB/day at
+/// single-site use, and BowEcho's identical unbounded cache on the same
+/// machine reached 17,506 MB - the proven endpoint of "no budget". 2 GiB keeps
+/// several days of multi-site history while staying invisible on a desktop
+/// disk; a mobile profile (~256 MB) arrives with the settings work, which is
+/// why the budget is a parameter of [`prune_live_cache`] rather than baked in.
+pub const DEFAULT_LIVE_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// A prune never touches anything newer than this, milliseconds.
+///
+/// The newest entries are the volume still assembling on the live poll and a
+/// possible backfill mid-download on its own thread; deleting either from
+/// under its writer forces a re-download at best. Fifteen minutes clears the
+/// slowest WSR-88D volume interval (VCP 31/32, 10 minutes) with margin.
+const LIVE_CACHE_PRUNE_MIN_AGE_MILLIS: u64 = 15 * 60 * 1_000;
+
+/// A prune stops at this fraction of the budget rather than exactly at it, so
+/// the next volume written does not immediately trigger another prune. Same
+/// policy as the basemap tile cache's sweep.
+const LIVE_CACHE_PRUNE_TARGET_FRACTION: f64 = 0.9;
+
+/// What one prune did, so a caller (or a test) can assert the bound rather
+/// than trusting a comment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LiveCachePruneReport {
+    pub entries_before: u64,
+    pub bytes_before: u64,
+    pub entries_removed: u64,
+    pub bytes_after: u64,
+}
+
+/// One evictable unit of the live cache: an assembled volume file, or one
+/// volume's whole `.chunks/` directory. A chunk directory is evicted as a unit
+/// because deleting individual chunk files out of it would leave a gapped set
+/// that [`first_missing_chunk_id`] then refuses wholesale anyway.
+struct LiveCacheEntry {
+    path: PathBuf,
+    is_directory: bool,
+    bytes: u64,
+    /// Newest modification time inside the unit, milliseconds since the
+    /// epoch, so an actively-growing chunk directory reads as young.
+    newest_modified_unix_millis: u64,
+}
+
+/// Bound the live Level II cache by deleting the oldest volumes first.
+///
+/// This cache grew without bound - 1,072 MB in ~2 days measured at single-site
+/// dev use, 17.5 GB proven endpoint on the same machine via BowEcho's
+/// identical cache pattern - while the in-repo tile cache has been
+/// byte-budgeted all along. Same pattern here: walk, total, delete
+/// oldest-first (by newest contained mtime) down to
+/// [`LIVE_CACHE_PRUNE_TARGET_FRACTION`] of `max_bytes`, and never touch
+/// anything younger than [`LIVE_CACHE_PRUNE_MIN_AGE_MILLIS`]. Age doubles as
+/// the correctness guard: the units a writer may be mid-way through are by
+/// construction the youngest in the directory.
+pub fn prune_live_cache(cache_dir: &Path, max_bytes: u64) -> LiveCachePruneReport {
+    let now_unix_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64);
+    prune_live_cache_at(cache_dir, max_bytes, now_unix_millis)
+}
+
+/// [`prune_live_cache`] against an explicit clock, so the age guard is
+/// testable without waiting fifteen minutes.
+fn prune_live_cache_at(
+    cache_dir: &Path,
+    max_bytes: u64,
+    now_unix_millis: u64,
+) -> LiveCachePruneReport {
+    let mut entries = live_cache_entries(cache_dir);
+    let bytes_before: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    let entries_before = entries.len() as u64;
+    if bytes_before <= max_bytes {
+        return LiveCachePruneReport {
+            entries_before,
+            bytes_before,
+            entries_removed: 0,
+            bytes_after: bytes_before,
+        };
+    }
+
+    entries.sort_by_key(|entry| entry.newest_modified_unix_millis);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let target = (max_bytes as f64 * LIVE_CACHE_PRUNE_TARGET_FRACTION) as u64;
+    let mut total = bytes_before;
+    let mut removed = 0_u64;
+    for entry in &entries {
+        if total <= target {
+            break;
+        }
+        if now_unix_millis.saturating_sub(entry.newest_modified_unix_millis)
+            < LIVE_CACHE_PRUNE_MIN_AGE_MILLIS
+        {
+            // Sorted oldest-first, so everything from here on is younger
+            // still: over budget or not, the young end is never deleted.
+            break;
+        }
+        let deleted = if entry.is_directory {
+            fs::remove_dir_all(&entry.path).is_ok()
+        } else {
+            fs::remove_file(&entry.path).is_ok()
+        };
+        if deleted {
+            total = total.saturating_sub(entry.bytes);
+            removed += 1;
+        }
+    }
+    LiveCachePruneReport {
+        entries_before,
+        bytes_before,
+        entries_removed: removed,
+        bytes_after: total,
+    }
+}
+
+fn live_cache_entries(cache_dir: &Path) -> Vec<LiveCacheEntry> {
+    let mut entries = Vec::new();
+    let Ok(listing) = fs::read_dir(cache_dir) else {
+        return entries;
+    };
+    for entry in listing.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_file() {
+            entries.push(LiveCacheEntry {
+                path,
+                is_directory: false,
+                bytes: metadata.len(),
+                newest_modified_unix_millis: modified_unix_millis(&metadata),
+            });
+        } else if metadata.is_dir() && path.file_name().is_some_and(|name| name == ".chunks") {
+            let Ok(chunk_dirs) = fs::read_dir(&path) else {
+                continue;
+            };
+            for chunk_dir in chunk_dirs.flatten() {
+                let dir_path = chunk_dir.path();
+                let (bytes, newest_modified_unix_millis) = directory_stats(&dir_path);
+                entries.push(LiveCacheEntry {
+                    path: dir_path,
+                    is_directory: true,
+                    bytes,
+                    newest_modified_unix_millis,
+                });
+            }
+        }
+        // Any other directory is not this cache's to delete.
+    }
+    entries
+}
+
+/// Total bytes under `directory` and the newest mtime in it, recursively. The
+/// directory's own mtime participates too, so an empty leftover still ages.
+fn directory_stats(directory: &Path) -> (u64, u64) {
+    let mut bytes = 0_u64;
+    let mut newest = directory
+        .metadata()
+        .map(|metadata| modified_unix_millis(&metadata))
+        .unwrap_or(0);
+    if let Ok(listing) = fs::read_dir(directory) {
+        for entry in listing.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                let (child_bytes, child_newest) = directory_stats(&entry.path());
+                bytes += child_bytes;
+                newest = newest.max(child_newest);
+            } else {
+                bytes += metadata.len();
+                newest = newest.max(modified_unix_millis(&metadata));
+            }
+        }
+    }
+    (bytes, newest)
+}
+
+fn modified_unix_millis(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 pub fn download_object(
@@ -2458,5 +2669,246 @@ mod tests {
             complete: chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end()),
             chunks,
         }
+    }
+
+    // --- the bounded live cache (review §2.9) -------------------------------
+
+    fn unique_cache_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "radar-workstation-live-cache-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp cache dir");
+        dir
+    }
+
+    /// Seed every chunk file of `volume` into its chunk cache directory, so
+    /// the download assembles entirely from disk and no test touches AWS.
+    fn seed_chunks(cache_dir: &Path, volume: &RealtimeLevel2Volume, fill: u8) {
+        let chunk_dir = realtime_chunk_cache_dir(cache_dir, volume);
+        fs::create_dir_all(&chunk_dir).expect("chunk dir");
+        for chunk in &volume.chunks {
+            let filename = chunk
+                .object
+                .key
+                .rsplit('/')
+                .next()
+                .expect("chunk keys carry a filename");
+            let body = vec![fill; usize::try_from(chunk.object.size).expect("test size")];
+            fs::write(chunk_dir.join(filename), body).expect("chunk file");
+        }
+    }
+
+    #[test]
+    fn assembling_a_complete_volume_discards_its_chunk_copies() {
+        let cache_dir = unique_cache_dir("complete");
+        let volume = test_realtime_volume_with_sizes(&[600, 400, 250]);
+        assert!(volume.complete);
+        seed_chunks(&cache_dir, &volume, 7);
+
+        let downloaded =
+            download_realtime_volume(&volume, &cache_dir).expect("assembles from seeded chunks");
+        assert!(!downloaded.cache_hit);
+        assert_eq!(downloaded.path.metadata().expect("assembled").len(), 1_250);
+        assert!(
+            !realtime_chunk_cache_dir(&cache_dir, &volume).exists(),
+            "a complete volume's chunk copies were retained - the measured 540 MB growth term"
+        );
+        // The next request is a cache hit off the assembled file alone.
+        assert!(
+            download_realtime_volume(&volume, &cache_dir)
+                .expect("cache hit")
+                .cache_hit
+        );
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn a_partial_volume_keeps_its_chunks_until_it_completes() {
+        let cache_dir = unique_cache_dir("partial");
+        let mut partial = test_realtime_volume_with_sizes(&[600, 400]);
+        // Still assembling on the radar.
+        partial.complete = false;
+        seed_chunks(&cache_dir, &partial, 3);
+        let downloaded = download_realtime_volume(&partial, &cache_dir).expect("assembles");
+        assert_eq!(downloaded.path.metadata().expect("assembled").len(), 1_000);
+        assert!(
+            realtime_chunk_cache_dir(&cache_dir, &partial).exists(),
+            "a growing volume needs its chunk copies for the next append"
+        );
+
+        // One more chunk completes it: the file is extended from the chunk
+        // cache, and only then are the copies discarded.
+        let complete = test_realtime_volume_with_sizes(&[600, 400, 250]);
+        seed_chunks(&cache_dir, &complete, 3);
+        let downloaded = download_realtime_volume(&complete, &cache_dir).expect("appends");
+        assert_eq!(downloaded.path.metadata().expect("extended").len(), 1_250);
+        assert!(!realtime_chunk_cache_dir(&cache_dir, &complete).exists());
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn the_prune_deletes_oldest_first_and_reports_the_bound() {
+        let cache_dir = unique_cache_dir("prune-order");
+        // Oldest to newest, with sleeps so the mtimes order on disk; the
+        // retained chunk directory sits in the middle era and counts as one
+        // unit.
+        let names = [
+            "KAAA_20260819_010000_001_V06",
+            "KAAA_20260819_011000_002_V06",
+            "KAAA_20260819_012000_003_V06",
+        ];
+        fs::write(cache_dir.join(names[0]), vec![0_u8; 1_000]).expect("volume file");
+        std::thread::sleep(StdDuration::from_millis(60));
+        let chunk_dir = cache_dir.join(".chunks").join("KAAA_20260819_010500_009");
+        fs::create_dir_all(&chunk_dir).expect("chunk dir");
+        fs::write(chunk_dir.join("chunk-001"), vec![0_u8; 500]).expect("chunk file");
+        for name in &names[1..] {
+            std::thread::sleep(StdDuration::from_millis(60));
+            fs::write(cache_dir.join(name), vec![0_u8; 1_000]).expect("volume file");
+        }
+
+        // An hour from now every entry clears the age guard, so this tests
+        // ordering and the bound alone. First a budget whose 90% target ONE
+        // eviction satisfies: 3,500 bytes against 3,000 gives a 2,700 target,
+        // so only the OLDEST unit - the first volume file - may go. The
+        // directory listing yields the younger `.chunks` entry before any
+        // volume file (`.` collates first), so a walk that skipped the
+        // oldest-first sort would evict the chunk directory here instead and
+        // still land under target: the survivor set, not just the byte
+        // count, is what pins the order.
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after 1970")
+            .as_millis() as u64
+            + 3_600_000;
+        let report = prune_live_cache_at(&cache_dir, 3_000, now_millis);
+        assert_eq!(
+            report,
+            LiveCachePruneReport {
+                entries_before: 4,
+                bytes_before: 3_500,
+                entries_removed: 1,
+                bytes_after: 2_500,
+            }
+        );
+        assert!(
+            !cache_dir.join(names[0]).exists(),
+            "the oldest volume must go first"
+        );
+        assert!(
+            chunk_dir.exists(),
+            "eviction was not oldest-first: the younger chunk directory went before the oldest file"
+        );
+
+        // Tighter: 2,500 bytes against 2,000 gives a 1,800 target, so the
+        // chunk directory - now the oldest unit - and the middle volume go
+        // and only the newest survives.
+        let report = prune_live_cache_at(&cache_dir, 2_000, now_millis);
+        assert_eq!(
+            report,
+            LiveCachePruneReport {
+                entries_before: 3,
+                bytes_before: 2_500,
+                entries_removed: 2,
+                bytes_after: 1_000,
+            }
+        );
+        assert!(!chunk_dir.exists(), "a stale chunk directory is evictable");
+        assert!(!cache_dir.join(names[1]).exists());
+        assert!(cache_dir.join(names[2]).exists());
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    /// The prune against a COPY of a real live cache, so the numbers in the
+    /// budget rationale stay measured rather than argued.
+    ///
+    /// Ignored because it needs a real cache on disk: copy one with
+    /// timestamps preserved (`cp -rp`) and point `RADAR_LIVE_CACHE_COPY` at
+    /// the copy - it deletes from whatever it is pointed at. Run with:
+    ///
+    /// ```text
+    /// cargo test --release -p data_source -- --ignored --nocapture \
+    ///     prunes_a_real_live_cache_copy
+    /// ```
+    #[test]
+    #[ignore = "set RADAR_LIVE_CACHE_COPY to a disposable copy of a real live cache"]
+    fn prunes_a_real_live_cache_copy() {
+        let root = PathBuf::from(
+            std::env::var("RADAR_LIVE_CACHE_COPY").expect("set RADAR_LIVE_CACHE_COPY"),
+        );
+        let before = live_cache_entries(&root);
+        let bytes_before: u64 = before.iter().map(|entry| entry.bytes).sum();
+        let newest = before
+            .iter()
+            .map(|entry| entry.newest_modified_unix_millis)
+            .max()
+            .expect("a populated cache");
+        println!(
+            "before: {} entries, {:.1} MiB",
+            before.len(),
+            bytes_before as f64 / (1024.0 * 1024.0)
+        );
+
+        // A deliberately small budget so the prune has real work to do.
+        let budget = bytes_before / 4;
+        let report = prune_live_cache(&root, budget);
+        println!("{report:?}");
+        assert_eq!(report.bytes_before, bytes_before);
+        assert!(
+            report.bytes_after <= budget,
+            "still over budget: {} > {budget}",
+            report.bytes_after
+        );
+        // The newest volume survives - it is what the analyst is looking at.
+        let after = live_cache_entries(&root);
+        assert!(
+            after
+                .iter()
+                .any(|entry| entry.newest_modified_unix_millis == newest),
+            "the prune deleted the newest volume"
+        );
+        let survivors_oldest = after
+            .iter()
+            .map(|entry| entry.newest_modified_unix_millis)
+            .min()
+            .expect("survivors");
+        let victims_newest = before
+            .iter()
+            .filter(|entry| !after.iter().any(|kept| kept.path == entry.path))
+            .map(|entry| entry.newest_modified_unix_millis)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            victims_newest <= survivors_oldest,
+            "eviction was not oldest-first: deleted {victims_newest} kept {survivors_oldest}"
+        );
+    }
+
+    #[test]
+    fn the_prune_never_touches_the_young_end_or_an_in_budget_cache() {
+        let cache_dir = unique_cache_dir("prune-age");
+        let name = "KAAA_20260819_010000_001_V06";
+        fs::write(cache_dir.join(name), vec![0_u8; 4_000]).expect("volume file");
+
+        // Over budget, but everything here was written moments ago - and the
+        // youngest entries are the ones a writer may be mid-way through, so
+        // the age guard holds even over budget.
+        let report = prune_live_cache(&cache_dir, 1_000);
+        assert_eq!(report.entries_removed, 0);
+        assert!(cache_dir.join(name).exists());
+
+        // Under budget the prune is a measured no-op.
+        assert_eq!(
+            prune_live_cache(&cache_dir, 100_000),
+            LiveCachePruneReport {
+                entries_before: 1,
+                bytes_before: 4_000,
+                entries_removed: 0,
+                bytes_after: 4_000,
+            }
+        );
+        let _ = fs::remove_dir_all(&cache_dir);
     }
 }

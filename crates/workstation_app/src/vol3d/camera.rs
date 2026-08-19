@@ -30,11 +30,16 @@
 //! in eleven seconds crosses the 360 km box in eleven seconds. Nothing here
 //! needs to know how many kilometres that is.
 
-// A finished camera is "never used" until the pane drives it, and clippy runs
-// with `-D warnings`. The exact pane call sites ship with this module as
-// integration notes; delete this attribute in the commit that pastes them into
-// `vol3d/pane.rs`.
-#![allow(dead_code)]
+// This module once carried its own `#![allow(dead_code)]` promising deletion
+// "in the commit that pastes [the call sites] into vol3d/pane.rs" - that
+// commit is this one: `pane::canvas` drives [`drive_camera`] and the pane
+// toolbar surfaces [`camera_controls`]. Note the parent module's own
+// `#![allow(dead_code)]` (vol3d.rs, for its ported BowEcho surface) STILL
+// reaches this file - lint scoping covers children - and cannot be re-armed
+// here with `#![warn(dead_code)]`, because `examples/vol3d_opacity_proof.rs`
+// recompiles the whole vol3d tree standalone, where this module's entry
+// points are legitimately uncalled. Narrowing that parent allow is vol3d.rs's
+// own change.
 
 use eframe::egui;
 
@@ -189,6 +194,11 @@ pub const KEYS_UP: &[egui::Key] = &[egui::Key::E, egui::Key::PageUp];
 pub const KEYS_DOWN: &[egui::Key] = &[egui::Key::Q, egui::Key::PageDown];
 
 /// Every key that steers, in one place, so a collision test can enumerate them.
+/// Test-only on purpose: nothing at runtime iterates the whole map, and (once
+/// vol3d.rs narrows its module-wide `allow(dead_code)` - today that allow
+/// still reaches this file, see the note at the top) an unused runtime const
+/// here would be the first thing the re-armed gate reports.
+#[cfg(test)]
 pub const FLIGHT_KEY_TABLES: &[&[egui::Key]] = &[
     KEYS_FORWARD,
     KEYS_BACK,

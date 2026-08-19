@@ -38,6 +38,7 @@ use render2d::volumetric::InterpPolicy;
 
 use super::advanced::{self, SupportMode, Vol3dRenderMode};
 use super::annotations;
+use super::camera;
 use super::controls;
 use super::{
     BOX_N, BOX_NZ, BOX_TOP_M, Vol3d, Vol3dCallback, Vol3dThresholdMode, empty_box,
@@ -933,6 +934,12 @@ fn toolbar(vol3d: &mut Vol3d, ui: &mut egui::Ui, value_min: f32, value_max: f32)
             ui.checkbox(&mut vol3d.show_labels, "Height scale and compass");
         });
 
+        // Which camera flies the box: Orbit/Fly toggle, fly speed, Recenter.
+        // This is the entry point `camera.rs` shipped without - the module
+        // doc calls Fly "the reason a second one was asked for", and until
+        // this call it was unreachable from any control.
+        camera::camera_controls(ui, vol3d);
+
         controls::box_geometry(ui, vol3d);
 
         ui.separator();
@@ -1098,18 +1105,21 @@ fn canvas(vol3d: &mut Vol3d, ui: &mut egui::Ui, value_min: f32, value_max: f32) 
     ui.painter()
         .rect_filled(rect, 0.0, egui::Color32::from_rgb(5, 7, 11));
 
-    if response.dragged() {
-        let delta = response.drag_delta();
-        vol3d.yaw -= delta.x * 0.01;
-        // Clamped short of the poles: at exactly +/-90 degrees the camera
-        // basis degenerates and the view snaps to an arbitrary roll.
-        vol3d.pitch = (vol3d.pitch + delta.y * 0.01).clamp(-1.5, 1.5);
-    }
-    if response.hovered() {
-        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-        if scroll != 0.0 {
-            vol3d.dist = (vol3d.dist * (1.0 - scroll * 0.002)).clamp(0.35, 6.0);
-        }
+    // The one camera authority: `super::camera` turns this frame's pointer,
+    // wheel and keyboard input into camera state for both modes. It replaces
+    // the inline drag/scroll handler this canvas carried, whose wheel clamped
+    // `dist` to [0.35, 6.0] while the renderer floors the radius at
+    // `orbit_distance()` - 1.655 on the default box - so about fifteen wheel
+    // notches changed the number and moved nothing, and Fly mode had no entry
+    // point at all. The repaint on movement is what makes a HELD key fly: a
+    // held key is not an event, so without it the camera would take one step
+    // per keystroke.
+    if camera::drive_camera(camera::FlyInput {
+        vol3d,
+        response: &response,
+        dt: camera::frame_dt(ui.ctx()),
+    }) {
+        ui.ctx().request_repaint();
     }
     response.context_menu(|ui| {
         if ui.button("Reset view").clicked() {
@@ -1832,6 +1842,93 @@ mod tests {
             "never rebuilt from the only volume left: {:?}",
             vol3d.status
         );
+    }
+
+    // --- the camera is wired, not just written ------------------------------
+
+    /// One headless pass of the real `canvas`, with this frame's input events.
+    fn canvas_frame(ctx: &egui::Context, vol3d: &mut Vol3d, events: Vec<egui::Event>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw, |ui| canvas(vol3d, ui, -32.0, 94.5));
+    }
+
+    /// §2.8: the canvas feeds its wheel to `camera::drive_camera`, so zooming
+    /// in stops AT the radius the renderer will actually use instead of at the
+    /// old 0.35 clamp ~15 dead notches below it.
+    #[test]
+    fn the_canvas_wheel_zooms_to_the_renderers_floor_with_no_dead_notches() {
+        let ctx = egui::Context::default();
+        let mut vol3d = Vol3d::default();
+        // First pass lays the canvas out; hover resolves on the second.
+        canvas_frame(&ctx, &mut vol3d, Vec::new());
+        canvas_frame(
+            &ctx,
+            &mut vol3d,
+            vec![egui::Event::PointerMoved(egui::pos2(200.0, 150.0))],
+        );
+        let floor = (vol3d.zspan() * 0.45 + 1.25).clamp(0.35, 6.0);
+        assert!(
+            vol3d.dist > floor,
+            "the default orbit must start above the floor for this test to bite"
+        );
+
+        let wheel = || egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 50.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut previous = vol3d.dist;
+        for _ in 0..40 {
+            canvas_frame(&ctx, &mut vol3d, vec![wheel()]);
+            assert!(
+                vol3d.dist >= floor - 1e-4,
+                "the wheel zoomed below the radius the renderer uses: {} < {floor}",
+                vol3d.dist
+            );
+            assert!(
+                vol3d.dist <= previous + 1e-6,
+                "zooming in moved the eye out"
+            );
+            previous = vol3d.dist;
+        }
+        // Flush egui's scroll smoothing, then: forty notches in lands ON the
+        // floor, and the renderer's radius agrees with the stored one - no
+        // band of notches that changes the number but not the eye.
+        for _ in 0..10 {
+            canvas_frame(&ctx, &mut vol3d, Vec::new());
+        }
+        assert!(
+            (vol3d.dist - floor).abs() < 1e-3,
+            "forty notches must land on the floor, not the old 0.35 clamp: {}",
+            vol3d.dist
+        );
+        assert!((vol3d.orbit_distance() - vol3d.dist).abs() < 1e-3);
+    }
+
+    /// §2.8: Fly mode has an on-screen entry point. `camera_controls` is
+    /// tested in `camera.rs`; this pins that the pane actually SURFACES it,
+    /// which is the half that shipped missing.
+    #[test]
+    fn the_fly_toggle_is_on_the_pane_toolbar() {
+        let volumes = [scan("KDMX", 1, &[0.5, 0.9, 1.3, 1.8, 2.4, 3.1])];
+        let candidates = as_candidates(&volumes, 0);
+        let table = color_tables::builtin_reflectivity_table();
+        let mut vol3d = Vol3d::default();
+        let texts = pane_pass(&mut vol3d, &candidates, &table, (900.0, 620.0));
+        for label in ["Orbit", "Fly"] {
+            assert!(
+                texts.iter().any(|(text, _)| text == label),
+                "no {label:?} toggle on the toolbar: {texts:?}"
+            );
+        }
     }
 
     // --- the measurement behind the tilt floor ------------------------------
