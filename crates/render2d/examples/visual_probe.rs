@@ -21,12 +21,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         volume.metadata.decoded_radial_count
     );
 
+    // Installing by name across every family it belongs to, so `--table
+    // "Smooth Classic REF (interpolated)"` photographs reflectivity through
+    // that table and leaves velocity on its own default rather than silently
+    // rendering nothing.
+    let mut color_tables = ColorTableSet::default();
+    if let Some(wanted) = config.table.as_deref() {
+        let mut installed = false;
+        for family in color_tables::ColorTableFamily::ALL {
+            if let Some(entry) = color_tables::builtin_tables_for_family(family)
+                .into_iter()
+                .find(|entry| entry.name() == wanted)
+            {
+                color_tables.set_family(family, entry);
+                installed = true;
+            }
+        }
+        if !installed {
+            return Err(format!(
+                "no built-in colour table named {wanted:?}; --list-tables prints every name"
+            )
+            .into());
+        }
+        println!("visual_probe table={wanted:?}");
+    }
+
     probe_product(
         &volume,
         Product::Moment(MomentType::Reflectivity),
         config.viewport,
         config.out_dir.as_deref(),
         config.strict,
+        &color_tables,
     )?;
     probe_product(
         &volume,
@@ -34,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.viewport,
         config.out_dir.as_deref(),
         config.strict,
+        &color_tables,
     )?;
     probe_product(
         &volume,
@@ -41,6 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.viewport,
         config.out_dir.as_deref(),
         config.strict,
+        &color_tables,
     )?;
 
     Ok(())
@@ -52,20 +80,20 @@ fn probe_product(
     viewport: ViewportRasterOptions,
     out_dir: Option<&Path>,
     strict: bool,
+    color_tables: &ColorTableSet,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(cut) = first_cut_with_moment(volume, &product.base_moment()) else {
         return Ok(());
     };
-    let color_tables = ColorTableSet::default();
     let cache = match product {
         Product::Moment(ref moment) => {
-            ViewportMomentCache::new_with_color_tables(volume, cut, moment.clone(), &color_tables)?
+            ViewportMomentCache::new_with_color_tables(volume, cut, moment.clone(), color_tables)?
         }
         Product::DealiasedVelocity => {
             ViewportMomentCache::new_dealiased_velocity_with_color_tables(
                 volume,
                 cut,
-                &color_tables,
+                color_tables,
             )?
         }
     };
@@ -217,6 +245,12 @@ struct Config {
     viewport: ViewportRasterOptions,
     out_dir: Option<PathBuf>,
     strict: bool,
+    /// Colour table to install, by name, or the family default when absent.
+    ///
+    /// Without this the probe could only ever photograph the default palette,
+    /// which made the one question a palette change raises - does the picture
+    /// actually look different on real data - impossible to answer here.
+    table: Option<String>,
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -224,6 +258,7 @@ fn parse_args() -> Result<Config, String> {
     let mut viewport = parse_viewport("1320x820")?;
     let mut out_dir = None;
     let mut strict = false;
+    let mut table = None;
     let mut input = None;
     let mut index = 0;
 
@@ -245,6 +280,23 @@ fn parse_args() -> Result<Config, String> {
                         .ok_or_else(|| "--out-dir needs a directory".to_owned())?,
                 ));
             }
+            "--table" => {
+                index += 1;
+                table = Some(
+                    args.get(index)
+                        .ok_or_else(|| "--table needs a colour table name".to_owned())?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--list-tables" => {
+                for family in color_tables::ColorTableFamily::ALL {
+                    for entry in color_tables::builtin_tables_for_family(family) {
+                        println!("{:?}	{}", family, entry.name());
+                    }
+                }
+                std::process::exit(0);
+            }
             "--strict" => strict = true,
             "--help" | "-h" => return Err(usage()),
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
@@ -264,6 +316,7 @@ fn parse_args() -> Result<Config, String> {
         viewport,
         out_dir,
         strict,
+        table,
     })
 }
 
@@ -290,5 +343,6 @@ fn parse_viewport(value: &str) -> Result<ViewportRasterOptions, String> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --release -p render2d --example visual_probe -- [--strict] [--viewport WIDTHxHEIGHT] [--out-dir DIR] <level2-file>".to_owned()
+    "usage: cargo run --release -p render2d --example visual_probe -- [--strict] [--viewport WIDTHxHEIGHT] [--out-dir DIR] [--table NAME] [--list-tables] <level2-file>"
+        .to_owned()
 }

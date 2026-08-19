@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 color_tables = { path = "../color_tables" }
 image.workspace = true
+product_engine = { path = "../product_engine" }
 radar_core = { path = "../radar_core" }
 rayon.workspace = true
 thiserror.workspace = true

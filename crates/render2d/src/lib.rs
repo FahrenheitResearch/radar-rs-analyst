@@ -3,16 +3,27 @@
 //! The long-term renderer will be GPU-backed, but this crate already provides a
 //! CPU raster path for smoke tests, screenshots, and early visual validation.
 
+pub mod beam;
+pub mod derived;
+pub mod interpolate;
+pub mod quality;
+pub mod smooth;
+pub mod sweep_blend;
+pub mod volumetric;
+pub mod volumetric_support;
+
 use std::f32::consts::PI;
 use std::ops::Range;
 use std::path::Path;
 
 pub use color_tables::{ColorTable, ColorTableFamily, ColorTableSet};
 use image::{ImageBuffer, ImageError, Rgba};
+pub use interpolate::{InterpolatedGrid, UpsampleFactors, upsample_moment_grid};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
 };
 use rayon::prelude::*;
+pub use smooth::smooth_moment_grid;
 use thiserror::Error;
 
 const AZIMUTH_BINS: usize = 3600;
@@ -51,6 +62,102 @@ impl Default for RasterOptions {
             height: 1024,
             range_fraction: 94,
         }
+    }
+}
+
+/// How hard the renderer works to make one frame look like radar rather than
+/// like a mosaic of gates.
+///
+/// Three independent passes, because they fix three different artefacts and
+/// cost three different amounts:
+///
+/// * `soften` averages neighbouring cells on the polar lattice, which removes
+///   the single-gate salt-and-pepper of a noisy field.
+/// * `interpolate` inserts sub-beams and sub-gates so a gate stops being a
+///   visible block when zoomed in. Both of these run once per volume, cut and
+///   product and are cached here, so panning stays free.
+/// * `supersample` renders at an integer multiple and box-filters down, and is
+///   the only one of the three that fixes ALIASING - the speckle a zoomed-out
+///   view gets from taking one sample per pixel where several gates fall. It is
+///   also the only one that costs per frame, and it costs roughly the square of
+///   the factor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayQuality {
+    pub soften: bool,
+    pub interpolate: bool,
+    pub supersample: u32,
+}
+
+impl DisplayQuality {
+    /// Exactly what the renderer did before any of this existed: one sample
+    /// per screen pixel, off the native polar lattice.
+    pub const NATIVE: Self = Self {
+        soften: false,
+        interpolate: false,
+        supersample: 1,
+    };
+
+    /// Sub-beams and sub-gates, and two samples per pixel per axis. This is the
+    /// default because it is the setting that stops a NEXRAD super-res sweep
+    /// looking like a mosaic, and its per-frame cost is about four times the
+    /// native raster on a pane-sized viewport - a few milliseconds.
+    pub const SMOOTH: Self = Self {
+        soften: false,
+        interpolate: true,
+        supersample: 2,
+    };
+
+    /// Adds the soften pass and a third sample per axis.
+    pub const HIGH: Self = Self {
+        soften: true,
+        interpolate: true,
+        supersample: 3,
+    };
+
+    /// Everything, at roughly sixteen times the native per-frame cost. Worth it
+    /// for a still or a screenshot; on a fast loop it will drop frames.
+    pub const ULTRA: Self = Self {
+        soften: true,
+        interpolate: true,
+        supersample: 4,
+    };
+
+    /// The presets a UI offers, coarse to fine, each with its label.
+    pub const PRESETS: [(&'static str, Self); 4] = [
+        ("Native", Self::NATIVE),
+        ("Smooth", Self::SMOOTH),
+        ("High", Self::HIGH),
+        ("Ultra", Self::ULTRA),
+    ];
+
+    /// The label of the preset this equals, or `None` for a custom setting.
+    pub fn preset_label(self) -> Option<&'static str> {
+        Self::PRESETS
+            .iter()
+            .find(|(_, preset)| *preset == self)
+            .map(|(label, _)| *label)
+    }
+
+    /// True when softening this moment is safe.
+    ///
+    /// The soften pass is unguarded, so it must not touch a field whose
+    /// interpolation is guarded: averaging across a velocity fold invents a
+    /// speed nobody measured, and averaging through the rho_hv minimum erases
+    /// the melting-layer signature that minimum IS (Giangrande, Krause and
+    /// Ryzhkov 2008, J. Appl. Meteor. Climatol., 47, 1354-1364). Measured on
+    /// one real sweep, softening velocity displaced 1,926 gates by up to
+    /// 40 m/s.
+    pub fn may_soften(self, moment: &MomentType) -> bool {
+        !matches!(
+            moment,
+            MomentType::Velocity | MomentType::CorrelationCoefficient
+        )
+    }
+}
+
+impl Default for DisplayQuality {
+    fn default() -> Self {
+        Self::SMOOTH
     }
 }
 
@@ -294,7 +401,14 @@ pub struct ViewportMomentCache {
     row_lookup: AzimuthLookup,
     color_lookup: CachedColorLookup,
     storm_motion_basis: Option<StormMotionBasis>,
-    dealiased_grid: Option<MomentGrid>,
+    /// A grid the cache owns and draws INSTEAD of the one in the cut.
+    ///
+    /// Two things put a grid here: velocity dealiasing, which replaces folded
+    /// values with unfolded ones, and the display-quality passes, which soften
+    /// and/or upsample the polar lattice. Both produce a grid that is not in
+    /// the volume, and both must be built once per data change rather than per
+    /// frame, which is what this cache is for.
+    display_grid: Option<MomentGrid>,
 }
 
 pub struct ViewportSampleCache {
@@ -585,7 +699,7 @@ impl ViewportMomentCache {
             moment,
             row_lookup: AzimuthLookup::new(cut, grid),
             color_lookup: CachedColorLookup::new(grid, color_tables),
-            dealiased_grid: None,
+            display_grid: None,
         })
     }
 
@@ -628,7 +742,121 @@ impl ViewportMomentCache {
             row_lookup: AzimuthLookup::new(cut, &dealiased_grid),
             color_lookup: CachedColorLookup::new(&dealiased_grid, color_tables),
             storm_motion_basis: Some(StormMotionBasis::new(cut, &dealiased_grid)),
-            dealiased_grid: Some(dealiased_grid),
+            display_grid: Some(dealiased_grid),
+        })
+    }
+
+    /// Build a cache whose grid has been through the display-quality passes.
+    ///
+    /// The workstation's rasteriser samples one gate per screen pixel, so a
+    /// coarse polar lattice reads as speckle when zoomed out and as blocks when
+    /// zoomed in. Softening and polar upsampling fix that at the DATA end -
+    /// once per volume/cut/product on the render worker, cached here - rather
+    /// than by blurring the finished picture, which would also blur the map and
+    /// the range rings.
+    ///
+    /// Softening is refused for the moments whose interpolation is guarded.
+    /// The soften pass has no `InterpPolicy`: it averages straight through a
+    /// velocity fold and through the rho_hv minimum at the melting layer. On
+    /// one real sweep that displaced 1,926 gates by up to 40 m/s, which is not
+    /// a cosmetic difference to anyone reading a couplet.
+    pub fn new_display_quality(
+        volume: &RadarVolume,
+        cut_index: usize,
+        moment: MomentType,
+        color_tables: &ColorTableSet,
+        quality: DisplayQuality,
+    ) -> Result<Self> {
+        let cut = volume
+            .cuts
+            .get(cut_index)
+            .ok_or(RenderError::CutOutOfRange {
+                index: cut_index,
+                cut_count: volume.cuts.len(),
+            })?;
+        let source = cut
+            .moments
+            .get(&moment)
+            .ok_or_else(|| RenderError::MissingMoment {
+                cut_index,
+                moment: moment.clone(),
+            })?;
+        if source.radial_indices.is_empty() {
+            return Err(RenderError::EmptyMoment { cut_index, moment });
+        }
+
+        let (display_grid, row_lookup) = apply_display_quality(cut, &moment, source, quality);
+        let grid = display_grid.as_ref().unwrap_or(source);
+        let color_lookup = CachedColorLookup::new(grid, color_tables);
+        let storm_motion_basis =
+            (moment == MomentType::Velocity).then(|| StormMotionBasis::new(cut, grid));
+
+        Ok(Self {
+            volume_ptr: volume as *const RadarVolume as usize,
+            cut_index,
+            moment,
+            row_lookup,
+            color_lookup,
+            storm_motion_basis,
+            display_grid,
+        })
+    }
+
+    /// The dealiased-velocity cache, with the display-quality passes applied to
+    /// the UNFOLDED grid.
+    ///
+    /// Order matters and this is the only correct one. Interpolating folded
+    /// velocity is stopped dead by the 30 m/s guard, so a fold would leave a
+    /// band of native-resolution blocks straight through the couplet an analyst
+    /// is looking at. Unfolding first removes the discontinuity, and the guard
+    /// then has nothing to refuse.
+    pub fn new_dealiased_velocity_display_quality(
+        volume: &RadarVolume,
+        cut_index: usize,
+        color_tables: &ColorTableSet,
+        quality: DisplayQuality,
+    ) -> Result<Self> {
+        let cut = volume
+            .cuts
+            .get(cut_index)
+            .ok_or(RenderError::CutOutOfRange {
+                index: cut_index,
+                cut_count: volume.cuts.len(),
+            })?;
+        let source_grid =
+            cut.moments
+                .get(&MomentType::Velocity)
+                .ok_or_else(|| RenderError::MissingMoment {
+                    cut_index,
+                    moment: MomentType::Velocity,
+                })?;
+        if source_grid.radial_indices.is_empty() {
+            return Err(RenderError::EmptyMoment {
+                cut_index,
+                moment: MomentType::Velocity,
+            });
+        }
+
+        let dealiased = dealias_velocity_grid(cut, source_grid);
+        // Softening is allowed here where it is refused for raw velocity: the
+        // reason for that refusal is the fold, and there is no longer one.
+        let quality = DisplayQuality {
+            soften: quality.soften,
+            ..quality
+        };
+        let (upgraded, row_lookup) = apply_display_quality_unguarded(cut, &dealiased, quality);
+        let grid = upgraded.as_ref().unwrap_or(&dealiased);
+        let color_lookup = CachedColorLookup::new(grid, color_tables);
+        let storm_motion_basis = Some(StormMotionBasis::new(cut, grid));
+
+        Ok(Self {
+            volume_ptr: volume as *const RadarVolume as usize,
+            cut_index,
+            moment: MomentType::Velocity,
+            row_lookup,
+            color_lookup,
+            storm_motion_basis,
+            display_grid: Some(upgraded.unwrap_or(dealiased)),
         })
     }
 
@@ -1076,7 +1304,7 @@ impl ViewportMomentCache {
                 index: self.cut_index,
                 cut_count: volume.cuts.len(),
             })?;
-        if let Some(grid) = &self.dealiased_grid {
+        if let Some(grid) = &self.display_grid {
             return Ok((cut, grid));
         }
         let grid = cut
@@ -1087,6 +1315,56 @@ impl ViewportMomentCache {
                 moment: self.moment.clone(),
             })?;
         Ok((cut, grid))
+    }
+}
+
+/// Run the display-quality passes over one grid, returning the owned result (if
+/// any pass ran) and the azimuth lookup that matches it.
+///
+/// `None` means every pass declined, and the caller must keep reading the grid
+/// out of the cut - so the default path allocates nothing at all.
+fn apply_display_quality(
+    cut: &ElevationCut,
+    moment: &MomentType,
+    source: &MomentGrid,
+    quality: DisplayQuality,
+) -> (Option<MomentGrid>, AzimuthLookup) {
+    let quality = DisplayQuality {
+        soften: quality.soften && quality.may_soften(moment),
+        ..quality
+    };
+    apply_display_quality_unguarded(cut, source, quality)
+}
+
+/// As `apply_display_quality`, but the caller has already decided softening is
+/// safe for this field. Only the dealiased-velocity path may say that.
+fn apply_display_quality_unguarded(
+    cut: &ElevationCut,
+    source: &MomentGrid,
+    quality: DisplayQuality,
+) -> (Option<MomentGrid>, AzimuthLookup) {
+    let softened = quality
+        .soften
+        .then(|| crate::smooth::smooth_moment_grid(source));
+    let base = softened.as_ref().unwrap_or(source);
+
+    let upsampled = quality
+        .interpolate
+        .then(|| crate::interpolate::upsample_moment_grid(cut, base))
+        .flatten();
+
+    match upsampled {
+        Some(interpolated) => {
+            let lookup = AzimuthLookup::from_row_azimuths(
+                &interpolated.row_azimuths_deg,
+                &interpolated.grid,
+            );
+            (Some(interpolated.grid), lookup)
+        }
+        None => {
+            let lookup = AzimuthLookup::new(cut, base);
+            (softened, lookup)
+        }
     }
 }
 
@@ -3309,12 +3587,41 @@ struct AzimuthLookup {
 
 impl AzimuthLookup {
     fn new(cut: &ElevationCut, grid: &MomentGrid) -> Self {
+        Self::from_row_azimuths_iter(
+            grid,
+            grid.radial_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(row, radial_index)| {
+                    cut.radials
+                        .get(*radial_index)
+                        .map(|radial| (row, radial.azimuth_deg))
+                }),
+        )
+    }
+
+    /// Build the lookup from azimuths given per grid row rather than read from
+    /// the cut.
+    ///
+    /// This is what an upsampled grid needs. `interpolate::upsample_moment_grid`
+    /// inserts synthetic sub-beams between the native ones and points each
+    /// one's `radial_indices` entry at its nearest PARENT radial, so that
+    /// Nyquist and beam-geometry lookups stay valid. That makes the cut unable
+    /// to say where a sub-beam actually points: every one of them would report
+    /// its parent's azimuth, the sub-beams would collapse back onto the native
+    /// beams, and the display would be identical to native while costing two to
+    /// four times the memory.
+    fn from_row_azimuths(row_azimuths_deg: &[f32], grid: &MomentGrid) -> Self {
+        Self::from_row_azimuths_iter(grid, row_azimuths_deg.iter().copied().enumerate())
+    }
+
+    fn from_row_azimuths_iter(
+        grid: &MomentGrid,
+        row_azimuths: impl Iterator<Item = (usize, f32)>,
+    ) -> Self {
         let mut groups = vec![None; AZIMUTH_BINS];
-        for (row, radial_index) in grid.radial_indices.iter().enumerate() {
-            let Some(radial) = cut.radials.get(*radial_index) else {
-                continue;
-            };
-            let azimuth = radial.azimuth_deg.rem_euclid(360.0);
+        for (row, azimuth_deg) in row_azimuths {
+            let azimuth = azimuth_deg.rem_euclid(360.0);
             let bin = azimuth_bin(azimuth);
             let group = groups[bin].get_or_insert_with(|| AzimuthGroup {
                 azimuth: bin as f32 * AZIMUTH_BIN_WIDTH_DEG,
@@ -3546,11 +3853,24 @@ fn motion_component_away_mps(storm_motion: StormMotion, beam_azimuth_deg: f32) -
 }
 
 pub fn color_family_for_moment(moment: &MomentType) -> ColorTableFamily {
+    // Exhaustive on purpose - no wildcard. The dual-polarimetric moments used
+    // to fall through a `_ => Generic` arm onto a ramp spanning 0..100, which
+    // rendered ZDR (-13..20 dB) and correlation coefficient (0.21..1.05) as a
+    // single flat wash. A wildcard here cannot be told apart from a deliberate
+    // choice, so the next moment added to `radar_core` must fail to compile
+    // rather than silently join them.
     match moment {
         MomentType::Reflectivity => ColorTableFamily::Reflectivity,
         MomentType::Velocity => ColorTableFamily::Velocity,
         MomentType::SpectrumWidth => ColorTableFamily::SpectrumWidth,
-        _ => ColorTableFamily::Generic,
+        MomentType::DifferentialReflectivity => ColorTableFamily::DifferentialReflectivity,
+        MomentType::CorrelationCoefficient => ColorTableFamily::CorrelationCoefficient,
+        MomentType::DifferentialPhase => ColorTableFamily::DifferentialPhase,
+        MomentType::SpecificDifferentialPhase => ColorTableFamily::SpecificDifferentialPhase,
+        // Only genuinely unclassified moments. Every cached WSR-88D volume
+        // carries `Unknown("CFP")`, clutter filter power, which has no family
+        // of its own yet.
+        MomentType::Unknown(_) => ColorTableFamily::Generic,
     }
 }
 
