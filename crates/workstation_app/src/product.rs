@@ -1,3 +1,18 @@
+//! The pane's `Copy` handle to a product, and its adapter to the registry.
+//!
+//! A pane stores which product it shows, and it does so many times per frame,
+//! so the handle stays a small `Copy` enum. Everything the handle *means* —
+//! its name, units, colour domain, plausible range, which moment it reads,
+//! which leg of a split cut it wants — belongs to `product_engine` and is
+//! looked up, never restated here. Before that split existed, a product's name
+//! lived in one match and its units in another, and the two drifted.
+//!
+//! This adapter is temporary. As the registry grows past the ten sweep
+//! products the panes can name, the handle becomes a `ProductId` and this file
+//! goes away.
+
+use product_engine::registry::ProductDescriptor;
+use product_engine::{DisplayDomain, ProductRegistry};
 use radar_core::{MomentType, ProductId, RadarVolume};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -13,10 +28,17 @@ pub enum DisplayProduct {
     CorrelationCoefficient,
     DifferentialPhase,
     SpecificDifferentialPhase,
+    CompositeReflectivity,
+    EchoTop18,
+    Vil,
+    VilDensity,
+    Mesh,
+    ProbabilityOfHail,
+    ProbabilityOfSevereHail,
 }
 
 impl DisplayProduct {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 17] = [
         Self::Reflectivity,
         Self::Velocity,
         Self::DealiasedVelocity,
@@ -27,8 +49,17 @@ impl DisplayProduct {
         Self::CorrelationCoefficient,
         Self::DifferentialPhase,
         Self::SpecificDifferentialPhase,
+        Self::CompositeReflectivity,
+        Self::EchoTop18,
+        Self::Vil,
+        Self::VilDensity,
+        Self::Mesh,
+        Self::ProbabilityOfHail,
+        Self::ProbabilityOfSevereHail,
     ];
 
+    /// The canonical registry id. This is the one piece of product identity the
+    /// handle keeps for itself, because it is what a saved workspace holds.
     pub const fn id(self) -> &'static str {
         match self {
             Self::Reflectivity => "REF",
@@ -41,70 +72,73 @@ impl DisplayProduct {
             Self::CorrelationCoefficient => "RHO",
             Self::DifferentialPhase => "PHI",
             Self::SpecificDifferentialPhase => "KDP",
+            Self::CompositeReflectivity => "CREF",
+            Self::EchoTop18 => "ET18",
+            Self::Vil => "VIL",
+            Self::VilDensity => "VILD",
+            Self::Mesh => "MESH",
+            Self::ProbabilityOfHail => "POH",
+            Self::ProbabilityOfSevereHail => "POSH",
         }
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Reflectivity => "Reflectivity",
-            Self::Velocity => "Base Velocity",
-            Self::DealiasedVelocity => "Dealiased Velocity",
-            Self::StormRelativeVelocity => "Storm-Relative Velocity",
-            Self::DealiasedStormRelativeVelocity => "Dealiased SRV",
-            Self::SpectrumWidth => "Spectrum Width",
-            Self::DifferentialReflectivity => "Differential Reflectivity",
-            Self::CorrelationCoefficient => "Correlation Coefficient",
-            Self::DifferentialPhase => "Differential Phase",
-            Self::SpecificDifferentialPhase => "Specific Differential Phase",
-        }
+    /// The volume product this handle names, if it names one.
+    pub fn derived_volume(self) -> Option<product_engine::registry::DerivedVolumeId> {
+        self.descriptor().computation.derived_volume()
+    }
+
+    /// The registry entry behind this handle.
+    ///
+    /// Every variant is pinned to an entry by a test, so the lookup cannot miss
+    /// at run time. A `LazyLock`-backed lookup over ten entries; not hot.
+    pub fn descriptor(self) -> &'static ProductDescriptor {
+        ProductRegistry::builtin()
+            .get(self.id())
+            .expect("every display product is pinned to a registry entry by test")
+    }
+
+    pub fn label(self) -> &'static str {
+        self.descriptor().display_name
+    }
+
+    /// Units, colour domain, and plausible range.
+    pub fn domain(self) -> DisplayDomain {
+        self.descriptor().domain
     }
 
     pub fn product_id(self) -> ProductId {
         ProductId(self.id().to_owned())
     }
 
+    /// The handle for a saved product id, or `None` when this build has no such
+    /// product. The caller decides what to do about it; nothing here silently
+    /// rewrites an analyst's saved workspace.
+    pub fn try_from_product_id(id: &ProductId) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|product| product.id().eq_ignore_ascii_case(id.0.trim()))
+    }
+
+    /// The handle for a saved product id, falling back to reflectivity.
+    ///
+    /// The fallback is a stop-gap: an unknown id currently draws reflectivity
+    /// without saying so. Surfacing it needs a pane header that can show
+    /// `unavailable: unknown product`, which arrives with the legend and status
+    /// work. Until then this at least draws something rather than panicking.
     pub fn from_product_id(id: &ProductId) -> Self {
-        match id.0.as_str() {
-            "VEL" => Self::Velocity,
-            "DVEL" => Self::DealiasedVelocity,
-            "SRV" => Self::StormRelativeVelocity,
-            "DSRV" => Self::DealiasedStormRelativeVelocity,
-            "SW" => Self::SpectrumWidth,
-            "ZDR" => Self::DifferentialReflectivity,
-            "RHO" => Self::CorrelationCoefficient,
-            "PHI" => Self::DifferentialPhase,
-            "KDP" => Self::SpecificDifferentialPhase,
-            _ => Self::Reflectivity,
-        }
+        Self::try_from_product_id(id).unwrap_or_default()
     }
 
     pub fn source_moment(self) -> MomentType {
-        match self {
-            Self::Reflectivity => MomentType::Reflectivity,
-            Self::Velocity
-            | Self::DealiasedVelocity
-            | Self::StormRelativeVelocity
-            | Self::DealiasedStormRelativeVelocity => MomentType::Velocity,
-            Self::SpectrumWidth => MomentType::SpectrumWidth,
-            Self::DifferentialReflectivity => MomentType::DifferentialReflectivity,
-            Self::CorrelationCoefficient => MomentType::CorrelationCoefficient,
-            Self::DifferentialPhase => MomentType::DifferentialPhase,
-            Self::SpecificDifferentialPhase => MomentType::SpecificDifferentialPhase,
-        }
+        self.descriptor().computation.source_moment()
     }
 
-    pub const fn uses_dealiased_velocity(self) -> bool {
-        matches!(
-            self,
-            Self::DealiasedVelocity | Self::DealiasedStormRelativeVelocity
-        )
+    pub fn uses_dealiased_velocity(self) -> bool {
+        self.descriptor().computation.uses_dealiased_velocity()
     }
 
-    pub const fn is_storm_relative(self) -> bool {
-        matches!(
-            self,
-            Self::StormRelativeVelocity | Self::DealiasedStormRelativeVelocity
-        )
+    pub fn is_storm_relative(self) -> bool {
+        self.descriptor().computation.is_storm_relative()
     }
 
     pub fn is_available_in_cut(self, volume: &RadarVolume, cut_index: usize) -> bool {
@@ -114,6 +148,16 @@ impl DisplayProduct {
             .is_some_and(|cut| cut.moments.contains_key(&self.source_moment()))
     }
 
+    /// The lowest-indexed cut carrying this product's moment.
+    ///
+    /// Known defective, and left in place deliberately until split-cut-aware
+    /// selection lands. NEXRAD splits its lowest tilts into a long-range
+    /// surveillance scan and a short-range Doppler scan at nearly the same
+    /// elevation, and both may carry reflectivity. Picking by index takes
+    /// whichever the file lists first, so reflectivity is often drawn from the
+    /// Doppler leg and folds to purple past about 150 km. The descriptor
+    /// already records which leg each product wants in `cut_policy`; nothing
+    /// reads it yet.
     pub fn first_available_cut(self, volume: &RadarVolume) -> Option<usize> {
         volume
             .cuts
@@ -152,6 +196,7 @@ impl DisplayProduct {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use product_engine::PhysicalUnit;
 
     #[test]
     fn product_ids_round_trip() {
@@ -164,10 +209,56 @@ mod tests {
     }
 
     #[test]
+    fn every_handle_resolves_to_a_registry_entry() {
+        for product in DisplayProduct::ALL {
+            assert_eq!(product.descriptor().id.0, product.id());
+        }
+    }
+
+    #[test]
+    fn the_handles_cover_every_selectable_registry_product() {
+        // If the registry gains a product the panes cannot name, the picker
+        // would silently omit it. That is the drift this pins.
+        let selectable: Vec<&str> = ProductRegistry::builtin()
+            .selectable_products(true)
+            .map(|descriptor| descriptor.id.0.as_str())
+            .collect();
+        let handles: Vec<&str> = DisplayProduct::ALL
+            .into_iter()
+            .map(DisplayProduct::id)
+            .collect();
+        assert_eq!(handles, selectable);
+    }
+
+    #[test]
     fn velocity_variants_share_velocity_source() {
         assert_eq!(
             DisplayProduct::DealiasedStormRelativeVelocity.source_moment(),
             MomentType::Velocity
         );
+    }
+
+    #[test]
+    fn an_unknown_saved_product_is_reported_rather_than_guessed() {
+        let unknown = ProductId("AZSHR".to_owned());
+        assert_eq!(DisplayProduct::try_from_product_id(&unknown), None);
+    }
+
+    #[test]
+    fn a_saved_product_id_resolves_regardless_of_case_or_padding() {
+        let saved = ProductId(" dvel ".to_owned());
+        assert_eq!(
+            DisplayProduct::try_from_product_id(&saved),
+            Some(DisplayProduct::DealiasedVelocity)
+        );
+    }
+
+    #[test]
+    fn the_handle_reads_its_units_from_the_registry_not_from_itself() {
+        assert_eq!(
+            DisplayProduct::DealiasedVelocity.domain().engine_unit,
+            PhysicalUnit::MetersPerSecond
+        );
+        assert_eq!(DisplayProduct::Reflectivity.label(), "Reflectivity");
     }
 }

@@ -3,13 +3,24 @@ use std::path::PathBuf;
 use eframe::egui;
 
 mod app;
+mod app_support;
 mod hazards;
+mod legend;
 mod live_service;
 mod load_service;
+mod nearest_site;
+mod palettes;
 mod pane_canvas;
+mod probe;
 mod product;
+mod popup;
+mod product_availability;
+mod product_picker;
 mod render_service;
 mod sites_service;
+mod sweep;
+mod vol3d;
+mod vrot;
 mod warnings_service;
 
 /// Overrides where warnings come from, for a daemon that is not on this
@@ -32,10 +43,16 @@ struct Startup {
     /// Warnings source, as written on the command line. `None` falls back to
     /// [`WARNINGS_URL_ENV`] and then to the default.
     warnings_url: Option<String>,
+    /// Product to open on, as a registry id or alias. Same reason as the
+    /// camera options: it is the only way to photograph a product on real data.
+    product: Option<String>,
+    /// Open the 3D volume explorer at startup.
+    vol3d: bool,
 }
 
 /// `radar-workstation [<level2-file>] [--live <SITE>] [--zoom <km-per-point>]
-/// [--center <east_km,north_km>] [--warnings-url <base-url|off>]`
+/// [--center <east_km,north_km>] [--warnings-url <base-url|off>]
+/// [--product <REF|VEL|DVEL|SRV|DSRV|SW|ZDR|RHO|PHI|KDP>] [--vol3d]`
 fn parse_startup<I: Iterator<Item = String>>(args: I) -> Startup {
     let mut startup = Startup::default();
     let mut pending: Option<String> = None;
@@ -49,6 +66,9 @@ fn parse_startup<I: Iterator<Item = String>>(args: I) -> Startup {
             Some((option, value)) if option.starts_with("--") => {
                 apply_option(&mut startup, option, value);
             }
+            // A bare switch takes no value, so it must not swallow the next
+            // argument the way an option would.
+            _ if arg == "--vol3d" => startup.vol3d = true,
             _ if arg.starts_with("--") => pending = Some(arg),
             _ if startup.input_path.is_none() => startup.input_path = Some(PathBuf::from(arg)),
             _ => {}
@@ -61,6 +81,8 @@ fn apply_option(startup: &mut Startup, option: &str, value: &str) {
     match option {
         "--live" => startup.live_site = Some(value.to_owned()),
         "--warnings-url" => startup.warnings_url = Some(value.to_owned()),
+        "--product" => startup.product = Some(value.to_owned()),
+        "--vol3d" => startup.vol3d = !matches!(value, "off" | "false" | "0"),
         "--zoom" => startup.zoom_km_per_point = value.parse().ok(),
         "--center" => {
             if let Some((east, north)) = value.split_once(',')
@@ -82,6 +104,27 @@ fn warnings_source(from_command_line: Option<String>) -> data_source::warnings::
         .unwrap_or_default()
 }
 
+/// Resolve a product named on the command line through the registry, so an
+/// alias such as `dealiased_velocity` works as well as `DVEL`.
+///
+/// An unrecognised name says so and leaves the default alone. Guessing would
+/// mean a captured receipt is labelled with a product nobody asked for.
+fn startup_product(requested: Option<&str>) -> Option<product::DisplayProduct> {
+    let requested = requested?;
+    let Some(descriptor) = product_engine::ProductRegistry::builtin().get(requested) else {
+        eprintln!("unknown product {requested:?}; opening on the default product instead");
+        return None;
+    };
+    let resolved = product::DisplayProduct::try_from_product_id(&descriptor.id);
+    if resolved.is_none() {
+        eprintln!(
+            "product {} is in the registry but no pane can show it yet",
+            descriptor.id.0
+        );
+    }
+    resolved
+}
+
 fn main() -> eframe::Result {
     let Startup {
         input_path,
@@ -89,8 +132,11 @@ fn main() -> eframe::Result {
         zoom_km_per_point,
         center_km,
         warnings_url,
+        product,
+        vol3d: open_vol3d,
     } = parse_startup(std::env::args().skip(1));
     let warnings_source = warnings_source(warnings_url);
+    let initial_product = startup_product(product.as_deref());
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
@@ -117,6 +163,22 @@ fn main() -> eframe::Result {
                         .write()
                         .callback_resources
                         .insert(resources);
+                    // The raster tile underlay owns its own pipeline and its
+                    // own texture residency, registered the same way and once.
+                    // Inert until a provider is picked: with no imagery
+                    // selected the pane never queues a tile callback.
+                    let tiles = map_scene::gpu::TileRenderResources::new(
+                        &render_state.device,
+                        render_state.target_format,
+                    );
+                    render_state
+                        .renderer
+                        .write()
+                        .callback_resources
+                        .insert(tiles);
+                    // The 3D explorer owns its own pipelines and textures and
+                    // registers them the same way, once, before any pane paints.
+                    vol3d::init_gpu(render_state);
                 }
                 None => eprintln!(
                     "wgpu map unavailable: no wgpu render state; the basemap will not draw"
@@ -126,6 +188,8 @@ fn main() -> eframe::Result {
             let mut app =
                 app::WorkstationApp::new(creation_context, input_path, live_site, warnings_source);
             app.set_initial_camera(zoom_km_per_point, center_km);
+            app.set_initial_product(initial_product);
+            app.set_vol3d_open(open_vol3d);
             Ok(Box::new(app))
         }),
     )
@@ -159,5 +223,39 @@ mod tests {
     fn does_not_treat_a_live_site_as_a_file_path() {
         let parsed = startup(&["--live", "KTLX"]);
         assert_eq!(parsed.input_path, None);
+    }
+
+    #[test]
+    fn the_volume_explorer_switch_takes_no_value_and_does_not_eat_the_next_argument() {
+        // Written as a bare switch, so `--vol3d C:/data/file` must still see
+        // the path as a path rather than as the switch's value.
+        let parsed = startup(&["--vol3d", "C:/data/KTLX_V06"]);
+        assert!(parsed.vol3d);
+        assert_eq!(parsed.input_path, Some(PathBuf::from("C:/data/KTLX_V06")));
+        assert!(!startup(&["C:/data/KTLX_V06"]).vol3d);
+        assert!(!startup(&["--vol3d=off"]).vol3d);
+    }
+
+    #[test]
+    fn a_stated_product_resolves_through_the_registry() {
+        let parsed = startup(&["--product", "DVEL"]);
+        assert_eq!(
+            startup_product(parsed.product.as_deref()),
+            Some(product::DisplayProduct::DealiasedVelocity)
+        );
+    }
+
+    #[test]
+    fn a_stated_product_accepts_a_registry_alias() {
+        assert_eq!(
+            startup_product(Some("correlation_coefficient")),
+            Some(product::DisplayProduct::CorrelationCoefficient)
+        );
+    }
+
+    #[test]
+    fn an_unknown_product_name_keeps_the_default_rather_than_guessing() {
+        assert_eq!(startup_product(Some("AZSHR")), None);
+        assert_eq!(startup_product(None), None);
     }
 }

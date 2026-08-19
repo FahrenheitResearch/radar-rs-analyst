@@ -20,8 +20,15 @@ use crate::live_service::{LiveService, LiveUpdate, default_live_cache_dir};
 use crate::load_service::{LoadRequest, LoadService, LoadUpdate, LoadedVolume};
 use crate::pane_canvas::{PaneMap, PaneTexture, PlacedSite, draw_pane, pane_rects};
 use crate::product::DisplayProduct;
-use crate::render_service::{RenderRequest, RenderService, RenderUpdate, RenderedPane};
+
+use crate::app_support::{color_image_from_rgba, layout_label, pane_title, viewport_changed};
+use crate::product_availability::ProductAvailabilityIndex;
+use crate::product_picker::{ProductPickerInput, ProductPickerState, draw_product_picker};
+use crate::render_service::{
+    RenderRequest, RenderService, RenderUpdate, RenderedPane, SweepBlendRequest,
+};
 use crate::sites_service::{LocatedSite, SitesService};
+use crate::sweep::{SweepAnimator, SweepState, catch_up_factor};
 use crate::warnings_service::WarningsService;
 
 /// How often placed hazards are rebuilt so expiries take effect.
@@ -51,6 +58,42 @@ struct PaneRuntime {
     pending_stamp: Option<RenderStamp>,
     viewport: Option<ViewportMetrics>,
     status: String,
+    /// Where the pointer was over this pane last frame, in radar-local
+    /// kilometres, and the readout built from it.
+    hovered_world_km: Option<(f64, f64)>,
+    probe_text: Option<String>,
+    /// Turns bursty radial arrivals into a clockwise wipe. One per pane,
+    /// because two panes can be following different tilts of the same volume.
+    sweep: SweepAnimator,
+    /// The reveal handed to the last render request.
+    sweep_state: Option<SweepState>,
+    /// What that reveal is a reveal OF. The animator recognises a sweep by its
+    /// elevation and start azimuth, which a product change leaves untouched
+    /// while replacing every pixel, so the pane tracks that separately.
+    sweep_key: Option<SweepKey>,
+    /// When the reveal was last stepped, for the wall-clock ease.
+    sweep_stepped_at: Option<Instant>,
+}
+
+impl PaneRuntime {
+    fn reset_sweep(&mut self) {
+        self.sweep.reset();
+        self.sweep_state = None;
+        self.sweep_key = None;
+        self.sweep_stepped_at = None;
+    }
+}
+
+/// What a pane's sweep reveal refers to.
+///
+/// Compared for equality to decide whether the eased position still means
+/// anything. The cut index is in here because switching tilts inside one volume
+/// changes everything about the sweep while leaving the frame identity alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SweepKey {
+    identity: analyst_runtime::FrameIdentity,
+    product: &'static str,
+    cut_index: usize,
 }
 
 struct InstalledTexture {
@@ -62,15 +105,52 @@ struct InstalledTexture {
     height: u32,
 }
 
+/// What a measurement of the current volume was taken from.
+///
+/// Compared for equality to decide whether the measurement is still good.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapabilitiesKey {
+    identity: analyst_runtime::FrameIdentity,
+    stage: FrameStage,
+    cuts: usize,
+    radials: usize,
+}
+
 pub struct WorkstationApp {
     workspace: WorkspaceState,
     history: VolumeHistory,
+    /// What the current volume can do, measured once per frame off the paint
+    /// path. Cut selection needs median elevations and per-sweep scan times,
+    /// and walking every radial while painting is not affordable.
+    /// Whether a pane click takes a Vrot endpoint instead of selecting a pane.
+    /// Thermal levels the hail products are computed against. Starts as the
+    /// documented fallback, which badges itself ASSUMED so nobody mistakes it
+    /// for a sounding.
+    hail_environment: product_engine::HailEnvironment,
+    /// The 3D volume explorer. Its own window, so opening it does not disturb
+    /// the pane layout an analyst has set up.
+    vol3d: crate::vol3d::Vol3d,
+    vrot_active: bool,
+    vrot_state: crate::vrot::VrotState,
+    vrot_pane: Option<PaneId>,
+    capabilities: Option<Arc<product_engine::VolumeCapabilities>>,
+    capabilities_for: Option<CapabilitiesKey>,
+    /// How hard the raster worker is asked to work. Not part of `RenderStamp`:
+    /// a change bumps every pane's view clock instead, which is the existing
+    /// way of saying "same data, different picture".
+    quality: render2d::DisplayQuality,
+    /// Which products the current volume can actually show, rebuilt with the
+    /// capabilities.
+    product_availability: ProductAvailabilityIndex,
+    product_picker: ProductPickerState,
+    product_picker_open: bool,
     load_service: LoadService,
     render_service: RenderService,
     session_clock: GenerationClock,
     frame_clock: GenerationClock,
     pane_clocks: [GenerationClock; analyst_runtime::MAX_PANES],
     view_clocks: [GenerationClock; analyst_runtime::MAX_PANES],
+    sweep_clocks: [GenerationClock; analyst_runtime::MAX_PANES],
     palette_clock: GenerationClock,
     panes: [PaneRuntime; analyst_runtime::MAX_PANES],
     color_tables: Arc<ColorTableSet>,
@@ -113,6 +193,17 @@ impl WorkstationApp {
         let mut app = Self {
             workspace: WorkspaceState::default(),
             history: VolumeHistory::default(),
+            hail_environment: product_engine::HailEnvironment::climatological_fallback(),
+            vol3d: crate::vol3d::Vol3d::default(),
+            vrot_active: false,
+            vrot_state: crate::vrot::VrotState::Idle,
+            vrot_pane: None,
+            capabilities: None,
+            capabilities_for: None,
+            quality: render2d::DisplayQuality::default(),
+            product_availability: ProductAvailabilityIndex::unrestricted(),
+            product_picker: ProductPickerState::default(),
+            product_picker_open: false,
             load_service: LoadService::new(context.clone()),
             render_service: RenderService::new(context.clone()),
             live_service: LiveService::new(context.clone()),
@@ -124,6 +215,7 @@ impl WorkstationApp {
             frame_clock: GenerationClock::default(),
             pane_clocks: [GenerationClock::default(); analyst_runtime::MAX_PANES],
             view_clocks: [GenerationClock::default(); analyst_runtime::MAX_PANES],
+            sweep_clocks: [GenerationClock::default(); analyst_runtime::MAX_PANES],
             palette_clock: GenerationClock::default(),
             panes: array::from_fn(|_| PaneRuntime::default()),
             color_tables: Arc::new(ColorTableSet::default()),
@@ -215,6 +307,35 @@ impl WorkstationApp {
             panes.push(pane);
         }
         self.invalidate_view_panes(&panes);
+    }
+
+    /// Open every pane on a product stated at startup.
+    ///
+    /// This exists for the same reason the camera options do. Windows refuses a
+    /// foreground change from a background process, so synthetic clicks land in
+    /// whatever window happens to be focused; a product cannot be selected by
+    /// hand in a captured session. Without this flag the only product that
+    /// could ever be photographed on real data is the default one.
+    pub fn set_initial_product(&mut self, product: Option<DisplayProduct>) {
+        let Some(product) = product else {
+            return;
+        };
+        let id = product.product_id();
+        let mut panes = Vec::with_capacity(analyst_runtime::MAX_PANES);
+        for index in 0..analyst_runtime::MAX_PANES {
+            let Some(pane) = PaneId::new(index as u8) else {
+                continue;
+            };
+            self.workspace.pane_mut(pane).product = id.clone();
+            panes.push(pane);
+        }
+        self.invalidate_semantic_panes(&panes);
+    }
+
+    /// Open the 3D explorer at startup, so a particular view can be captured
+    /// without driving the window by hand.
+    pub fn set_vol3d_open(&mut self, open: bool) {
+        self.vol3d.open = open;
     }
 
     fn begin_load(&mut self, path: PathBuf) {
@@ -321,15 +442,6 @@ impl WorkstationApp {
     /// county-coded products that carry no polygon at all -- 442 active against
     /// 148 with geometry, measured on 2026-08-17. Saying how many are actually
     /// drawn stops the chip reading as a claim about the picture.
-    fn warnings_hover(&self) -> String {
-        let detail = self.warnings_state.detail();
-        if self.show_warnings {
-            format!("{detail} · {} drawn here", self.placed_hazards.len())
-        } else {
-            format!("{detail} · hidden")
-        }
-    }
-
     fn poll_warnings(&mut self) {
         while let Some(update) = self.warnings_service.try_recv() {
             self.warnings_state = update.state;
@@ -482,6 +594,7 @@ impl WorkstationApp {
         }
 
         let before = self.current_frame_signature();
+        let before_extent = self.current_frame_extent();
         let stage = loaded.stage;
         let report = self.history.install(VolumeFrame::new(
             loaded.volume,
@@ -491,9 +604,23 @@ impl WorkstationApp {
         ));
         self.load_ms = Some(loaded.elapsed_ms);
         let after = self.current_frame_signature();
+        let after_extent = self.current_frame_extent();
+
         if before != after {
+            // A genuinely different frame: the old pixels describe another
+            // volume, so they go.
             self.frame_clock.bump();
             self.clear_all_panes();
+        } else if before_extent != after_extent {
+            // The same frame, grown. Radials were appended under one site,
+            // volume time and stage, so the signature above cannot see it and
+            // without this the new data never reaches the screen at all.
+            //
+            // The clock is bumped but the panes are NOT cleared: the installed
+            // texture still shows the part of the sweep that had already
+            // arrived, and clearing it would blink the pane to empty on every
+            // chunk. The texture is replaced when the new render lands.
+            self.frame_clock.bump();
         }
         self.status = match stage {
             FrameStage::Preview => format!(
@@ -617,6 +744,8 @@ impl WorkstationApp {
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
         let mut selected_product = current_product;
+        let mut quality_changed = false;
+        let mut palette_changed = false;
         let mut tilt_delta = 0_isize;
         let visible = self.workspace.visible_panes();
         let cameras_linked = visible
@@ -664,7 +793,11 @@ impl WorkstationApp {
             };
             let response = ui
                 .selectable_label(self.show_warnings, chip)
-                .on_hover_text(self.warnings_hover());
+                .on_hover_text(crate::app_support::warnings_hover(
+                    &self.warnings_state.detail(),
+                    self.show_warnings,
+                    self.placed_hazards.len(),
+                ));
             if response.clicked() {
                 toggle_warnings = true;
             }
@@ -684,19 +817,125 @@ impl WorkstationApp {
                     }
                 });
 
-            egui::ComboBox::from_id_salt("workstation-product")
-                .selected_text(current_product.label())
-                .width(184.0)
+            let picker_button = ui
+                .selectable_label(self.product_picker_open, current_product.label())
+                .on_hover_text("Choose a product and its colour table");
+            let mut opened_this_frame = false;
+            if picker_button.clicked() {
+                self.product_picker_open = !self.product_picker_open;
+                if self.product_picker_open {
+                    self.product_picker.opened(current_product);
+                    opened_this_frame = true;
+                }
+            }
+            if self.product_picker_open {
+                // Only while open: the picker takes the arrow keys, Enter and
+                // Escape off the global event queue every frame it runs, so
+                // drawing it unconditionally would eat them from the toolbar.
+                let outcome = egui::Area::new(egui::Id::new("workstation-product-picker"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(picker_button.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            draw_product_picker(
+                                ui,
+                                ProductPickerInput {
+                                    state: &mut self.product_picker,
+                                    current: current_product,
+                                    availability: &self.product_availability,
+                                    tables: &self.color_tables,
+                                    show_experimental: false,
+                                },
+                            )
+                        })
+                    });
+                let popup_rect = outcome.response.rect;
+                let outcome = outcome.inner.inner;
+                if let Some(product) = outcome.product {
+                    selected_product = product;
+                    self.product_picker_open = false;
+                }
+                if let Some(selection) = outcome.palette {
+                    // Family-wide on purpose: installing a velocity table moves
+                    // VEL, DVEL, SRV and DSRV together, because they are the
+                    // same measurement drawn four ways.
+                    Arc::make_mut(&mut self.color_tables)
+                        .set_family(selection.family, selection.table);
+                    self.palette_clock.bump();
+                    palette_changed = true;
+                }
+                // `crate::popup` rather than `clicked_elsewhere()`. That method
+                // answered yes for the click that OPENED this popup - the click
+                // was on the button, which is outside the popup - so the popup
+                // opened and closed inside one frame and the product button was
+                // dead. The rule now knows about that click.
+                let dismissal = crate::popup::dismissal_from_input(
+                    ui.ctx(),
+                    popup_rect,
+                    picker_button.rect,
+                    opened_this_frame,
+                    outcome.dismissed,
+                );
+                if dismissal.should_close() {
+                    self.product_picker_open = false;
+                }
+            }
+
+            // A colour table has to be reachable without the popup. It is the
+            // control that tells an analyst whether a strange-looking field is
+            // the data or the palette, so burying it one level down inside
+            // another menu was wrong.
+            let palette_family = crate::product_picker::palette_family(current_product);
+            if let Some(family) = palette_family {
+                let installed = self.color_tables.for_family(family).name().to_owned();
+                egui::ComboBox::from_id_salt("workstation-palette")
+                    .selected_text(&installed)
+                    .width(210.0)
+                    .show_ui(ui, |ui| {
+                        for table in color_tables::builtin_tables_for_family(family) {
+                            let chosen = table.name() == installed;
+                            if ui.selectable_label(chosen, table.name()).clicked() && !chosen {
+                                Arc::make_mut(&mut self.color_tables).set_family(family, table);
+                                self.palette_clock.bump();
+                                palette_changed = true;
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Colour table for this product's family. \"Stepped\" paints hard bands \
+                         at each stop; \"smooth\" interpolates between them.",
+                    );
+            }
+
+            crate::app_support::basemap_picker(ui, &mut self.map_scene);
+
+            let mut selected_quality = self.quality;
+            egui::ComboBox::from_id_salt("workstation-quality")
+                .selected_text(selected_quality.preset_label().unwrap_or("Custom"))
+                .width(92.0)
                 .show_ui(ui, |ui| {
-                    for product in DisplayProduct::ALL {
-                        ui.selectable_value(&mut selected_product, product, product.label());
+                    for (label, preset) in render2d::DisplayQuality::PRESETS {
+                        ui.selectable_value(&mut selected_quality, preset, label);
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Display quality. Smooth adds sub-beams and sub-gates so a gate stops \
+                     being a visible block; High and Ultra also supersample, which is what \
+                     removes the speckle of a zoomed-out view. Ultra costs about sixteen \
+                     times the native raster per frame.",
+                );
+            if selected_quality != self.quality {
+                self.quality = selected_quality;
+                quality_changed = true;
+            }
 
             if ui.button("− Tilt").clicked() {
                 tilt_delta = -1;
             }
-            ui.label(self.active_tilt_label());
+            ui.label(self.active_tilt_label())
+                .on_hover_text(self.active_tilt_hover());
             if ui.button("+ Tilt").clicked() {
                 tilt_delta = 1;
             }
@@ -706,8 +945,45 @@ impl WorkstationApp {
             {
                 toggle_camera_links = true;
             }
+            if ui
+                .selectable_label(self.vol3d.open, "3D")
+                .on_hover_text("Volumetric explorer: every tilt resampled into a box and ray marched")
+                .clicked()
+            {
+                self.vol3d.open = !self.vol3d.open;
+            }
+            if ui
+                .selectable_label(self.vrot_active, "Vrot")
+                .on_hover_text(
+                    "Click two gates across a velocity couplet.
+                     Needs a dealiased product: measuring folded velocity gives                      a number wrong by a multiple of the Nyquist that still                      looks reasonable.",
+                )
+                .clicked()
+            {
+                self.vrot_active = !self.vrot_active;
+                if !self.vrot_active {
+                    self.vrot_state.clear();
+                    self.vrot_pane = None;
+                }
+            }
+            if self.vrot_state.measurement().is_some() || self.vrot_state.pending().is_some() {
+                if ui.button("Clear Vrot").clicked() {
+                    self.vrot_state.clear();
+                    self.vrot_pane = None;
+                }
+                if let Some(measurement) = self.vrot_state.measurement() {
+                    ui.label(format!("Vrot {:.0} kt", measurement.vrot_knots()));
+                }
+            }
             ui.label(format!("Pane {}", active.get() + 1));
         });
+
+        if quality_changed || palette_changed {
+            // Same data, different picture: every pane's view generation moves,
+            // which discards the in-flight render and asks for a new one
+            // without throwing away the texture that is currently on screen.
+            self.invalidate_view_panes(self.workspace.visible_panes());
+        }
 
         if let Some(path) = requested_load {
             self.begin_load(path);
@@ -748,6 +1024,40 @@ impl WorkstationApp {
         }
     }
 
+    /// The 3D volume explorer, in its own window.
+    ///
+    /// Follows the active pane's product, so switching that pane to velocity
+    /// rebuilds the box from velocity rather than showing a reflectivity body
+    /// under a velocity label.
+    fn vol3d_window(&mut self, context: &egui::Context) {
+        if !self.vol3d.open {
+            return;
+        }
+        let product = DisplayProduct::from_product_id(&self.workspace.active().product);
+        let descriptor = product.descriptor();
+        // Volume products are already a vertical reduction; there is nothing
+        // left to ray march. Fall back to the moment they are built from.
+        let moment = descriptor.computation.source_moment();
+        let table = crate::palettes::table_for(descriptor, &self.color_tables);
+        let range = descriptor.domain.declared_engine_range;
+        let candidates = crate::app_support::vol3d_candidates(&self.history);
+        let input = crate::vol3d::pane::Vol3dPaneInput {
+            candidates: &candidates,
+            moment,
+            product_label: descriptor.short_name.to_owned(),
+            color_table: &table,
+            value_range: (range.min, range.max),
+        };
+        let mut open = self.vol3d.open;
+        egui::Window::new("3D Volume")
+            .open(&mut open)
+            .default_size([900.0, 620.0])
+            .show(context, |ui| {
+                crate::vol3d::pane::draw_vol3d_pane(&mut self.vol3d, ui, &input);
+            });
+        self.vol3d.open = open;
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let volume = self
             .history
@@ -767,11 +1077,36 @@ impl WorkstationApp {
                 geometry: self
                     .map_scene
                     .geometry_for_pane(pane.index(), camera.sanitized().km_per_point),
+                tiles: self
+                    .map_scene
+                    .tiles_for_pane(pane.index(), camera, pane_rect),
                 projection: self.map_scene.projection(),
+                // Paint-time colours for the chosen basemap look. Read from the
+                // style the controller is holding rather than stored beside it,
+                // so the picker has exactly one thing to set.
+                chrome: map_scene::MapChrome::for_style(self.map_scene.style()),
                 sites: Arc::clone(&self.placed_sites),
                 active_site: self.live_site.clone(),
                 hazards: Arc::clone(&self.placed_hazards),
             };
+            // Badges describe what limits the picture. Only what is true right
+            // now; an empty list is the common case and draws nothing.
+            let mut badges: Vec<String> = Vec::new();
+            if let Some(frame) = self.history.current()
+                && frame.stage != FrameStage::Complete
+            {
+                badges.push(format!("{:?}", frame.stage).to_uppercase());
+            }
+            // A hail product computed from a guessed freezing level and one
+            // computed from a sounding are different claims. Without this the
+            // two look identical on screen, which is the whole reason the
+            // environment carries its provenance around with it.
+            if product
+                .derived_volume()
+                .is_some_and(product_engine::registry::DerivedVolumeId::needs_hail_environment)
+            {
+                badges.push(self.hail_environment.summary());
+            }
             let interaction = {
                 let texture =
                     self.panes[pane.index()]
@@ -782,6 +1117,22 @@ impl WorkstationApp {
                             camera: texture.camera,
                             viewport: texture.viewport,
                         });
+                // The raster is painted with `palettes::table_for`
+                // (render_service.rs), so the legend has to read the same table
+                // or the bar explains a picture drawn with a different one. For
+                // a derived-volume product whose domain is metres or kilograms,
+                // a base-moment dBZ ramp does not even intersect the domain, so
+                // the legend vanished instead of being wrong visibly: VIL
+                // Density had no legend at all.
+                let table = crate::palettes::table_for(product.descriptor(), &self.color_tables);
+                let layout = crate::legend::legend_layout(&product.domain(), &table);
+                let overlay = crate::pane_canvas::PaneOverlay {
+                    legend: layout.as_ref(),
+                    table: Some(&table),
+                    product_name: product.descriptor().short_name,
+                    badges: &badges,
+                    probe: self.panes[pane.index()].probe_text.as_deref(),
+                };
                 draw_pane(
                     ui,
                     pane,
@@ -792,17 +1143,40 @@ impl WorkstationApp {
                     &pane_map,
                     &title,
                     &status,
+                    &overlay,
                 )
             };
 
-            if let Some(site) = interaction.clicked_site {
+            if self.vrot_active && interaction.clicked {
+                self.take_vrot_sample(pane, volume.as_deref(), cut_index, product);
+            } else if let Some(site) = interaction.clicked_site {
                 // Clicking a site marker is the quickest way to change radar.
                 self.workspace.set_active(pane);
                 self.site_text = site.to_uppercase();
                 self.start_live(site);
+            } else if let Some((lon, lat)) = interaction.ctrl_clicked_lon_lat {
+                // Ctrl+click loads the nearest S-band NEXRAD. A TDWR sits
+                // closer to most downtowns than the WSR-88D does and must never
+                // win; `nearest_site` is where that is decided. Note the
+                // argument swap: the projection returns (lon, lat) and
+                // `nearest_s_band_site` takes (lat, lon).
+                self.workspace.set_active(pane);
+                match crate::nearest_site::nearest_s_band_site(lat, lon, &self.sites) {
+                    Some(choice) => {
+                        let status = choice.status_line();
+                        self.site_text = choice.id.to_uppercase();
+                        self.start_live(choice.id);
+                        // AFTER the load kick: `start_live` writes its own
+                        // status, so setting this first would be invisible.
+                        self.status = status;
+                    }
+                    None => self.status = crate::nearest_site::no_site_in_range_status(),
+                }
             } else if interaction.clicked {
                 self.workspace.set_active(pane);
             }
+            self.panes[pane.index()].hovered_world_km = interaction.hovered_world_km;
+            self.refresh_probe(pane, volume.as_deref(), cut_index, product);
             self.update_viewport(pane, interaction.viewport);
             if interaction.camera_changed {
                 let changed = self.workspace.apply_camera_from(pane, interaction.camera);
@@ -928,16 +1302,48 @@ impl WorkstationApp {
             return;
         }
 
+        // A volume product needs the measurement; without it there is nothing
+        // to select tilts from, and drawing an empty field would look like a
+        // storm-free sky rather than a missing prerequisite.
+        let Some(capabilities) = self.capabilities.as_ref().map(Arc::clone) else {
+            return;
+        };
+        // A sweep still filling is drawn over the last complete picture of the
+        // same tilt. A complete sweep is not blended at all, so an archive file
+        // renders down exactly the path it always did.
+        let sweep = self.panes[pane.index()]
+            .sweep_state
+            .filter(|state| !state.complete)
+            .and_then(|state| {
+                let moment = product.source_moment();
+                let (previous_volume, previous_cut_index) = crate::app_support::previous_sweep_for(
+                    &self.history,
+                    &volume,
+                    cut_index,
+                    &moment,
+                )?;
+                Some(SweepBlendRequest {
+                    previous_volume,
+                    previous_cut_index,
+                    start_deg: state.start_deg,
+                    revealed_deg: state.revealed_deg,
+                })
+            });
+
         let request = RenderRequest {
             pane,
             stamp,
             volume,
+            capabilities,
+            environment: self.hail_environment.clone(),
             cut_index,
             product,
             camera: self.workspace.pane(pane).camera,
             viewport,
             storm_motion: self.workspace.pane(pane).storm_motion,
             color_tables: Arc::clone(&self.color_tables),
+            quality: self.quality,
+            sweep,
         };
         match self.render_service.request(request) {
             Ok(()) => {
@@ -951,6 +1357,96 @@ impl WorkstationApp {
         }
     }
 
+    /// Step every pane's sweep reveal on by one frame.
+    ///
+    /// Only panes with no render in flight are stepped, and that restriction is
+    /// load-bearing rather than an optimisation. The reveal is part of the
+    /// render stamp, so moving it while a render is running would make that
+    /// render stale the instant it landed, `install_render` would drop it, and
+    /// the pane would never install anything at all. Tying each step to the
+    /// completion of the last one also makes the animation self-pacing: a
+    /// slower render takes fewer, larger steps instead of falling behind.
+    fn advance_sweeps(&mut self) {
+        let Some((identity, volume)) = self
+            .history
+            .current()
+            .map(|frame| (frame.identity.clone(), Arc::clone(&frame.volume)))
+        else {
+            for runtime in &mut self.panes {
+                runtime.reset_sweep();
+            }
+            return;
+        };
+
+        // Only the live edge animates. A frame the analyst has scrubbed back to
+        // is finished data, and revealing it a spoke at a time would animate
+        // history rather than report on an arriving sweep.
+        if !self.history.at_live_edge() {
+            for runtime in &mut self.panes {
+                runtime.reset_sweep();
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        for index in 0..analyst_runtime::MAX_PANES {
+            let Some(pane) = PaneId::new(index as u8) else {
+                continue;
+            };
+            // Resolved before the mutable borrow below: both read `self`.
+            let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
+            let cut_index = self.resolve_cut_index(pane, &volume);
+            let key = cut_index.map(|cut_index| SweepKey {
+                identity: identity.clone(),
+                product: product.id(),
+                cut_index,
+            });
+            let runtime = &mut self.panes[index];
+
+            let (Some(cut_index), Some(key)) = (cut_index, key) else {
+                runtime.reset_sweep();
+                continue;
+            };
+            if runtime.sweep_key.as_ref() != Some(&key) {
+                runtime.reset_sweep();
+                runtime.sweep_key = Some(key);
+            }
+            if runtime.pending_stamp.is_some() {
+                continue;
+            }
+            let Some(cut) = volume.cuts.get(cut_index) else {
+                runtime.reset_sweep();
+                continue;
+            };
+
+            let elapsed = runtime
+                .sweep_stepped_at
+                .map(|stepped_at| now.saturating_duration_since(stepped_at))
+                .unwrap_or_default();
+            let catch_up = runtime
+                .sweep_state
+                .map(|state| catch_up_factor(state.pending_deg()))
+                .unwrap_or(1.0);
+            let before = runtime.sweep_state;
+            let after = runtime.sweep.observe(cut, elapsed.mul_f32(catch_up));
+            runtime.sweep_state = after;
+            runtime.sweep_stepped_at = Some(now);
+
+            // Only a reveal that actually moved is worth a render. Without this
+            // a settled pane would re-render every frame forever, because the
+            // stamp would change on every step whether or not the picture did.
+            if before != after {
+                self.sweep_clocks[index].bump();
+            }
+        }
+    }
+
+    /// The tilt as it was in the previous frame, for a sweep still arriving.
+    ///
+    /// `None` is not a failure: the first volume after a site change genuinely
+    /// has nothing older to underpaint with, and the blend then draws the
+    /// arrived wedge alone, which is what the pane did before any of this
+    /// existed.
     fn update_viewport(&mut self, pane: PaneId, viewport: ViewportMetrics) {
         let changed = self.panes[pane.index()]
             .viewport
@@ -976,6 +1472,7 @@ impl WorkstationApp {
             runtime.texture = None;
             runtime.pending_stamp = None;
             runtime.status.clear();
+            runtime.reset_sweep();
         }
     }
 
@@ -984,6 +1481,10 @@ impl WorkstationApp {
             runtime.texture = None;
             runtime.pending_stamp = None;
             runtime.status.clear();
+            // The reveal describes a position in a sweep that is no longer on
+            // screen. Easing on from it would wipe the new picture in from
+            // wherever the old one happened to have got to.
+            runtime.reset_sweep();
         }
     }
 
@@ -995,13 +1496,58 @@ impl WorkstationApp {
             pane: self.pane_clocks[pane.index()].current(),
             view: self.view_clocks[pane.index()].current(),
             palette: self.palette_clock.current(),
+            sweep: self.sweep_clocks[pane.index()].current(),
         }
+    }
+
+    /// Re-measure the current volume when anything about it changes.
+    ///
+    /// The key includes the cut and radial counts, not just the frame identity
+    /// and stage. A live volume grows in place: chunks arrive, radials are
+    /// appended and whole cuts are added, all under one site and volume time at
+    /// stage `Partial`. Keying on identity alone would measure the first
+    /// fragment that arrived and then answer every later question from it, so
+    /// the pane would keep drawing the tilt that existed a minute ago.
+    fn refresh_capabilities(&mut self) {
+        let key = self.history.current().map(|frame| CapabilitiesKey {
+            identity: frame.identity.clone(),
+            stage: frame.stage,
+            cuts: frame.volume.cuts.len(),
+            radials: frame.volume.cuts.iter().map(|cut| cut.radials.len()).sum(),
+        });
+        if key == self.capabilities_for && self.capabilities.is_some() {
+            return;
+        }
+        self.capabilities = self
+            .history
+            .current()
+            .map(|frame| Arc::new(product_engine::VolumeCapabilities::analyze(&frame.volume)));
+        self.capabilities_for = key;
+        // Greying out a product the volume cannot show is a claim about the
+        // data, so it is remeasured wherever the measurement is.
+        self.product_availability =
+            ProductAvailabilityIndex::from_optional_capabilities(self.capabilities.as_deref());
     }
 
     fn current_frame_signature(&self) -> Option<(analyst_runtime::FrameIdentity, FrameStage)> {
         self.history
             .current()
             .map(|frame| (frame.identity.clone(), frame.stage))
+    }
+
+    /// How much data the current frame holds, as (cuts, radials).
+    ///
+    /// A live volume grows in place: chunks arrive and radials are appended
+    /// under one site, one volume time and the stage `Partial`. Its identity
+    /// and stage therefore do not change while it fills, which is why growth
+    /// needs its own measure - see `install_loaded_volume`.
+    fn current_frame_extent(&self) -> Option<(usize, usize)> {
+        self.history.current().map(|frame| {
+            (
+                frame.volume.cuts.len(),
+                frame.volume.cuts.iter().map(|cut| cut.radials.len()).sum(),
+            )
+        })
     }
 
     fn commit_history_selection(
@@ -1014,28 +1560,165 @@ impl WorkstationApp {
         }
     }
 
+    /// Which sweep this pane should draw.
+    ///
+    /// Delegates to `product_engine::cut_selection`, which chooses by measured
+    /// elevation and scan time rather than by position in the file. The
+    /// difference is not cosmetic: on a VCP 212 SAILSx3 volume the lowest tilt
+    /// is scanned four times across the volume period, and taking the first one
+    /// listed serves velocity that is over four minutes older than a sweep of
+    /// the same tilt sitting in the same file.
+    /// Take one endpoint of a Vrot measurement from the point just clicked.
+    fn take_vrot_sample(
+        &mut self,
+        pane: PaneId,
+        volume: Option<&RadarVolume>,
+        cut_index: Option<usize>,
+        product: DisplayProduct,
+    ) {
+        self.workspace.set_active(pane);
+        if self.vrot_pane != Some(pane) {
+            // Starting in a different pane abandons the half-finished pair
+            // rather than pairing gates from two different pictures.
+            self.vrot_state.clear();
+            self.vrot_pane = Some(pane);
+        }
+        let Some((east_km, north_km)) = self.panes[pane.index()].hovered_world_km else {
+            return;
+        };
+        let (Some(volume), Some(cut_index)) = (volume, cut_index) else {
+            return;
+        };
+        let descriptor = product.descriptor();
+        let elevation_deg = self
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.cut(cut_index))
+            .map(|cut| cut.nominal_elevation_deg)
+            .or_else(|| volume.cuts.get(cut_index).map(|cut| cut.elevation_deg))
+            .unwrap_or_default();
+        let reading = crate::probe::probe_polar(
+            volume,
+            cut_index,
+            &descriptor.computation.source_moment(),
+            elevation_deg,
+            volume.site.elevation_m,
+            east_km,
+            north_km,
+        );
+        let crate::probe::ProbeReading::Value(value) = reading else {
+            self.status = "Vrot: that point has no velocity".to_owned();
+            return;
+        };
+        let sample = crate::vrot::VrotSample::from_probe(&value);
+
+        match self.vrot_state.pending().cloned() {
+            None => {
+                self.vrot_state = crate::vrot::VrotState::AwaitingSecond(sample);
+                self.status = "Vrot: click the other side of the couplet".to_owned();
+            }
+            Some(first) => {
+                let dealiased = descriptor.computation.uses_dealiased_velocity();
+                match crate::vrot::measure(first, sample, dealiased) {
+                    Ok(measurement) => {
+                        self.status = crate::vrot::report(&measurement);
+                        self.vrot_state = crate::vrot::VrotState::Complete(measurement);
+                    }
+                    Err(refusal) => {
+                        self.status = format!("Vrot refused: {}", refusal.label());
+                        self.vrot_state = crate::vrot::VrotState::Idle;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read the value under this pane's cursor from the sweep it is drawing.
+    ///
+    /// Uses the pointer position captured during the previous paint, so the
+    /// volume is never scanned while laying out a frame.
+    fn refresh_probe(
+        &mut self,
+        pane: PaneId,
+        volume: Option<&RadarVolume>,
+        cut_index: Option<usize>,
+        product: DisplayProduct,
+    ) {
+        let Some((east_km, north_km)) = self.panes[pane.index()].hovered_world_km else {
+            self.panes[pane.index()].probe_text = None;
+            return;
+        };
+        let (Some(volume), Some(cut_index)) = (volume, cut_index) else {
+            self.panes[pane.index()].probe_text = None;
+            return;
+        };
+        let descriptor = product.descriptor();
+        // The measured elevation, so the beam height is computed from the angle
+        // the antenna actually flew rather than from the first radial's.
+        let elevation_deg = self
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.cut(cut_index))
+            .map(|cut| cut.nominal_elevation_deg)
+            .or_else(|| volume.cuts.get(cut_index).map(|cut| cut.elevation_deg))
+            .unwrap_or_default();
+        let reading = crate::probe::probe_polar(
+            volume,
+            cut_index,
+            &descriptor.computation.source_moment(),
+            elevation_deg,
+            volume.site.elevation_m,
+            east_km,
+            north_km,
+        );
+        self.panes[pane.index()].probe_text = Some(crate::probe::format_reading(
+            &reading,
+            &descriptor.domain,
+            descriptor.short_name,
+        ));
+    }
+
     fn resolve_cut_index(&self, pane: PaneId, volume: &RadarVolume) -> Option<usize> {
         let intent = self.workspace.pane(pane);
         let product = DisplayProduct::from_product_id(&intent.product);
+        let descriptor = product.descriptor();
+        let moment = descriptor.computation.source_moment();
+        let policy = descriptor.cut_policy;
+
+        let Some(capabilities) = self.capabilities.as_ref() else {
+            // Measurement has not run yet this frame. Draw something rather
+            // than nothing; the next frame will have the real answer.
+            return product.first_available_cut(volume);
+        };
+
         match intent.tilt {
-            TiltSelection::LowestAvailable => product.first_available_cut(volume),
+            TiltSelection::LowestAvailable => {
+                product_engine::cut_selection::select_lowest_tilt(capabilities, &moment, policy)
+                    .map(|choice| choice.cut_index)
+            }
             TiltSelection::CutIndex(index) => {
                 let index = usize::from(index);
                 product
                     .is_available_in_cut(volume, index)
                     .then_some(index)
-                    .or_else(|| product.first_available_cut(volume))
+                    .or_else(|| {
+                        product_engine::cut_selection::select_lowest_tilt(
+                            capabilities,
+                            &moment,
+                            policy,
+                        )
+                        .map(|choice| choice.cut_index)
+                    })
             }
-            TiltSelection::NearestElevationTenths(target) => volume
-                .cuts
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| product.is_available_in_cut(volume, *index))
-                .min_by_key(|(_, cut)| {
-                    let elevation = (cut.elevation_deg * 10.0).round() as i16;
-                    (elevation - target).abs()
-                })
-                .map(|(index, _)| index),
+            TiltSelection::NearestElevationTenths(target) => {
+                product_engine::cut_selection::select_nearest_elevation(
+                    capabilities,
+                    f32::from(target) / 10.0,
+                    &moment,
+                    policy,
+                )
+                .map(|choice| choice.cut_index)
+            }
         }
     }
 
@@ -1052,13 +1735,85 @@ impl WorkstationApp {
         let Some(current) = self.resolve_cut_index(active, &volume) else {
             return;
         };
-        let Some(next) = product.next_available_cut(&volume, current, delta) else {
+        // Step one commanded tilt, not one cut. On a split-cut volume the next
+        // entry in the cut list is the other leg of the same elevation, so
+        // stepping by index makes "+ Tilt" stand still.
+        let next = match self.capabilities.as_ref() {
+            Some(capabilities) => product_engine::cut_selection::step_tilt(
+                capabilities,
+                current,
+                delta,
+                &product.descriptor().computation.source_moment(),
+                product.descriptor().cut_policy,
+            )
+            .map(|choice| choice.cut_index),
+            None => product.next_available_cut(&volume, current, delta),
+        };
+        let Some(next) = next else {
             return;
         };
         let changed = self
             .workspace
             .apply_tilt_from(active, TiltSelection::CutIndex(next as u16));
         self.invalidate_semantic_panes(&changed);
+    }
+
+    /// Why this sweep and not another. Shown on hover over the tilt readout,
+    /// because "the pane jumped from 0.48 to 0.44 degrees" is otherwise an
+    /// unexplained change rather than a four-minute-fresher picture.
+    fn active_tilt_hover(&self) -> String {
+        let Some(capabilities) = self.capabilities.as_ref() else {
+            return "No volume measured yet".to_owned();
+        };
+        let pane = self.workspace.active_pane;
+        let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
+        let descriptor = product.descriptor();
+        let moment = descriptor.computation.source_moment();
+        let Some(choice) = product_engine::cut_selection::select_lowest_tilt(
+            capabilities,
+            &moment,
+            descriptor.cut_policy,
+        ) else {
+            return format!("No sweep in this volume carries {moment}");
+        };
+        let Some(cut) = capabilities.cut(choice.cut_index) else {
+            return "No sweep selected".to_owned();
+        };
+        let mut lines = vec![
+            format!(
+                "cut {} of {} - {} leg at {:.2}° (stored {:.2}°)",
+                choice.cut_index,
+                capabilities.cuts.len(),
+                choice.leg.label(),
+                cut.nominal_elevation_deg,
+                cut.stored_elevation_deg
+            ),
+            format!(
+                "{} radials, {:.0}° of azimuth{}",
+                cut.radial_count,
+                cut.azimuth_coverage_deg,
+                if cut.complete { "" } else { ", still arriving" }
+            ),
+        ];
+        if let Some(nyquist) = cut.representative_nyquist_mps {
+            lines.push(format!("Nyquist {nyquist:.1} m/s"));
+        }
+        if choice.repeats_passed_over > 0 {
+            lines.push(format!(
+                "{} other sweep(s) of this tilt in the volume",
+                choice.repeats_passed_over
+            ));
+        }
+        if choice.older_alternative_ms > 0 {
+            lines.push(format!(
+                "{:.1} s fresher than the first sweep listed in the file",
+                choice.older_alternative_ms as f32 / 1000.0
+            ));
+        }
+        lines.join(
+            "
+",
+        )
     }
 
     fn active_tilt_label(&self) -> String {
@@ -1068,11 +1823,27 @@ impl WorkstationApp {
         let Some(index) = self.resolve_cut_index(self.workspace.active_pane, &frame.volume) else {
             return "Unavailable".to_owned();
         };
-        frame
-            .volume
-            .cuts
-            .get(index)
-            .map(|cut| format!("{:.1}°", cut.elevation_deg))
+        // The measured elevation, not the stored one. The stored angle is the
+        // first radial's, taken while the antenna is still ramping onto the
+        // tilt, so real 0.5-degree sweeps label themselves "0.4" and disagree
+        // with every other radar viewer.
+        self.capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.cut(index))
+            // Two decimals, not one. The commanded tilt is 0.5 degrees but the
+            // antenna flies 0.44, and rounding that to "0.4" reads as a wrong
+            // 0.5 rather than as a right measurement. There is no VCP
+            // elevation table here to recover the commanded angle from, so the
+            // honest thing is to show what was measured, precisely enough that
+            // nobody mistakes it for a label.
+            .map(|cut| format!("{:.2}°", cut.nominal_elevation_deg))
+            .or_else(|| {
+                frame
+                    .volume
+                    .cuts
+                    .get(index)
+                    .map(|cut| format!("{:.2}°", cut.elevation_deg))
+            })
             .unwrap_or_else(|| "Unavailable".to_owned())
     }
 
@@ -1114,13 +1885,21 @@ impl eframe::App for WorkstationApp {
         self.poll_load_results();
         self.poll_site_directory();
         self.poll_warnings();
+        // Before anything asks which sweep to draw.
+        self.refresh_capabilities();
+        self.map_scene
+            .set_pixels_per_point(context.pixels_per_point());
         self.map_scene.poll();
         self.refresh_placed_sites();
         self.refresh_placed_hazards();
         self.poll_render_results(&context);
+        // After the results, before the canvas asks for the next render:
+        // the reveal only steps for panes whose previous render has landed.
+        self.advance_sweeps();
         self.advance_playback(&context);
 
         ui.visuals_mut().panel_fill = egui::Color32::from_rgb(10, 13, 17);
+        self.vol3d_window(&context);
         self.toolbar(ui);
         ui.separator();
 
@@ -1135,49 +1914,20 @@ impl eframe::App for WorkstationApp {
         ui.separator();
         self.timeline(ui, &context);
 
-        if self.panes.iter().any(|pane| pane.pending_stamp.is_some()) {
+        // A reveal that has caught up with the data is not animating: it is
+        // waiting for a chunk, and the load service wakes the UI when one
+        // lands. Repainting anyway would spin at 60 Hz over a picture that
+        // cannot change.
+        let animating = self.panes.iter().any(|pane| {
+            pane.pending_stamp.is_some()
+                || pane
+                    .sweep_state
+                    .is_some_and(|state| !state.complete && state.pending_deg() > 0.0)
+        });
+        if animating {
             context.request_repaint_after(Duration::from_millis(16));
         }
     }
-}
-
-fn layout_label(layout: PaneLayout) -> &'static str {
-    match layout {
-        PaneLayout::One => "1 pane",
-        PaneLayout::TwoHorizontal => "2 horizontal",
-        PaneLayout::TwoVertical => "2 vertical",
-        PaneLayout::Four => "4 panes",
-    }
-}
-
-fn pane_title(
-    volume: Option<&RadarVolume>,
-    pane: PaneId,
-    product: DisplayProduct,
-    cut_index: Option<usize>,
-) -> String {
-    let elevation = volume
-        .zip(cut_index)
-        .and_then(|(volume, index)| volume.cuts.get(index))
-        .map(|cut| format!(" · {:.1}°", cut.elevation_deg))
-        .unwrap_or_default();
-    format!("{} · {}{}", pane.get() + 1, product.id(), elevation)
-}
-
-fn viewport_changed(previous: ViewportMetrics, current: ViewportMetrics) -> bool {
-    (previous.width_points - current.width_points).abs() >= 0.5
-        || (previous.height_points - current.height_points).abs() >= 0.5
-        || previous.pixels_per_point.to_bits() != current.pixels_per_point.to_bits()
-}
-
-fn color_image_from_rgba(width: u32, height: u32, rgba: &[u8]) -> egui::ColorImage {
-    let expected = width as usize * height as usize * 4;
-    assert_eq!(rgba.len(), expected, "invalid renderer RGBA buffer length");
-    let pixels = rgba
-        .chunks_exact(4)
-        .map(|pixel| egui::Color32::from_rgba_unmultiplied(pixel[0], pixel[1], pixel[2], pixel[3]))
-        .collect();
-    egui::ColorImage::new([width as usize, height as usize], pixels)
 }
 
 #[cfg(test)]
@@ -1206,5 +1956,45 @@ mod tests {
                 ..original
             }
         ));
+    }
+
+    fn first_pane() -> PaneId {
+        PaneId::new(0).expect("pane 0 always exists")
+    }
+
+    #[test]
+    fn a_pane_header_names_the_unit_its_readout_will_be_in() {
+        assert_eq!(
+            pane_title(None, first_pane(), DisplayProduct::Reflectivity, None),
+            "1 · REF (dBZ)"
+        );
+    }
+
+    #[test]
+    fn a_pane_header_distinguishes_the_two_velocity_style_units() {
+        // Velocity reads in knots and spectrum width in metres per second, and
+        // the header is where an analyst finds that out before misreading a
+        // threshold quoted in the other one.
+        assert_eq!(
+            pane_title(None, first_pane(), DisplayProduct::DealiasedVelocity, None),
+            "1 · DVEL (kt)"
+        );
+        assert_eq!(
+            pane_title(None, first_pane(), DisplayProduct::SpectrumWidth, None),
+            "1 · SW (m/s)"
+        );
+    }
+
+    #[test]
+    fn a_dimensionless_product_header_carries_no_empty_parentheses() {
+        assert_eq!(
+            pane_title(
+                None,
+                first_pane(),
+                DisplayProduct::CorrelationCoefficient,
+                None
+            ),
+            "1 · RHO"
+        );
     }
 }
