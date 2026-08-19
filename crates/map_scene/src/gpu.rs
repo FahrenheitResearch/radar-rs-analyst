@@ -16,6 +16,13 @@ use eframe::wgpu::{self, util::DeviceExt};
 use crate::geometry::{MapGeometry, MapVertex};
 use crate::residency::{Admission, GeometryResidency, ResidencyMetrics};
 
+// The raster tile underlay's GPU half lives next door but is registered and
+// used through this module, so a caller has one place to look for "the map's
+// GPU resources" whichever layer it means.
+pub use crate::tile_gpu::{
+    TileDrawUniform, TilePaintCallback, TilePaneUniform, TileRenderResources, TileResidencyMetrics,
+};
+
 /// Uniform block. `repr(C)` and 16-byte aligned to match the WGSL layout.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -234,7 +241,9 @@ pub struct MapPaintCallback {
 }
 
 impl MapPaintCallback {
-    fn uniform(&self) -> MapUniform {
+    /// `pub(crate)` so the tile layer's own test can assert that both layers
+    /// build the identical camera matrix; nothing outside this crate needs it.
+    pub(crate) fn uniform(&self) -> MapUniform {
         let camera = self.camera.sanitized();
         let viewport = self.viewport.sanitized();
         let width_px = (self.rect_px[2] - self.rect_px[0]).max(1.0);

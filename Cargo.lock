@@ -445,6 +445,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "basemap_tiles"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
+ "image",
+ "reqwest",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1783,6 +1792,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2023,8 +2034,10 @@ name = "map_scene"
 version = "0.2.0"
 dependencies = [
  "analyst_runtime",
+ "basemap_tiles",
  "bytemuck",
  "eframe",
+ "image",
  "radar_core",
 ]
 
@@ -2797,6 +2810,7 @@ dependencies = [
 name = "product_engine"
 version = "0.2.0"
 dependencies = [
+ "chrono",
  "radar_core",
 ]
 
@@ -3030,6 +3044,7 @@ dependencies = [
  "color_tables",
  "image",
  "nexrad_io",
+ "product_engine",
  "radar_core",
  "rayon",
  "thiserror 2.0.18",
@@ -4860,9 +4875,13 @@ dependencies = [
  "color_tables",
  "data_source",
  "eframe",
+ "image",
  "map_scene",
+ "naga",
  "nexrad_io",
+ "product_engine",
  "radar_core",
+ "rayon",
  "render2d",
 ]
 

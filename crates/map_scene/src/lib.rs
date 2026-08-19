@@ -17,6 +17,9 @@ pub mod projection;
 pub mod residency;
 pub mod scene;
 pub mod style;
+pub mod style_presets;
+pub mod tile_gpu;
+pub mod tiles;
 
 pub use build::{
     LOD_REFERENCE_KM_PER_POINT, MAX_BUILD_HALF_EXTENT_KM, MIN_BUILD_HALF_EXTENT_KM,
@@ -30,4 +33,13 @@ pub use labels::{MAX_LABELS_PLACED, PlacedLabel, PlacementMetrics, place_labels}
 pub use projection::{PROJECTION_ALGORITHM_VERSION, ProjectionId, RadarProjection};
 pub use residency::{Admission, GeometryResidency, ResidencyMetrics};
 pub use scene::{MapSceneController, SceneMetrics};
-pub use style::{LayerColor, LayerStyle, MapStyle};
+pub use style::{LayerColor, LayerInk, LayerStyle, MapInk, MapStyle, ScaleBands};
+pub use style_presets::{MapChrome, MapStylePreset};
+// The raster tile underlay, re-exported so the application never names
+// `basemap_tiles`: the dependency edge is workstation_app -> map_scene ->
+// basemap_tiles, and the picker only ever needs a provider and a frame.
+pub use basemap_tiles::{TileCacheConfig, TileId, TileProvider, TileState};
+pub use tiles::{
+    MAX_TILES_PER_PANE, TileDraw, TileFeedback, TileFrame, TileFrameKey, TileKey, TileMetrics,
+    TileSceneController, tile_zoom_for,
+};

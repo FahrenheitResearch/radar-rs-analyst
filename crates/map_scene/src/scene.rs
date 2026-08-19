@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::thread;
 
 use analyst_runtime::{
-    Generation, GenerationClock, GeometryCacheKey, LatestLaneSender, LodBucket, LodSelector,
-    MAX_PANES, latest_lane_channel,
+    Camera2D, Generation, GenerationClock, GeometryCacheKey, LatestLaneSender, LodBucket,
+    LodSelector, MAX_PANES, ViewportMetrics, latest_lane_channel,
 };
+use basemap_tiles::TileProvider;
 
 use crate::build::{LOD_REFERENCE_KM_PER_POINT, MapBuildRequest, build_geometry};
 use crate::dataset::MapDataset;
@@ -20,6 +21,8 @@ use crate::geometry::MapGeometry;
 use crate::projection::RadarProjection;
 use crate::residency::DEFAULT_BUDGET_BYTES;
 use crate::style::MapStyle;
+use crate::style_presets::MapChrome;
+use crate::tiles::{TileFrame, TileMetrics, TileSceneController};
 
 /// Ceiling for CPU-side retained geometry, mirroring the GPU budget.
 pub const DEFAULT_CPU_BUDGET_BYTES: usize = DEFAULT_BUDGET_BYTES;
@@ -58,6 +61,14 @@ pub struct MapSceneController {
     results: std::sync::mpsc::Receiver<BuiltGeometry>,
     budget_bytes: usize,
     metrics: SceneMetrics,
+    /// The raster tile underlay. A private field on purpose: the application
+    /// already owns this controller and already talks to it, so the imagery
+    /// layer costs the app no new dependency and no new state.
+    tiles: TileSceneController,
+    /// Display scale, which the tile zoom depends on. Set once per frame by
+    /// the host; 1.0 until then, which selects one coarser zoom on a HiDPI
+    /// display rather than failing.
+    pixels_per_point: f32,
 }
 
 impl MapSceneController {
@@ -65,13 +76,20 @@ impl MapSceneController {
     ///
     /// `repaint` is called when a build lands so the host can schedule a frame;
     /// it must not block.
-    pub fn new(repaint: impl Fn() + Send + 'static) -> Self {
+    ///
+    /// `Sync` is required because the same closure is shared with the tile
+    /// worker pool as well as the geometry worker. Both existing call sites -
+    /// a closure capturing an `egui::Context`, and `|| {}` - satisfy it
+    /// unchanged.
+    pub fn new(repaint: impl Fn() + Send + Sync + 'static) -> Self {
         Self::with_dataset(MapDataset::from_generated(Generation::new(1)), repaint)
     }
 
-    pub fn with_dataset(dataset: MapDataset, repaint: impl Fn() + Send + 'static) -> Self {
+    pub fn with_dataset(dataset: MapDataset, repaint: impl Fn() + Send + Sync + 'static) -> Self {
         let (request_sender, request_receiver) = latest_lane_channel::<i16, MapBuildRequest>();
         let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(repaint);
+        let build_repaint = Arc::clone(&repaint);
         let _worker = thread::Builder::new()
             .name("map-scene-build".to_owned())
             .spawn(move || {
@@ -80,7 +98,7 @@ impl MapSceneController {
                     if result_sender.send(BuiltGeometry { geometry }).is_err() {
                         break;
                     }
-                    repaint();
+                    build_repaint();
                 }
             })
             .expect("failed to start map build worker");
@@ -104,6 +122,8 @@ impl MapSceneController {
             results: result_receiver,
             budget_bytes: DEFAULT_CPU_BUDGET_BYTES,
             metrics: SceneMetrics::default(),
+            tiles: TileSceneController::new(repaint),
+            pixels_per_point: 1.0,
         }
     }
 
@@ -238,8 +258,127 @@ impl MapSceneController {
         existing
     }
 
+    /// The display scale, which the tile zoom depends on.
+    ///
+    /// It arrives here rather than through every pane so the per-pane call
+    /// stays short, and because it is a property of the window, not of a pane.
+    pub fn set_pixels_per_point(&mut self, pixels_per_point: f32) {
+        if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            self.pixels_per_point = pixels_per_point;
+        }
+    }
+
+    #[must_use]
+    pub fn pixels_per_point(&self) -> f32 {
+        self.pixels_per_point
+    }
+
+    /// This pane's raster tile underlay, or `None` for the vector-only pane.
+    ///
+    /// `None` when no provider is selected, when there is no radar anchor, or
+    /// when the camera is coarser than `basemap_tiles::MIN_TILE_ZOOM` - each
+    /// of which leaves the pane exactly as it is today. Call it every frame:
+    /// the meshes and the textures behind it are cached, and the visible tile
+    /// set is the only part that follows the camera.
+    pub fn tiles_for_pane(
+        &mut self,
+        pane_index: usize,
+        camera: Camera2D,
+        rect: eframe::egui::Rect,
+    ) -> Option<Arc<TileFrame>> {
+        let projection = self.projection?;
+        let selector = self.lod.get_mut(pane_index)?;
+        // Idempotent with the `geometry_for_pane` call beside it: the same
+        // scale returns the same bucket, so this is safe whether or not the
+        // vector layer has already asked.
+        let lod = selector.update(camera.sanitized().km_per_point);
+        let viewport = ViewportMetrics {
+            width_points: rect.width().max(1.0),
+            height_points: rect.height().max(1.0),
+            pixels_per_point: self.pixels_per_point,
+        };
+        // The scrim is the pane's OWN ground, partially over the imagery, so a
+        // light look dims towards light and a dark look towards dark. That
+        // ties the imagery to the four presets without making the tile layer
+        // part of the geometry cache key.
+        let canvas = MapChrome::for_style(self.style).canvas;
+        self.tiles.frame_for_pane(
+            &projection,
+            self.projection_clock.current(),
+            lod,
+            camera,
+            viewport,
+            [canvas.r, canvas.g, canvas.b],
+        )
+    }
+
+    #[must_use]
+    pub fn tile_provider(&self) -> Option<TileProvider> {
+        self.tiles.provider()
+    }
+
+    /// Choose the ground imagery. `None` is the shipped vector-only pane and
+    /// stays the default, so an offline or firewalled machine is never worse
+    /// off than it is today.
+    pub fn set_tile_provider(&mut self, provider: Option<TileProvider>) {
+        self.tiles.set_provider(provider);
+    }
+
+    /// Whether a provider may be used with this store's configuration. A
+    /// picker should hide the ones that may not.
+    #[must_use]
+    pub fn tile_provider_permitted(&self, provider: TileProvider) -> bool {
+        self.tiles.permits(provider)
+    }
+
+    /// The credit string the pane must draw. Displaying it is a condition of
+    /// use for every provider here, which is why there is no switch for it.
+    #[must_use]
+    pub fn tile_attribution(&self) -> Option<&'static str> {
+        self.tiles.attribution()
+    }
+
+    /// How much the imagery is dimmed on the current look, 0..1.
+    ///
+    /// Computed against the pane's own ground rather than read from a table:
+    /// three of the five providers are light maps, and how much dimming they
+    /// need depends on what they are drawn over.
+    #[must_use]
+    pub fn tile_scrim(&self) -> f32 {
+        let canvas = MapChrome::for_style(self.style).canvas;
+        self.tiles.scrim_for_ground([canvas.r, canvas.g, canvas.b])
+    }
+
+    pub fn set_tile_scrim(&mut self, alpha: f32) {
+        self.tiles.set_scrim(alpha);
+    }
+
+    pub fn set_tiles_offline(&mut self, offline: bool) {
+        self.tiles.set_offline(offline);
+    }
+
+    #[must_use]
+    pub fn tiles_offline(&self) -> bool {
+        self.tiles.is_offline()
+    }
+
+    #[must_use]
+    pub fn tile_metrics(&self) -> TileMetrics {
+        self.tiles.metrics()
+    }
+
+    #[must_use]
+    pub fn tile_cache_root(&self) -> Option<&std::path::Path> {
+        self.tiles.cache_root()
+    }
+
     /// Install completed builds. Call once per frame before drawing.
+    ///
+    /// Also the tile layer's frame boundary: decoded tiles are taken from the
+    /// store, the GPU's uploads and evictions are applied, and every tile no
+    /// pane asked for last frame is cancelled before it reaches the network.
     pub fn poll(&mut self) -> usize {
+        self.tiles.poll();
         let mut installed = 0;
         while let Ok(result) = self.results.try_recv() {
             let key = result.geometry.key;
