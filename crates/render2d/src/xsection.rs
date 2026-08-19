@@ -2059,7 +2059,7 @@ mod tests {
     }
 
     /// The interpolated fill IS the pre-change picture — bit for bit, on the
-    /// owner's own volume and on synthetic geometry, for every moment, every
+    /// field volume and on synthetic geometry, for every moment, every
     /// interpolation policy and both horizontal smoothings.
     ///
     /// Bit for bit and not "close": a slice is a `Vec<f32>` built by the same
