@@ -95,24 +95,21 @@ impl Default for TileCacheConfig {
     }
 }
 
-/// `radar-workstation/<version> (+<repository>)`.
+/// `GenericRadar/<version> (+<repository>)`.
 ///
 /// Not decoration. The OpenStreetMap Foundation tile usage policy blocks
 /// traffic carrying a library's default User-Agent because it cannot identify
 /// or contact the application behind it, so this string is a condition of use
 /// for that provider. The fallback URL exists because `CARGO_PKG_REPOSITORY`
 /// is empty unless the manifest inherits it, and shipping
-/// `radar-workstation/0.2.0 (+)` would defeat the point.
+/// `GenericRadar/0.2.0 (+)` would defeat the point.
 #[must_use]
 pub fn default_user_agent() -> String {
     let repository = match env!("CARGO_PKG_REPOSITORY") {
-        "" => "https://github.com/FahrenheitResearch/radar-rs-analyst",
+        "" => "https://github.com/FahrenheitResearch/GenericRadar",
         url => url,
     };
-    format!(
-        "radar-workstation/{} (+{repository})",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("GenericRadar/{} (+{repository})", env!("CARGO_PKG_VERSION"))
 }
 
 /// The platform cache directory, with this application's subdirectory
@@ -1021,7 +1018,7 @@ mod tests {
     #[test]
     fn the_default_user_agent_names_the_application_and_a_contact() {
         let agent = default_user_agent();
-        assert!(agent.starts_with("radar-workstation/"), "{agent}");
+        assert!(agent.starts_with("GenericRadar/"), "{agent}");
         assert!(agent.contains("(+https://"), "{agent}");
         // The OSMF policy blocks library default agents specifically.
         assert!(!agent.to_ascii_lowercase().contains("reqwest"), "{agent}");
@@ -1759,7 +1756,7 @@ mod tests {
         assert!(config.max_disk_bytes >= 64 * 1024 * 1024);
         assert!(config.max_workers >= 1 && config.max_workers <= 8);
         assert!(!config.offline);
-        assert!(config.user_agent.starts_with("radar-workstation/"));
+        assert!(config.user_agent.starts_with("GenericRadar/"));
     }
 
     #[test]

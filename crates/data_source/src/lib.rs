@@ -19,7 +19,7 @@ pub const LEVEL2_CHUNKS_BUCKET: &str = "unidata-nexrad-level2-chunks";
 const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(4);
 const HTTP_METADATA_TIMEOUT: StdDuration = StdDuration::from_secs(8);
 const HTTP_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(45);
-const HTTP_USER_AGENT: &str = "radar-rs-analyst/0.1 local-desktop";
+const HTTP_USER_AGENT: &str = "GenericRadar/0.1 local-desktop";
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
 const REALTIME_CHUNK_DOWNLOAD_BATCH: usize = 8;
@@ -1657,10 +1657,8 @@ mod tests {
 
     #[test]
     fn newest_cached_level2_path_ignores_partial_empty_and_mdm_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "radar-rs-analyst-cache-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("genericradar-cache-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("test cache dir");
 
