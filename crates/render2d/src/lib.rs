@@ -11,6 +11,7 @@ pub mod smooth;
 pub mod sweep_blend;
 pub mod volumetric;
 pub mod volumetric_support;
+pub mod xsection;
 
 use std::f32::consts::PI;
 use std::ops::Range;
