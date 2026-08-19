@@ -48,6 +48,7 @@ fn map_for(preset: MapStylePreset) -> PaneMap {
         tiles: None,
         chrome: preset.chrome(),
         sites: Arc::from(Vec::new()),
+        site_labels: SiteLabelMode::default(),
         active_site: None,
         hazards: Arc::from(Vec::new()),
     }
@@ -74,6 +75,7 @@ fn painted(map: &PaneMap) -> Vec<egui::Shape> {
                     PANE,
                     true,
                     Camera2D::default(),
+                    NavTuning::default(),
                     None,
                     map,
                     "1 - REF (dBZ)",
@@ -254,6 +256,7 @@ fn painted_hovered(map: &PaneMap, probe: Option<&str>) -> Vec<egui::Shape> {
                     PANE,
                     true,
                     Camera2D::default(),
+                    NavTuning::default(),
                     None,
                     map,
                     "1 - REF (dBZ)",
@@ -496,8 +499,14 @@ mod the_picker_itself {
             events,
             ..Default::default()
         };
+        // A store at a path that never exists and is never saved: the picker
+        // needs one for the Dim slider's persistence write, and these tests
+        // only assert on the shapes.
+        let mut store = settings::SettingsStore::open(
+            std::env::temp_dir().join("radar-workstation-chrome-tests-no-settings.json"),
+        );
         let output = context.run_ui(input, |ui| {
-            crate::app_support::basemap_picker(ui, scene);
+            crate::app_support::basemap_picker(ui, scene, &mut store);
         });
         output.shapes.into_iter().map(|c| c.shape).collect()
     }

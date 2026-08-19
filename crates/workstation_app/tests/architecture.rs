@@ -42,6 +42,12 @@ const ALLOWED_DIRECT_DEPENDENCIES: &[&str] = &[
     // trade a working shared upstream for a lint.
     "rayon",
     "render2d",
+    // Persisted settings: the store, the registry, the platform paths. Pure
+    // std plus serde - no network, no GPU, no GIS - and deliberately at the
+    // bottom of the workspace so any crate can declare settings without a
+    // cycle. Admitted so the workstation can be the one composition root that
+    // loads, applies and mirrors them.
+    "settings",
 ];
 
 #[test]

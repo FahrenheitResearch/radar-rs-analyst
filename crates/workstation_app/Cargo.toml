@@ -16,6 +16,7 @@ product_engine = { path = "../product_engine" }
 radar_core = { path = "../radar_core" }
 rayon.workspace = true
 render2d = { path = "../render2d" }
+settings = { path = "../settings" }
 
 # Test-only. `vol3d` validates its two embedded WGSL shaders without a GPU, so
 # a headless build node still catches a broken shader. Pinned to the naga that

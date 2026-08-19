@@ -3320,7 +3320,15 @@ dependencies = [
 name = "settings"
 version = "0.2.0"
 dependencies = [
+ "analyst_runtime",
+ "color_tables",
+ "eframe",
+ "image",
+ "map_scene",
+ "radar_core",
+ "render2d",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4883,6 +4891,7 @@ dependencies = [
  "radar_core",
  "rayon",
  "render2d",
+ "settings",
 ]
 
 [[package]]

@@ -19,7 +19,17 @@ use crate::vol3d::pane::Vol3dCandidate;
 /// exactly one appearance - black with slate lines - no matter what the style
 /// type could express. `for_style` preselects, because the controller stores a
 /// `MapStyle` rather than a preset.
-pub(crate) fn basemap_picker(ui: &mut egui::Ui, scene: &mut map_scene::MapSceneController) {
+///
+/// The settings store is here for exactly one write: a hand-dragged Dim
+/// slider. Style and provider are mirrored from the scene every frame by
+/// `app.rs`, but the scrim cannot be - while auto-dim is on it is measured
+/// from arriving tiles, and mirroring the measurement would silently convert
+/// it into a stored manual choice.
+pub(crate) fn basemap_picker(
+    ui: &mut egui::Ui,
+    scene: &mut map_scene::MapSceneController,
+    store: &mut settings::SettingsStore,
+) {
     let current = scene.style();
     // `recognised` is kept rather than collapsed into `chosen`, because the
     // write-back below has to distinguish "the operator picked something else"
@@ -108,6 +118,20 @@ pub(crate) fn basemap_picker(ui: &mut egui::Ui, scene: &mut map_scene::MapSceneC
             .changed()
         {
             scene.set_tile_scrim(scrim);
+            // A hand-set dim is a manual dim, so automatic dimming turns off
+            // - which is exactly what the settings window's pair of controls
+            // means - and the choice survives the process.
+            use crate::settings_ui::catalog::keys::map as k;
+            store.set(
+                k::CATEGORY,
+                k::IMAGERY_DIM,
+                settings::SettingValue::Float(f64::from(scrim)),
+            );
+            store.set(
+                k::CATEGORY,
+                k::IMAGERY_DIM_AUTO,
+                settings::SettingValue::Bool(false),
+            );
         }
     }
 }

@@ -11,17 +11,27 @@ mod load_service;
 mod nearest_site;
 mod palettes;
 mod pane_canvas;
+mod popup;
 mod probe;
 mod product;
-mod popup;
 mod product_availability;
 mod product_picker;
 mod render_service;
+// `settings_ui` and `theme` are each compiled in a second home as well - the
+// `settings` crate's ui harness and the `theme_gallery` example include them
+// by `#[path]` - so items this binary does not call (the deep-link openers,
+// the gallery's bevel toolkit) are still live API. `dead_code` is judged per
+// compilation unit and cannot see those callers.
+#[allow(dead_code)]
+mod settings_ui;
 mod sites_service;
 mod sweep;
+#[allow(dead_code)]
+mod theme;
 mod vol3d;
 mod vrot;
 mod warnings_service;
+mod xsection;
 
 /// Overrides where warnings come from, for a daemon that is not on this
 /// machine. A base URL selects it; `off` pins the public feed.
@@ -137,10 +147,31 @@ fn main() -> eframe::Result {
     } = parse_startup(std::env::args().skip(1));
     let warnings_source = warnings_source(warnings_url);
     let initial_product = startup_product(product.as_deref());
+    // The settings file is parsed once, here, because the window geometry it
+    // holds has to exist before the window does. The store then moves into
+    // the app, so live state persists through the same handle rather than a
+    // second parse racing this one.
+    //
+    // A mobile shell porting this must call `settings::set_app_config_root` /
+    // `set_app_cache_root` with its sandbox paths BEFORE this line; the
+    // desktop defaults are the conventions the rest of the workspace uses.
+    let store = settings::SettingsStore::open(settings::default_settings_file());
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1500.0, 950.0])
+        .with_min_inner_size([960.0, 620.0]);
+    if let Some(window) = &store.workspace().window {
+        // `window_snapshot` refused degenerate sizes at capture, so a size
+        // that is here at all is one worth reopening at.
+        if let (Some(width), Some(height)) = (window.width, window.height) {
+            viewport = viewport.with_inner_size([width, height]);
+        }
+        if let (Some(x), Some(y)) = (window.x, window.y) {
+            viewport = viewport.with_position([x, y]);
+        }
+        viewport = viewport.with_maximized(window.maximized);
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1500.0, 950.0])
-            .with_min_inner_size([960.0, 620.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -148,6 +179,9 @@ fn main() -> eframe::Result {
         "Radar Workstation",
         native_options,
         Box::new(move |creation_context| {
+            // The visual theme, before anything draws: every widget of the
+            // first frame styles itself from the context this call fills in.
+            theme::apply(&creation_context.egui_ctx, theme::Variant::Dark);
             // Register the map's persistent GPU resources once, before any
             // pane paints. Without a wgpu render state the map cannot draw at
             // all, so say so rather than silently falling back to per-frame
@@ -185,8 +219,13 @@ fn main() -> eframe::Result {
                 ),
             }
 
-            let mut app =
-                app::WorkstationApp::new(creation_context, input_path, live_site, warnings_source);
+            let mut app = app::WorkstationApp::new(
+                creation_context,
+                input_path,
+                live_site,
+                warnings_source,
+                store,
+            );
             app.set_initial_camera(zoom_km_per_point, center_km);
             app.set_initial_product(initial_product);
             app.set_vol3d_open(open_vol3d);

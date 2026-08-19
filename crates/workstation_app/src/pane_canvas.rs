@@ -21,6 +21,49 @@ pub struct PaneTexture<'a> {
     pub viewport: ViewportMetrics,
 }
 
+/// The analyst's navigation-speed settings, remapped so the tuned response
+/// curves in `analyst_runtime::view` keep their shape with the user's numbers
+/// in them. Exponents and time scales rather than raw rates because the
+/// curves are exponential: `1.2^n` raised to `zoom_exp` is exactly
+/// `user^n`, `KEY_ZOOM_RATE^(hold·dt·kzoom_exp)` is exactly `user^(hold·dt)`,
+/// and `span·KEY_PAN_FRACTION·(dt·pan_scale)` is exactly `span·user·dt` - the
+/// burst behaviour, clamps and anchor rules all survive untouched.
+#[derive(Clone, Copy)]
+pub struct NavTuning {
+    /// Exponent on the wheel factor: `ln(user) / ln(ZOOM_PER_NOTCH)`.
+    pub zoom_exp: f32,
+    /// Multiplier on dt for the pan-only nav pass.
+    pub pan_scale: f32,
+    /// Multiplier on dt for the zoom-only nav pass.
+    pub kzoom_exp: f32,
+    /// Whether double-clicking a pane resets its camera to the home view.
+    pub double_click_reset: bool,
+}
+
+impl Default for NavTuning {
+    fn default() -> Self {
+        // Identity: the tuned constants exactly as shipped.
+        Self {
+            zoom_exp: 1.0,
+            pan_scale: 1.0,
+            kzoom_exp: 1.0,
+            double_click_reset: true,
+        }
+    }
+}
+
+/// When a radar site marker gets its identifier written beside it.
+///
+/// `Auto` is the shipped rule: active, hovered, or an uncluttered view.
+/// `Never` writes no ids at all - the markers stay.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum SiteLabelMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
 /// The retained map underlay for one pane, if the scene has geometry built for
 /// the pane's current LOD. `projection` also drives the cursor's lat/lon, so
 /// the readout uses the same transform the map was built with.
@@ -47,6 +90,8 @@ pub struct PaneMap {
     /// Radar sites already projected into world kilometres, so the paint pass
     /// only transforms points rather than projecting them.
     pub sites: Arc<[PlacedSite]>,
+    /// When a site marker's identifier is written beside it.
+    pub site_labels: SiteLabelMode,
     /// The site currently being displayed, drawn as selected.
     pub active_site: Option<String>,
     /// Warning polygons in force, already projected, least severe first.
@@ -153,6 +198,7 @@ pub fn draw_pane(
     rect: egui::Rect,
     active: bool,
     camera: Camera2D,
+    tuning: NavTuning,
     texture: Option<PaneTexture<'_>>,
     map: &PaneMap,
     title: &str,
@@ -181,7 +227,10 @@ pub fn draw_pane(
     }
 
     if response.hovered() {
-        let factor = wheel_zoom_factor(ui, pane);
+        // The exponent remaps the tuned 1.2-per-notch response to the
+        // analyst's chosen rate - `1.2^n` becomes `user^n` - with the burst
+        // acceleration riding along unchanged.
+        let factor = wheel_zoom_factor(ui, pane).powf(tuning.zoom_exp);
         if factor != 1.0 {
             // Anchor on the POINTER, not the pane centre: holding the world
             // point under the cursor still is what makes a zoom feel aimed
@@ -200,13 +249,34 @@ pub fn draw_pane(
     let nav = keyboard_nav(ui, active);
     if !nav.is_idle() {
         let dt = ui.input(|input| input.stable_dt);
-        camera_changed |= updated_camera.apply_nav(nav, dt, viewport);
+        if nav.reset {
+            // Reset wins outright inside `apply_nav`; splitting it would
+            // let the zoom pass move a camera the reset just homed.
+            camera_changed |= updated_camera.apply_nav(nav, dt, viewport);
+        } else {
+            // Two passes so pan and zoom each run at their own configured
+            // rate: dt scaling is exact because the pan step is linear in dt
+            // and the held zoom is exponential in it (see [`NavTuning`]).
+            let pan_only = NavInput {
+                zoom_hold: 0.0,
+                zoom_steps: 0.0,
+                ..nav
+            };
+            let zoom_only = NavInput {
+                pan_right: 0.0,
+                pan_up: 0.0,
+                zoom_steps: nav.zoom_steps * tuning.zoom_exp,
+                ..nav
+            };
+            camera_changed |= updated_camera.apply_nav(pan_only, dt * tuning.pan_scale, viewport);
+            camera_changed |= updated_camera.apply_nav(zoom_only, dt * tuning.kzoom_exp, viewport);
+        }
         // A held key produces no further events, so without this the flight
         // would stop after one frame and resume on the next mouse twitch.
         ui.ctx().request_repaint();
     }
 
-    if response.double_clicked() {
+    if tuning.double_click_reset && response.double_clicked() {
         updated_camera = Camera2D::default();
         camera_changed = true;
     }
@@ -737,8 +807,13 @@ fn draw_radar_sites(
         );
 
         // Only label what the analyst can act on, so a continental view is not
-        // buried under two hundred identifiers.
-        if active || hovered || map.sites.len() <= 40 {
+        // buried under two hundred identifiers - unless the settings say
+        // always or never, which both override the clutter rule.
+        if match map.site_labels {
+            SiteLabelMode::Always => true,
+            SiteLabelMode::Never => false,
+            SiteLabelMode::Auto => active || hovered || map.sites.len() <= 40,
+        } {
             painter.text(
                 position + egui::vec2(0.0, -SITE_MARKER_HALF - 2.0),
                 egui::Align2::CENTER_BOTTOM,
@@ -1878,6 +1953,7 @@ mod tests {
                     rect,
                     active,
                     camera,
+                    NavTuning::default(),
                     None,
                     &map,
                     "KEAX 0.5 REF",
